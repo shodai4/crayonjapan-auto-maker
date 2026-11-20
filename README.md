@@ -115,6 +115,35 @@ Each `--drive-once` / `--drive-watch` cycle:
 `02_READY_TO_POST` until you check it on your phone. Without it the Short is uploaded unlisted
 (`config.yaml`), so nothing goes public by itself.
 
+## Hand-off mode: Apps Script + GitHub Actions
+
+No always-on PC. `gas/Code_drive_watch.gs` is pasted into the Apps Script project that already
+runs the message-board relay; its 1-minute trigger watches `01_RAW_VIDEO` and posts a
+`repository_dispatch` (`raw_video_uploaded`) to this repository. `.github/workflows/auto-edit.yml`
+then runs the same `--drive-once --no-upload` pipeline on a free `ubuntu-latest` runner:
+
+```
+phone → 01_RAW_VIDEO → Apps Script (1 min) → repository_dispatch → Actions (FFmpeg/OpenCV/Gemini)
+      → 02_READY_TO_POST + raw file moved to 03_ARCHIVE → artifact kept on the run for 14 days
+```
+
+Apps Script script properties: `RAW_FOLDER_ID`, `GITHUB_REPO` (`owner/repo`) and `GITHUB_TOKEN`
+(a fine-grained PAT with *Contents: read* and *Actions: read/write*).
+
+Repository secrets: `GEMINI_API_KEY`, `DRIVE_RAW_FOLDER_ID`, `DRIVE_READY_FOLDER_ID`,
+`DRIVE_ARCHIVE_FOLDER_ID`, plus one Drive credential:
+
+- `GDRIVE_TOKEN_JSON` – the content of `drive_token.json`; long-lived, lets a scheduled or manual
+  run work on its own.
+- or nothing at all: each dispatch carries `GDRIVE_ACCESS_TOKEN`, a Drive access token minted by
+  `ScriptApp.getOAuthToken()` that lives for about an hour. The workflow masks it before use.
+
+`python scripts/verify_drive_access.py` checks that credential and prints how many files are
+waiting, without printing the credential itself.
+
+A double dispatch is harmless: `01_RAW_VIDEO` is scanned on every run and the raw file only
+leaves it once the package is uploaded, so a second run simply finds nothing to render.
+
 ## Narrative styles
 
 | style | intent |
@@ -151,6 +180,9 @@ video_processor.py       9:16 time-lapse, hook cut, ASMR audio retention, artwor
 ai_writer.py             style selection + Gemini script generation
 metadata_writer.py       English upload pack (.txt) + art metadata (.json)
 drive_sync.py            Google Drive hub: list / download / upload / archive
+scripts/verify_drive_access.py  CI pre-flight check for the Drive credential
+.github/workflows/auto-edit.yml  Actions job: dispatch → render → Drive
+gas/Code_drive_watch.gs  Apps Script half: 1-minute folder watch → repository_dispatch
 youtube_uploader.py      OAuth, Data API upload, Analytics API client
 analytics_updater.py     performance.csv refresh
 analytics/performance.csv one row per uploaded Short
@@ -169,6 +201,10 @@ tests/                   unittest suite
 - The OAuth tokens are stored locally only; the scopes requested are
   `youtube.upload`, `youtube.readonly`, `yt-analytics.readonly` for YouTube and
   `drive` for Drive mode.
+- In CI the credentials arrive as encrypted repository secrets or in the dispatch payload, are
+  masked with `::add-mask::` before the first command, and are never written to a tracked file.
+  A dispatched access token expires within the hour and grants only what the Apps Script project
+  is already authorized for.
 
 ## Notes and limitations
 

@@ -350,5 +350,70 @@ class WatchTests(unittest.TestCase):
         self.assertEqual(runs, [[], []])
 
 
+def _has_google_auth():
+    try:
+        import google.oauth2.credentials  # noqa: F401
+    except ImportError:  # pragma: no cover - depends on the install
+        return False
+    return True
+
+
+AUTHORIZED_USER = {
+    "token": "old-access-token",
+    "refresh_token": "refresh-token",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "client_id": "client-id",
+    "client_secret": "client-secret",
+    "scopes": ["https://www.googleapis.com/auth/drive"],
+}
+
+
+class CiCredentialTests(unittest.TestCase):
+    """The credentials CI hands in instead of a local drive_token.json."""
+
+    def test_no_environment_credential_means_none(self):
+        self.assertIsNone(ds.load_credentials_from_env({}))
+        self.assertIsNone(
+            ds.load_credentials_from_env({ds.ACCESS_TOKEN_ENV: "  ", ds.TOKEN_JSON_ENV: ""})
+        )
+
+    def test_invalid_json_names_the_variable(self):
+        with self.assertRaises(ds.DriveSyncError) as ctx:
+            ds.load_credentials_from_env({ds.TOKEN_JSON_ENV: "{not json"})
+        self.assertIn(ds.TOKEN_JSON_ENV, str(ctx.exception))
+
+    def test_json_without_refresh_token_is_rejected(self):
+        with self.assertRaises(ds.DriveSyncError) as ctx:
+            ds.load_credentials_from_env({ds.TOKEN_JSON_ENV: json.dumps({"token": "t"})})
+        self.assertIn("refresh_token", str(ctx.exception))
+
+    @unittest.skipUnless(_has_google_auth(), "google-auth is not installed")
+    def test_access_token_is_used_as_is(self):
+        creds = ds.load_credentials_from_env({ds.ACCESS_TOKEN_ENV: " token-123 "})
+        self.assertEqual(creds.token, "token-123")
+        self.assertIsNone(creds.refresh_token)
+
+    @unittest.skipUnless(_has_google_auth(), "google-auth is not installed")
+    def test_authorized_user_json_keeps_its_refresh_token(self):
+        creds = ds.load_credentials_from_env({ds.TOKEN_JSON_ENV: json.dumps(AUTHORIZED_USER)})
+        self.assertEqual(creds.refresh_token, "refresh-token")
+        self.assertIn("https://www.googleapis.com/auth/drive", creds.scopes)
+
+    @unittest.skipUnless(_has_google_auth(), "google-auth is not installed")
+    def test_dispatched_access_token_wins_over_the_stored_json(self):
+        creds = ds.load_credentials_from_env(
+            {ds.ACCESS_TOKEN_ENV: "fresh", ds.TOKEN_JSON_ENV: json.dumps(AUTHORIZED_USER)}
+        )
+        self.assertEqual(creds.token, "fresh")
+
+    def test_build_drive_service_prefers_the_environment(self):
+        sentinel = object()
+        with mock.patch.object(ds, "load_credentials_from_env", return_value=sentinel) as load:
+            with mock.patch("googleapiclient.discovery.build") as build:
+                ds.build_drive_service()
+        load.assert_called_once_with()
+        self.assertIs(build.call_args.kwargs["credentials"], sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()

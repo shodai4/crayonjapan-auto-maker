@@ -34,6 +34,13 @@ CLIENT_SECRET_PATH = "client_secret.json"
 DRIVE_TOKEN_PATH = "drive_token.json"
 DEFAULT_STATE_PATH = "drive_state.json"
 
+# CI hands the credentials in through the environment instead of a local file:
+# a long-lived authorized-user JSON (``GDRIVE_TOKEN_JSON``) or the short-lived
+# access token that the Apps Script trigger forwards with each dispatch
+# (``GDRIVE_ACCESS_TOKEN``). Neither is ever written to the repository.
+TOKEN_JSON_ENV = "GDRIVE_TOKEN_JSON"
+ACCESS_TOKEN_ENV = "GDRIVE_ACCESS_TOKEN"
+
 RAW_EXTENSIONS = (".mp4", ".mov", ".avi")
 MIME_BY_EXTENSION = {
     ".mp4": "video/mp4",
@@ -141,11 +148,41 @@ def load_drive_credentials(
     return creds
 
 
+def load_credentials_from_env(env: Optional[Dict[str, str]] = None):
+    """Credentials handed in by CI, or ``None`` when the local token is used.
+
+    ``GDRIVE_ACCESS_TOKEN`` wins: it is the token the Apps Script trigger puts
+    in the dispatch payload, and it only lives for about an hour. Otherwise
+    ``GDRIVE_TOKEN_JSON`` (a full authorized-user JSON with a refresh token)
+    keeps a scheduled run working without the Apps Script hop.
+    """
+    source = os.environ if env is None else env
+    access_token = str(source.get(ACCESS_TOKEN_ENV, "") or "").strip()
+    token_json = str(source.get(TOKEN_JSON_ENV, "") or "").strip()
+    if not access_token and not token_json:
+        return None
+
+    from google.oauth2.credentials import Credentials
+
+    if access_token:
+        return Credentials(token=access_token)
+    try:
+        info = json.loads(token_json)
+    except json.JSONDecodeError as exc:
+        raise DriveSyncError(f"{TOKEN_JSON_ENV} is not valid JSON") from exc
+    if not isinstance(info, dict) or not info.get("refresh_token"):
+        raise DriveSyncError(
+            f"{TOKEN_JSON_ENV} must hold an authorized-user JSON that includes a "
+            "refresh_token (the content of drive_token.json)."
+        )
+    return Credentials.from_authorized_user_info(info, list(DRIVE_SCOPES))
+
+
 def build_drive_service(credentials=None, token_path: str = DRIVE_TOKEN_PATH):
-    """Build the Drive v3 client (first call opens the consent screen)."""
+    """Build the Drive v3 client (first local call opens the consent screen)."""
     from googleapiclient.discovery import build
 
-    creds = credentials or load_drive_credentials(token_path=token_path)
+    creds = credentials or load_credentials_from_env() or load_drive_credentials(token_path=token_path)
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
