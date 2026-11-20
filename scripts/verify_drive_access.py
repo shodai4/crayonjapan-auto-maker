@@ -44,7 +44,13 @@ def main() -> int:
         print(f"[verify] Drive access failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    print(f"[verify] Drive access OK; {len(videos)} raw video(s) waiting in 01_RAW_VIDEO.")
+    print(f"[verify] Drive access OK; {len(videos)} raw video(s) waiting in 01_RAW_VIDEO")
+    if not str(os.environ.get("GEMINI_API_KEY", "") or "").strip():
+        print(
+            "[verify] Warning: GEMINI_API_KEY is empty, so a new recording will stop at the "
+            "script step. Add the GEMINI_API_KEY repository secret.",
+            file=sys.stderr,
+        )
     return 0
 
 

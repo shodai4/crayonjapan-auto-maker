@@ -43,7 +43,14 @@ function watchRawVideo() {
   var props = PropertiesService.getScriptProperties();
   var folderId = props.getProperty('RAW_FOLDER_ID');
   if (!folderId) {
-    throw new Error('RAW_FOLDER_ID is not set in the script properties.');
+    // Log instead of throwing: an exception here would mail the owner once a
+    // minute from the time-driven trigger.
+    console.error('[raw] RAW_FOLDER_ID is not set in the script properties.');
+    return;
+  }
+  if (!props.getProperty('GITHUB_TOKEN')) {
+    console.error('[raw] GITHUB_TOKEN is not set; the relay is paused.');
+    return;
   }
 
   var log = readDispatchLog(props);
@@ -87,10 +94,11 @@ function watchRawVideo() {
 function dispatchToGitHub(file, props) {
   var token = props.getProperty('GITHUB_TOKEN');
   if (!token) {
-    throw new Error(
-      'GITHUB_TOKEN is not set. Create a fine-grained personal access token for ' +
+    console.error(
+      '[raw] GITHUB_TOKEN is not set. Create a fine-grained personal access token for ' +
       props.getProperty('GITHUB_REPO') + ' with Contents: read and write, and nothing else.'
     );
+    return false;
   }
   var repo = props.getProperty('GITHUB_REPO') || DEFAULT_GITHUB_REPO;
   var payload = {
