@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Sequence
 
 import pandas as pd
 
-MODEL_NAME = "gemini-3.8-flash"
+MODEL_NAME = "gemini-3-flash-preview"
 REQUIRED_SCRIPT_KEYS = ("title", "hook_text", "narration", "description", "tags")
 ASMR_STYLE_KEY = "style_C_asmr"
 ASMR_NARRATION_MAX_WORDS = 25
