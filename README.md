@@ -17,7 +17,9 @@ viewers actually watch.
    without a scan, the completed illustration is pulled from the last frame of the last clip.
 4. **Gemini script** – four keyframes (plus the scanned artwork when there is one) are sent to
    `gemini-3-flash-preview`, which returns the title, on-screen hook text, English narration,
-   description and tags as JSON.
+   description and tags as JSON. The client is pinned to **`v1beta`** (the `gemini-3` models are
+   not served on `v1`, which answers `404 NOT_FOUND`), and if a model is retired, out of
+   free-tier quota or overloaded the next one in `FALLBACK_MODELS` is tried instead.
 5. **Voice + subtitles** – `edge-tts` (en-US-JennyNeural) narrates, and word-level subtitles
    are burned into the video.
 6. **Upload + record** – the Short is uploaded (unlisted by default) and one row is appended

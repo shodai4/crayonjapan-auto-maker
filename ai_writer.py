@@ -14,6 +14,16 @@ from typing import Dict, List, Optional, Sequence
 import pandas as pd
 
 MODEL_NAME = "gemini-3-flash-preview"
+# The gemini-3 family is served on v1beta only. google-genai 3.x defaults to
+# v1, where a v1beta-only model answers 404 "not found for API version v1".
+API_VERSION = "v1beta"
+# Tried in order when a model is retired, out of free-tier quota or busy.
+# Retired/quota/overload replies cost no quota, so a fallback is cheap.
+# The GAS board relay uses gemini-3.8-flash, so the pipeline keeps its daily
+# free-tier quota on a different model when it can.
+FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.8-flash")
+# 404 retired/unknown model, 429 free-tier quota, 5xx overload.
+RETRYABLE_STATUS_CODES = frozenset({404, 429, 500, 502, 503, 504})
 REQUIRED_SCRIPT_KEYS = ("title", "hook_text", "narration", "description", "tags")
 ASMR_STYLE_KEY = "style_C_asmr"
 ASMR_NARRATION_MAX_WORDS = 25
@@ -123,6 +133,39 @@ def parse_script_json(raw_text: str) -> dict:
     return data
 
 
+def model_candidates(model_name: str = MODEL_NAME) -> List[str]:
+    """The primary model first, then the fallbacks, without duplicates."""
+    names: List[str] = []
+    for name in (model_name,) + tuple(FALLBACK_MODELS):
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def is_retryable_model_error(exc: BaseException) -> bool:
+    """True when another model could succeed (retired, quota, overload)."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, int) and code in RETRYABLE_STATUS_CODES:
+        return True
+    status = str(getattr(exc, "status", "") or "").upper()
+    return status in {
+        "NOT_FOUND",
+        "RESOURCE_EXHAUSTED",
+        "UNAVAILABLE",
+        "INTERNAL",
+        "DEADLINE_EXCEEDED",
+    }
+
+
+def create_client(api_key: str):
+    """A Gemini client pinned to the API version the gemini-3 models live on."""
+    from google import genai
+    from google.genai import types
+
+    http_options = types.HttpOptions(api_version=API_VERSION)
+    return genai.Client(api_key=api_key, http_options=http_options)
+
+
 def generate_making_script(
     keyframe_paths: Sequence[str],
     style_key: str,
@@ -131,14 +174,13 @@ def generate_making_script(
     reference_scan: bool = False,
 ) -> dict:
     """Send the keyframes to Gemini and return the parsed script dict."""
-    from google import genai
     from PIL import Image
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set (add it to .env)")
 
-    client = genai.Client(api_key=api_key)
+    client = create_client(api_key)
     prompt = build_script_prompt(style_key, config, reference_scan=reference_scan)
 
     contents: List[object] = [prompt]
@@ -146,5 +188,20 @@ def generate_making_script(
         if os.path.exists(path):
             contents.append(Image.open(path))
 
-    response = client.models.generate_content(model=model_name, contents=contents)
-    return parse_script_json(getattr(response, "text", "") or "")
+    candidates = model_candidates(model_name)
+    last_error: Optional[BaseException] = None
+    for name in candidates:
+        try:
+            response = client.models.generate_content(model=name, contents=contents)
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not is_retryable_model_error(exc):
+                raise
+            print(f"[gemini] {name} unavailable ({exc}); trying the next model")
+            last_error = exc
+            continue
+        print(f"[gemini] script written by {name}")
+        return parse_script_json(getattr(response, "text", "") or "")
+
+    raise RuntimeError(
+        f"Gemini rejected every model in {', '.join(candidates)}: {last_error}"
+    )

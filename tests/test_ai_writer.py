@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 import unittest
@@ -144,6 +145,156 @@ class PromptTests(unittest.TestCase):
         prompt = ai_writer.build_script_prompt("style_C_asmr", CONFIG)
         self.assertIn("the drawing sound carries the video", prompt)
         self.assertIn("25 words", prompt)
+
+
+class _FakeApiError(Exception):
+    """Stands in for google.genai.errors.APIError without the SDK."""
+
+    def __init__(self, code, status):
+        super().__init__(f"{code} {status}")
+        self.code = code
+        self.status = status
+
+
+class ModelCandidateTests(unittest.TestCase):
+    def test_the_primary_model_comes_first(self):
+        names = ai_writer.model_candidates("the-primary")
+        self.assertEqual(names[0], "the-primary")
+        self.assertEqual(len(names), len(set(names)))
+        self.assertTrue(names[1:])
+
+    def test_the_default_chain_starts_with_model_name(self):
+        self.assertEqual(ai_writer.model_candidates()[0], ai_writer.MODEL_NAME)
+
+    def test_a_fallback_is_not_repeated_when_it_is_the_primary(self):
+        names = ai_writer.model_candidates(ai_writer.FALLBACK_MODELS[0])
+        self.assertEqual(names.count(ai_writer.FALLBACK_MODELS[0]), 1)
+
+    def test_retired_quota_and_overload_errors_are_retryable(self):
+        for code, status in (
+            (404, "NOT_FOUND"),
+            (429, "RESOURCE_EXHAUSTED"),
+            (503, "UNAVAILABLE"),
+            (500, "INTERNAL"),
+        ):
+            with self.subTest(code=code):
+                self.assertTrue(ai_writer.is_retryable_model_error(_FakeApiError(code, status)))
+
+    def test_a_status_name_alone_is_enough(self):
+        self.assertTrue(
+            ai_writer.is_retryable_model_error(_FakeApiError(None, "RESOURCE_EXHAUSTED"))
+        )
+
+    def test_a_rejected_request_is_not_retryable(self):
+        for code, status in ((400, "INVALID_ARGUMENT"), (401, "UNAUTHENTICATED"), (403, "PERMISSION_DENIED")):
+            with self.subTest(code=code):
+                self.assertFalse(ai_writer.is_retryable_model_error(_FakeApiError(code, status)))
+
+    def test_a_plain_exception_is_not_retryable(self):
+        self.assertFalse(ai_writer.is_retryable_model_error(ValueError("boom")))
+
+
+class _FakeModels:
+    def __init__(self, replies, calls):
+        self._replies = replies
+        self._calls = calls
+
+    def generate_content(self, model, contents):
+        self._calls.append((model, contents))
+        reply = self._replies[model]
+        if isinstance(reply, Exception):
+            raise reply
+        return type("Reply", (), {"text": reply})()
+
+
+class _FakeClient:
+    def __init__(self, replies, calls):
+        self.models = _FakeModels(replies, calls)
+
+
+VALID_SCRIPT = {
+    "title": "Tiny pastel cat #Shorts",
+    "hook_text": "Three strokes only",
+    "narration": "A one-of-a-kind postcard.",
+    "description": "Shop: {shop}",
+    "tags": ["oil pastel", "japan"],
+}
+
+
+class GenerateScriptFallbackTests(unittest.TestCase):
+    def _run(self, replies, model_name=None):
+        calls = []
+        kwargs = {"model_name": model_name} if model_name else {}
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
+                mock.patch.object(ai_writer, "create_client", return_value=_FakeClient(replies, calls)) as factory:
+            data = ai_writer.generate_making_script([], "style_A_material", CONFIG, **kwargs)
+        return data, calls, factory
+
+    def test_a_working_primary_model_is_used_once(self):
+        data, calls, _ = self._run({ai_writer.MODEL_NAME: json.dumps(VALID_SCRIPT)})
+        self.assertEqual(data["title"], VALID_SCRIPT["title"])
+        self.assertEqual([name for name, _ in calls], [ai_writer.MODEL_NAME])
+
+    def test_a_retired_model_falls_back_to_the_next_one(self):
+        fallback = ai_writer.FALLBACK_MODELS[0]
+        replies = {
+            ai_writer.MODEL_NAME: _FakeApiError(404, "NOT_FOUND"),
+            fallback: json.dumps(VALID_SCRIPT),
+        }
+        data, calls, _ = self._run(replies)
+        self.assertEqual(data["title"], VALID_SCRIPT["title"])
+        self.assertEqual([name for name, _ in calls], [ai_writer.MODEL_NAME, fallback])
+
+    def test_an_exhausted_quota_falls_back(self):
+        replies = {name: _FakeApiError(429, "RESOURCE_EXHAUSTED") for name in ai_writer.model_candidates()}
+        replies[ai_writer.model_candidates()[-1]] = json.dumps(VALID_SCRIPT)
+        _, calls, _ = self._run(replies)
+        self.assertEqual(len(calls), len(ai_writer.model_candidates()))
+
+    def test_every_model_failing_raises_with_the_chain(self):
+        replies = {name: _FakeApiError(503, "UNAVAILABLE") for name in ai_writer.model_candidates()}
+        with self.assertRaises(RuntimeError) as caught:
+            self._run(replies)
+        self.assertIn(ai_writer.MODEL_NAME, str(caught.exception))
+
+    def test_an_invalid_request_is_not_retried_on_another_model(self):
+        replies = {ai_writer.MODEL_NAME: _FakeApiError(400, "INVALID_ARGUMENT")}
+        with self.assertRaises(_FakeApiError):
+            self._run(replies)
+
+    def test_a_missing_key_raises_before_any_call(self):
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(ai_writer, "create_client") as factory:
+            with self.assertRaises(RuntimeError):
+                ai_writer.generate_making_script([], "style_A_material", CONFIG)
+        factory.assert_not_called()
+
+    def test_existing_keyframes_are_sent_with_the_prompt(self):
+        from PIL import Image
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        frame = os.path.join(tmp.name, "frame.jpg")
+        Image.new("RGB", (8, 8), (250, 200, 210)).save(frame)
+        replies = {ai_writer.MODEL_NAME: json.dumps(VALID_SCRIPT)}
+        calls = []
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
+                mock.patch.object(ai_writer, "create_client",
+                                  return_value=_FakeClient(replies, calls)):
+            ai_writer.generate_making_script([frame], "style_A_material", CONFIG)
+        contents = calls[0][1]
+        self.assertEqual(len(contents), 2)
+        self.assertIsInstance(contents[1], Image.Image)
+
+
+class ClientApiVersionTests(unittest.TestCase):
+    def test_the_client_is_pinned_to_v1beta(self):
+        try:
+            from google.genai import types  # noqa: F401
+        except ImportError:  # pragma: no cover - SDK missing locally
+            self.skipTest("google-genai is not installed")
+        client = ai_writer.create_client("test-key")
+        self.assertEqual(client._api_client._http_options.api_version, "v1beta")
 
 
 if __name__ == "__main__":
