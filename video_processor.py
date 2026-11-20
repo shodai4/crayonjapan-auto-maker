@@ -24,6 +24,14 @@ CROP_FILTER = "crop=ih*9/16:ih,scale=1080:1920,setsar=1"
 HOOK_TAIL_SECONDS = 4.0
 MIN_MAIN_DURATION = 10.0
 
+# The finished artwork is pulled from the very end of the recording, where the
+# paper holds the completed drawing. It is kept uncropped (the 9:16 crop would
+# cut the postcard in half) so it can be used for the shop listing as well.
+DEFAULT_ARTWORK_OFFSET = 0.0
+ARTWORK_JPEG_QUALITY = 92
+ARTWORK_MAX_WIDTH = 1080
+ARTWORK_SEEK_ATTEMPTS = 8
+
 VIDEO_CODEC_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
 AUDIO_CODEC_ARGS = ["-c:a", "aac", "-b:a", "128k"]
 
@@ -146,6 +154,127 @@ def extract_keyframes(video_path: str, output_dir: str, count: int = 4) -> List[
             saved_paths.append(path)
     cap.release()
     return saved_paths
+
+
+def build_artwork_command(
+    video_path: str,
+    output_image_path: str,
+    offset_seconds: float = DEFAULT_ARTWORK_OFFSET,
+    jpeg_quality: int = ARTWORK_JPEG_QUALITY,
+) -> List[str]:
+    """FFmpeg command that grabs the finished drawing as a JPEG.
+
+    ``-sseof`` counts back from the end of the file, so only the tail is
+    decoded: the last frame of the recording is the completed illustration.
+    """
+    try:
+        requested = float(offset_seconds or 0.0)
+    except (TypeError, ValueError):
+        requested = 0.0
+    if not math.isfinite(requested) or requested < 0:
+        requested = 0.0
+    # FFmpeg refuses a "seek from the end" of exactly zero.
+    seek = max(requested, 0.1)
+    quality = min(max(int(jpeg_quality), 1), 100)
+    qscale = int(max(2, min(31, round(31 - (quality / 100.0) * 29))))
+    return [
+        "ffmpeg", "-y",
+        "-sseof", f"-{seek:.3f}",
+        "-i", video_path,
+        "-frames:v", "1",
+        "-q:v", str(qscale),
+        output_image_path,
+    ]
+
+
+def _shrink_frame(cv2, frame, max_width: int):
+    """Keep a phone-camera sized still, but never upscale it."""
+    if not max_width or max_width <= 0:
+        return frame
+    height, width = frame.shape[:2]
+    if width <= max_width:
+        return frame
+    scale = max_width / float(width)
+    size = (int(max_width), max(1, int(round(height * scale))))
+    return cv2.resize(frame, size, interpolation=cv2.INTER_AREA)
+
+
+def _save_last_frame_with_cv2(
+    video_path: str,
+    output_image_path: str,
+    offset_seconds: float,
+    jpeg_quality: int,
+    max_width: int,
+) -> bool:
+    """Write the tail frame with OpenCV; False means "let FFmpeg try"."""
+    try:
+        cv2 = _import_cv2()
+    except Exception:
+        return False
+
+    cap = cv2.VideoCapture(video_path)
+    try:
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total_frames <= 0:
+            return False
+        try:
+            offset = float(offset_seconds or 0.0)
+        except (TypeError, ValueError):
+            offset = 0.0
+        offset_frames = int(round(max(offset, 0.0) * fps))
+        target = max(total_frames - 1 - offset_frames, 0)
+        # The very last frame of a recording often sits past the final keyframe
+        # and will not decode; step back a second at a time until one does.
+        step = max(int(fps), 1)
+        for attempt in range(ARTWORK_SEEK_ATTEMPTS):
+            position = max(target - attempt * step, 0)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, position)
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                frame = _shrink_frame(cv2, frame, max_width)
+                params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
+                return bool(cv2.imwrite(output_image_path, frame, params))
+            if position == 0:
+                break
+    except Exception:
+        return False
+    finally:
+        cap.release()
+    return False
+
+
+def extract_final_artwork(
+    video_path: str,
+    output_image_path: str,
+    offset_seconds: float = DEFAULT_ARTWORK_OFFSET,
+    jpeg_quality: int = ARTWORK_JPEG_QUALITY,
+    max_width: int = ARTWORK_MAX_WIDTH,
+    runner: Runner = run_command,
+) -> str:
+    """Save the finished illustration of a drawing video as a JPEG.
+
+    Used for the shop listing and the Short thumbnail, so it comes from the raw
+    recording (full frame, no 9:16 crop). OpenCV is tried first because the
+    keyframes already need it; FFmpeg's ``-sseof`` is the fallback when OpenCV
+    cannot open or decode the file.
+    """
+    directory = os.path.dirname(output_image_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    saved = _save_last_frame_with_cv2(
+        video_path, output_image_path,
+        offset_seconds=offset_seconds,
+        jpeg_quality=jpeg_quality,
+        max_width=max_width,
+    )
+    if not saved:
+        runner(build_artwork_command(video_path, output_image_path, offset_seconds, jpeg_quality))
+
+    if not os.path.exists(output_image_path) or os.path.getsize(output_image_path) == 0:
+        raise RuntimeError(f"Could not extract the finished artwork from {video_path}")
+    return output_image_path
 
 
 def compute_timelapse_plan(

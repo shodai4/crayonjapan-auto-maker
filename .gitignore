@@ -2,6 +2,7 @@
 .env
 client_secret.json
 token.json
+drive_token.json
 
 # Local media (raw drawings and rendered output)
 input/
@@ -9,6 +10,9 @@ output/
 *.mp4
 *.mov
 *.avi
+
+# Drive sync bookkeeping (holds personal Drive file IDs)
+drive_state.json
 
 # Python
 __pycache__/
