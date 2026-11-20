@@ -112,7 +112,8 @@ Each `--drive-once` / `--drive-watch` cycle:
 
 `--drive-interval` (or `DRIVE_WATCH_INTERVAL_SECONDS`) sets the scan interval; the default is
 60 s. `--no-upload` leaves the YouTube upload to you: the package simply waits in
-`02_READY_TO_POST` until you check it on your phone.
+`02_READY_TO_POST` until you check it on your phone. Without it the Short is uploaded unlisted
+(`config.yaml`), so nothing goes public by itself.
 
 ## Narrative styles
 
