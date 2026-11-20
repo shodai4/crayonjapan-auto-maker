@@ -128,7 +128,8 @@ phone → 01_RAW_VIDEO → Apps Script (1 min) → repository_dispatch → Actio
 ```
 
 Apps Script script properties: `RAW_FOLDER_ID`, `GITHUB_REPO` (`owner/repo`) and `GITHUB_TOKEN`
-(a fine-grained PAT with *Contents: read* and *Actions: read/write*).
+(a fine-grained PAT for that one repository with *Contents: read and write* — GitHub only accepts
+a `repository_dispatch` from a token that can write code — and no other permission).
 
 Repository secrets: `GEMINI_API_KEY`, `DRIVE_RAW_FOLDER_ID`, `DRIVE_READY_FOLDER_ID`,
 `DRIVE_ARCHIVE_FOLDER_ID`, plus one Drive credential:

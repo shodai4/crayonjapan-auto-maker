@@ -17,7 +17,9 @@
  * Script properties this file expects (Project settings -> Script properties):
  *   RAW_FOLDER_ID   id of 01_RAW_VIDEO                      (required)
  *   GITHUB_TOKEN    fine-grained PAT for that repository     (required)
- *                   Contents: read, Actions: read and write
+ *                   Contents: read and write (GitHub only accepts a
+ *                   repository_dispatch from a token that can write code);
+ *                   nothing else. Revoke it here when the relay is retired.
  *   GITHUB_REPO     "owner/repo", defaults to shodai4/crayonjapan-auto-maker
  *
  * Nothing secret is written into this file, so it can stay in the public
@@ -87,7 +89,7 @@ function dispatchToGitHub(file, props) {
   if (!token) {
     throw new Error(
       'GITHUB_TOKEN is not set. Create a fine-grained personal access token for ' +
-      props.getProperty('GITHUB_REPO') + ' with Contents: read and Actions: read/write.'
+      props.getProperty('GITHUB_REPO') + ' with Contents: read and write, and nothing else.'
     );
   }
   var repo = props.getProperty('GITHUB_REPO') || DEFAULT_GITHUB_REPO;
