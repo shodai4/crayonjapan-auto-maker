@@ -108,6 +108,38 @@ def build_mux_command(
     ]
 
 
+def feed_word_boundary(submaker, chunk: dict) -> None:
+    """Hand one WordBoundary chunk to edge-tts 7.x (feed) or 6.x (create_sub).
+
+    edge-tts 7.0.0 dropped ``SubMaker.create_sub`` and ``SubMaker.generate_subs``
+    and the new API takes the chunk itself through ``feed()``; the requirements
+    pin 7.x, but working with an older install must not crash either.
+    """
+    feed = getattr(submaker, "feed", None)
+    if callable(feed):
+        feed(chunk)
+        return
+    create_sub = getattr(submaker, "create_sub", None)
+    if not callable(create_sub):
+        raise RuntimeError(
+            "edge-tts SubMaker offers neither feed() nor create_sub(); "
+            "check the installed edge-tts version"
+        )
+    create_sub((chunk["offset"], chunk["duration"]), chunk["text"])
+
+
+def render_srt(submaker) -> str:
+    """The collected words as SRT text, on both edge-tts SubMaker APIs."""
+    for name in ("get_srt", "generate_subs"):
+        writer = getattr(submaker, name, None)
+        if callable(writer):
+            return writer()
+    raise RuntimeError(
+        "edge-tts SubMaker offers neither get_srt() nor generate_subs(); "
+        "check the installed edge-tts version"
+    )
+
+
 async def synthesize_voice(
     text: str,
     audio_path: str,
@@ -125,9 +157,9 @@ async def synthesize_voice(
             if chunk["type"] == "audio":
                 file.write(chunk["data"])
             elif chunk["type"] == "WordBoundary":
-                submaker.create_sub((chunk["offset"], chunk["duration"]), chunk["text"])
+                feed_word_boundary(submaker, chunk)
     with open(srt_path, "w", encoding="utf-8") as f:
-        f.write(submaker.generate_subs())
+        f.write(render_srt(submaker))
 
 
 def mux_audio_and_subtitles(
