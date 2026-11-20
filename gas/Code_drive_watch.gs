@@ -148,6 +148,13 @@ function installRawVideoTrigger() {
   return 'installed';
 }
 
+/** Forgets the dispatched files so the next sweep retries them (handy while testing). */
+function clearDispatchLog() {
+  PropertiesService.getScriptProperties().deleteProperty(LOG_PROPERTY);
+  console.log('[raw] dispatch log cleared; the next sweep will treat every file as new.');
+  return 'cleared';
+}
+
 /** Prints what the next sweep would see; useful for a first manual check. */
 function describeRawFolder() {
   var props = PropertiesService.getScriptProperties();
