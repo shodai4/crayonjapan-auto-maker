@@ -109,6 +109,32 @@ class GasScriptTests(unittest.TestCase):
         self.assertIsNone(DRIVE_FOLDER_ID.search(self.text))
         self.assertNotIn("@", self.text)
 
+    def test_watches_go_folders_as_well_as_loose_videos(self):
+        self.assertIn("/^GO_/i", self.text)
+        self.assertIn("getFolders()", self.text)
+        self.assertIn("FOLDER_MIN_AGE_MS", self.text)
+        self.assertIn("GO_FOLDER_PATTERN.test(sub.getName())", self.text)
+        self.assertIn("VIDEO_EXTENSION.test(file.getName())", self.text)
+
+    def test_the_dispatch_says_what_kind_of_item_it_is(self):
+        self.assertIn("item_type", self.text)
+        self.assertIn("kind: 'folder'", self.text)
+        self.assertIn("kind: 'file'", self.text)
+
+    def test_the_trigger_never_throws_when_unconfigured(self):
+        start = self.text.index("function watchRawVideo")
+        body = self.text[start:self.text.index("function collectWaitingItems")]
+        self.assertIn("console.error", body)
+        self.assertIn("return;", body)
+        self.assertNotIn("throw new Error", body)
+
+    def test_describe_lists_folders_and_files(self):
+        self.assertIn("describeRawFolder", self.text)
+        describe = self.text[self.text.index("function describeRawFolder"):]
+        self.assertIn("getFolders()", describe)
+        self.assertIn("getFiles()", describe)
+        self.assertIn("go=", describe)
+
 
 if __name__ == "__main__":
     unittest.main()

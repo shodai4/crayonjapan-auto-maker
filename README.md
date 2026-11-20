@@ -9,12 +9,15 @@ viewers actually watch.
 
 1. **Finish-preview hook** – the last few seconds of the drawing (the finished postcard) are
    cut at natural speed into the first 2.5 s.
-2. **Vertical time-lapse** – the whole recording is sped up and cropped to 1080x1920 (9:16).
-3. **Finished artwork still** – the completed illustration is pulled from the last frame of the
-   raw recording (full frame, no 9:16 crop) and saved as a JPEG for the thumbnail and the shop
-   listing.
-4. **Gemini script** – four keyframes are sent to `gemini-3-flash-preview`, which returns the title,
-   on-screen hook text, English narration, description and tags as JSON.
+2. **Vertical time-lapse** – the whole recording is sped up and fitted to 1080x1920 (9:16).
+   A project of several recordings is rendered clip by clip: each raw clip becomes its own
+   short 9:16 segment proportional to its length, and only those small segments are joined.
+3. **Finished artwork still** – a scanned drawing placed in the project folder becomes the
+   artwork JPEG (whole sheet, never cropped, shrunk to 1080 px wide) and is given to Gemini;
+   without a scan, the completed illustration is pulled from the last frame of the last clip.
+4. **Gemini script** – four keyframes (plus the scanned artwork when there is one) are sent to
+   `gemini-3-flash-preview`, which returns the title, on-screen hook text, English narration,
+   description and tags as JSON.
 5. **Voice + subtitles** – `edge-tts` (en-US-JennyNeural) narrates, and word-level subtitles
    are burned into the video.
 6. **Upload + record** – the Short is uploaded (unlisted by default) and one row is appended
@@ -24,9 +27,10 @@ viewers actually watch.
    YouTube Data API and the average view percentage from the YouTube Analytics API.
    `choose_best_style()` then reuses the best-performing style, with a 25 % exploration rate
    so the other styles keep getting a chance.
-8. **Google Drive hub (phase 2)** – `drive_sync.py` watches a Drive folder, downloads new
-   recordings, renders them and drops the finished package into a second folder, then moves
-   the source into an archive folder. See *Google Drive hub* below.
+8. **Google Drive hub (phase 2)** – `drive_sync.py` watches a Drive folder, renders each
+   waiting artwork (a `GO_` project folder or a loose recording) and drops the finished
+   package into a second folder, then moves the source into an archive folder. See
+   *Google Drive hub* below.
 
 ## Requirements
 
@@ -91,24 +95,55 @@ Folder layout (create it once in your own Drive; nothing personal is stored in t
 
 ```
 AI秘書 / 12_動画自動作成/
-    01_RAW_VIDEO/      drop the raw drawing recording here
-    02_READY_TO_POST/  finished MP4 + artwork JPEG + English metadata appear here
-    03_ARCHIVE/        the raw recording, moved here once it has been rendered
+    01_RAW_VIDEO/          drop the raw drawing recording(s) here
+        20261121_sushi/        <- one artwork while you are still uploading
+            part1.mp4
+            part2.mp4
+            finish.mp4
+            scan.jpg
+        GO_20261121_sushi/     <- renamed when the artwork is ready to render
+        GO_20261122_cat/       <- another finished artwork, waiting
+    02_READY_TO_POST/      finished MP4 + artwork JPEG + English metadata appear here
+    03_ARCHIVE/            the GO_ folder (or loose recording) moved here once rendered
 ```
 
 Copy each folder ID from its URL (`https://drive.google.com/drive/folders/<ID>`) into `.env` as
 `DRIVE_RAW_FOLDER_ID`, `DRIVE_READY_FOLDER_ID` and `DRIVE_ARCHIVE_FOLDER_ID`.
 
-Each `--drive-once` / `--drive-watch` cycle:
+### One artwork = one `GO_` folder
 
-1. lists `01_RAW_VIDEO` for `.mp4` / `.mov` / `.avi` files that are not already processed;
-2. skips files modified in the last 60 s (`--drive-min-age`), so a still-uploading video is
-   never downloaded half-finished;
-3. downloads the recording into `input/` and runs the full pipeline;
-4. uploads `*_final.mp4`, `*_artwork.jpg`, `*_metadata.txt` and `*_art_metadata.json` into
-   `02_READY_TO_POST` with resumable uploads;
-5. moves the raw recording to `03_ARCHIVE` and records the file ID in `drive_state.json`,
-   so an interrupted run repeats at most one video instead of re-rendering everything.
+Put all the files of one artwork in a subfolder of `01_RAW_VIDEO`:
+
+- **raw drawing clips** – `.mp4` / `.mov` / `.avi`, any number, any length. They are sorted
+  naturally (`part2.mp4` before `part10.mp4`), and a clip named `finish`, `final`, `complete`,
+  `end` or `完成` is always put last so the finish-preview hook comes from it.
+- **scanned artwork** – `.jpg` / `.png` of the finished drawing. The first one is used as the
+  artwork JPEG and as Gemini's reference image.
+
+`GO_` is the signal: **while the folder has any other name it is ignored**, so you can upload
+for an hour and rename the folder (or just type `GO_` in front of its name) when it is complete.
+The prefix is stripped from the output names, so `GO_20261121_sushi` produces
+`20261121_sushi_final.mp4`, `20261121_sushi_artwork.jpg`, `20261121_sushi_metadata.txt` and
+`20261121_sushi_art_metadata.json`.
+
+A loose `.mp4` / `.mov` / `.avi` dropped straight into `01_RAW_VIDEO` still works exactly as
+before (one recording, artwork from its last frame).
+
+### One scan cycle
+
+1. lists `01_RAW_VIDEO` and picks up every `GO_` folder plus any loose video that is not
+   already processed;
+2. skips a loose video modified in the last 60 s (`--drive-min-age`) so a still-uploading file
+   is never downloaded half-finished; a `GO_` folder only waits a few seconds after its rename,
+   because the rename itself is the "done" signal;
+3. downloads the clips **one at a time**, renders each into its short 9:16 segment and deletes
+   the raw copy again, so an hour-long 6 GB recording never becomes a second 6 GB file on disk;
+4. joins the hook (2.5 s from the end of the last clip) with the segments and finishes the
+   Short (script, voice, subtitles);
+5. uploads the four artifacts into `02_READY_TO_POST` with resumable uploads;
+6. moves the whole `GO_` folder (or the loose file) to `03_ARCHIVE` and records its id in
+   `drive_state.json`, so an interrupted run repeats at most one artwork instead of
+   re-rendering everything.
 
 `--drive-interval` (or `DRIVE_WATCH_INTERVAL_SECONDS`) sets the scan interval; the default is
 60 s. `--no-upload` leaves the YouTube upload to you: the package simply waits in
@@ -123,8 +158,9 @@ runs the message-board relay; its 1-minute trigger watches `01_RAW_VIDEO` and po
 then runs the same `--drive-once --no-upload` pipeline on a free `ubuntu-latest` runner:
 
 ```
-phone → 01_RAW_VIDEO → Apps Script (1 min) → repository_dispatch → Actions (FFmpeg/OpenCV/Gemini)
-      → 02_READY_TO_POST + raw file moved to 03_ARCHIVE → artifact kept on the run for 14 days
+phone → 01_RAW_VIDEO (GO_ folder) → Apps Script (1 min) → repository_dispatch
+      → Actions (FFmpeg/OpenCV/Gemini) → 02_READY_TO_POST + folder moved to 03_ARCHIVE
+      → artifact kept on the run for 14 days
 ```
 
 Apps Script script properties: `RAW_FOLDER_ID`, `GITHUB_REPO` (`owner/repo`) and `GITHUB_TOKEN`
@@ -142,8 +178,9 @@ Repository secrets: `GEMINI_API_KEY`, `DRIVE_RAW_FOLDER_ID`, `DRIVE_READY_FOLDER
 `python scripts/verify_drive_access.py` checks that credential and prints how many files are
 waiting, without printing the credential itself.
 
-A double dispatch is harmless: `01_RAW_VIDEO` is scanned on every run and the raw file only
-leaves it once the package is uploaded, so a second run simply finds nothing to render.
+A double dispatch is harmless: `01_RAW_VIDEO` is scanned on every run and a `GO_` folder (or a
+loose file) only leaves it once the package is uploaded, so a second run simply finds nothing to
+render.
 
 ## Narrative styles
 
@@ -167,10 +204,19 @@ python3 -m unittest discover -s tests -t . -v
 
 The tests cover style selection, CSV handling, FFmpeg command assembly, `atempo` chaining,
 the audio-mixing branch, JSON parsing of Gemini replies, upload body limits, finished-artwork
-extraction (OpenCV path and FFmpeg fallback), the metadata bundle, the Drive sync orchestration
-(list / download / upload / archive / state, mocked Drive client) and project file invariants.
+extraction (OpenCV path and FFmpeg fallback), scanned-artwork resizing, the per-clip project
+plan and its FFmpeg commands, the metadata bundle, the Drive sync orchestration
+(GO_ folder discovery, natural sorting, prefix stripping, download / upload / archive / state,
+mocked Drive client) and project file invariants.
 They need `pandas`, `pyyaml` and `opencv-python` only – no FFmpeg run, API key or network
 access.
+
+For a real end-to-end check with FFmpeg (synthetic clips, different resolutions and audio,
+plus a scanned PNG), run:
+
+```bash
+python3 scripts/verify_project_pipeline.py --ffmpeg "$(command -v ffmpeg)"
+```
 
 ## Repository layout
 
@@ -209,13 +255,19 @@ tests/                   unittest suite
 
 ## Notes and limitations
 
-- Videos are processed one at a time; the watcher keeps running if a single video fails.
-- Drive mode needs a video that is fully uploaded. Files touched in the last 60 s are skipped
-  until a later scan, so the upload can finish first.
-- A failed render or upload leaves the raw video in `01_RAW_VIDEO`; the next scan tries it again.
-  Only successes go to `03_ARCHIVE`.
-- The finished artwork is the last frame of the recording. If your hand still covers part of the
-  paper at the end, pass `--artwork-offset 3` to grab a frame three seconds earlier.
+- Artworks are processed one at a time; the watcher keeps running if a single one fails.
+- Drive mode needs an item that is fully uploaded. A loose file touched in the last 60 s is
+  skipped until a later scan; a `GO_` folder only waits about 15 s after the rename.
+- A failed render or upload leaves the `GO_` folder in `01_RAW_VIDEO`; the next scan tries it
+  again. Only successes go to `03_ARCHIVE`.
+- Long recordings: each clip is downloaded, time-lapsed into its short segment and deleted
+  before the next one is pulled, and a clip is only downloaded when at least 1.5 GB would stay
+  free. Rendering is dominated by decoding the source (roughly a few minutes per hour of
+  1080p), so several hour-long clips in one artwork can approach the free runner's 1-hour
+  limit; the dispatch token also expires after about an hour, so keep one artwork per run for
+  very long material.
+- The scanned image is the finished artwork; if you would rather take it from the video, leave
+  the image out of the folder and `--artwork-offset 3` grabs a frame three seconds earlier.
 - The mix uses `amix=...:normalize=0`, which needs FFmpeg 4.4 or newer.
 - A freshly uploaded Short has no Analytics rows for a while; until then its
   `avg_view_percentage` stays at its previous (or 0) value and the update is only logged.

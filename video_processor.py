@@ -5,6 +5,14 @@ Turns a raw hand-drawing recording into a 9:16 vertical time-lapse with a short
 
 `keep_audio=True` keeps the original drawing sound (used by the ASMR style)
 instead of stripping the audio track with ``-an``.
+
+Two input shapes are supported:
+
+* one recording (``build_vertical_timelapse``) - the original behaviour;
+* a project of several recordings (``GO_`` folder in 01_RAW_VIDEO). Each clip is
+  rendered straight into its own short 9:16 segment (``render_project_segment``)
+  and only the tiny segments are concatenated, so an hour-long 6 GB recording
+  never becomes a second multi-GB intermediate file on the runner's disk.
 """
 
 from __future__ import annotations
@@ -34,6 +42,27 @@ ARTWORK_SEEK_ATTEMPTS = 8
 
 VIDEO_CODEC_ARGS = ["-c:v", "libx264", "-preset", "fast", "-crf", "22"]
 AUDIO_CODEC_ARGS = ["-c:a", "aac", "-b:a", "128k"]
+
+# Project rendering: every clip is normalised to the same canvas so the short
+# segments can be concatenated with `-c copy`. "Fit + pad" (instead of the 9:16
+# crop) never cuts a landscape clip in half and keeps both orientations valid.
+PROJECT_WIDTH = 1080
+PROJECT_HEIGHT = 1920
+PROJECT_FPS = 30
+PROJECT_AUDIO_RATE = 48000
+PROJECT_AUDIO_CHANNELS = 2
+SEGMENT_VIDEO_CODEC_ARGS = [
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+]
+SEGMENT_AUDIO_CODEC_ARGS = [
+    "-c:a", "aac", "-b:a", "128k",
+    "-ar", str(PROJECT_AUDIO_RATE), "-ac", str(PROJECT_AUDIO_CHANNELS),
+]
+# Used only when a clip's length is unknown (Drive normally reports
+# videoMediaMetadata.durationMillis, so this is a rare fallback).
+DEFAULT_CLIP_DURATION_SECONDS = 60.0
+# Below this breathing room the pipeline refuses to pull another raw clip.
+DISK_MARGIN_BYTES = 1500 * 1024 * 1024
 
 Runner = Callable[[Sequence[str]], None]
 
@@ -395,6 +424,250 @@ def build_concat_list_content(hook_path: str, main_path: str) -> str:
         f"file '{os.path.abspath(hook_path)}'\n"
         f"file '{os.path.abspath(main_path)}'\n"
     )
+
+
+# ---------------------------------------------------------------------------
+# Project mode: several raw clips -> one Short, rendered clip by clip
+# ---------------------------------------------------------------------------
+
+def build_fit_filter(
+    width: int = PROJECT_WIDTH,
+    height: int = PROJECT_HEIGHT,
+    fps: int = PROJECT_FPS,
+) -> str:
+    """Letterbox a clip onto the shared 1080x1920 30 fps canvas (no cropping)."""
+    return (
+        f"scale={int(width)}:{int(height)}:force_original_aspect_ratio=decrease,"
+        f"pad={int(width)}:{int(height)}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={int(fps)}"
+    )
+
+
+def compute_project_plan(
+    durations: Sequence[float],
+    target_duration: float = 38.0,
+    hook_duration: float = 2.5,
+    fallback_duration: float = DEFAULT_CLIP_DURATION_SECONDS,
+) -> Dict[str, object]:
+    """Split one Short across the clips of a project, proportionally.
+
+    Every clip keeps the same time-lapse speed (``pts_multiplier``), so a clip
+    that is twice as long contributes twice as many seconds, and the segments
+    add up to the requested main duration. A duration of ``0``/``None`` (Drive
+    had no metadata for that file) is replaced by the average of the known
+    clips and flagged in ``estimated``.
+    """
+    if not durations:
+        raise ValueError("a project needs at least one video clip")
+
+    cleaned: List[Optional[float]] = []
+    for value in durations:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            cleaned.append(None)
+            continue
+        cleaned.append(number if math.isfinite(number) and number > 0 else None)
+
+    known = [value for value in cleaned if value]
+    fallback = (sum(known) / len(known)) if known else float(fallback_duration)
+    resolved = [value if value else fallback for value in cleaned]
+    total = sum(resolved)
+
+    plan = compute_timelapse_plan(total, target_duration=target_duration, hook_duration=hook_duration)
+    last_duration = resolved[-1]
+    hook_length = min(plan["hook_duration"], last_duration)
+    hook_start = max(last_duration - HOOK_TAIL_SECONDS, 0.0)
+    pts = plan["pts_multiplier"]
+
+    return {
+        "clip_count": len(resolved),
+        "durations": resolved,
+        "estimated": any(value is None for value in cleaned),
+        "total_duration": total,
+        # The hook comes from the tail of the last clip, at natural speed.
+        "hook_start": hook_start,
+        "hook_duration": hook_length,
+        "main_duration": plan["main_duration"],
+        "speed_factor": plan["speed_factor"],
+        "pts_multiplier": pts,
+        "segment_durations": [duration * pts for duration in resolved],
+    }
+
+
+def _segment_inputs(keep_audio: bool, has_audio: bool) -> List[str]:
+    """Extra FFmpeg inputs needed so every segment carries the same streams."""
+    if keep_audio and not has_audio:
+        return [
+            "-f", "lavfi",
+            "-i", f"anullsrc=r={PROJECT_AUDIO_RATE}:cl=stereo",
+        ]
+    return []
+
+
+def _segment_output_args(keep_audio: bool, has_audio: bool) -> List[str]:
+    """Maps and codec arguments shared by the hook and the body segments."""
+    if not keep_audio:
+        return ["-an", *SEGMENT_VIDEO_CODEC_ARGS]
+    audio_map = "0:a:0" if has_audio else "1:a:0"
+    return [
+        "-map", "0:v:0",
+        "-map", audio_map,
+        *SEGMENT_VIDEO_CODEC_ARGS,
+        *SEGMENT_AUDIO_CODEC_ARGS,
+        "-shortest",
+    ]
+
+
+def build_project_segment_command(
+    input_path: str,
+    output_path: str,
+    pts_multiplier: float,
+    keep_audio: bool = False,
+    has_audio: bool = True,
+    width: int = PROJECT_WIDTH,
+    height: int = PROJECT_HEIGHT,
+    fps: int = PROJECT_FPS,
+) -> List[str]:
+    """Speed one raw clip up and write its short 9:16 segment.
+
+    ``pts_multiplier`` is the shared time scale (0.01 = 100x faster), so the
+    segment is ``clip_duration * pts_multiplier`` seconds long. Audio, when kept
+    (ASMR), is stretched by the same factor and padded so ``-shortest`` ends on
+    the picture.
+    """
+    try:
+        pts = float(pts_multiplier)
+    except (TypeError, ValueError):
+        pts = 1.0
+    if not math.isfinite(pts) or pts <= 0:
+        pts = 1.0
+
+    vf = f"setpts={pts:.6f}*PTS,{build_fit_filter(width, height, fps)}"
+    cmd = ["ffmpeg", "-y", "-i", input_path]
+    cmd += _segment_inputs(keep_audio, has_audio)
+    cmd += ["-vf", vf]
+    if keep_audio:
+        cmd += ["-af", f"{build_atempo_filter(1.0 / pts)},apad"]
+    cmd += _segment_output_args(keep_audio, has_audio)
+    cmd.append(output_path)
+    return cmd
+
+
+def build_project_hook_command(
+    input_path: str,
+    output_path: str,
+    hook_start: float,
+    hook_duration: float,
+    keep_audio: bool = False,
+    has_audio: bool = True,
+    width: int = PROJECT_WIDTH,
+    height: int = PROJECT_HEIGHT,
+    fps: int = PROJECT_FPS,
+) -> List[str]:
+    """2.5 s finish preview cut from the tail of the last clip, natural speed."""
+    try:
+        start = max(float(hook_start), 0.0)
+    except (TypeError, ValueError):
+        start = 0.0
+    try:
+        length = max(float(hook_duration), 0.1)
+    except (TypeError, ValueError):
+        length = HOOK_TAIL_SECONDS
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.3f}",
+        "-t", f"{length:.3f}",
+        "-i", input_path,
+    ]
+    cmd += _segment_inputs(keep_audio, has_audio)
+    cmd += ["-vf", build_fit_filter(width, height, fps)]
+    if keep_audio:
+        cmd += ["-af", "apad"]
+    cmd += _segment_output_args(keep_audio, has_audio)
+    cmd.append(output_path)
+    return cmd
+
+
+def build_segments_concat_list_content(paths: Sequence[str]) -> str:
+    return "".join(f"file '{os.path.abspath(path)}'\n" for path in paths)
+
+
+def concat_segments(
+    paths: Sequence[str],
+    output_path: str,
+    runner: Runner = run_command,
+    list_path: str = "",
+) -> str:
+    """Join the identically-encoded hook/body segments without re-encoding."""
+    if not paths:
+        raise ValueError("nothing to concatenate")
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    list_file = list_path or f"{os.path.splitext(output_path)[0]}_segments.txt"
+    with open(list_file, "w", encoding="utf-8") as handle:
+        handle.write(build_segments_concat_list_content(paths))
+    try:
+        runner(build_concat_command(list_file, output_path))
+    finally:
+        if os.path.exists(list_file):
+            os.remove(list_file)
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"Concatenating the segments produced no video: {output_path}")
+    return output_path
+
+
+def ensure_disk_space(directory: str, required_bytes: int = 0, margin: int = DISK_MARGIN_BYTES) -> None:
+    """Raise before a download that would fill the runner's disk."""
+    import shutil
+
+    try:
+        free = shutil.disk_usage(directory or ".").free
+    except OSError:
+        return
+    if required_bytes and free < int(required_bytes) + margin:
+        raise RuntimeError(
+            f"not enough free disk for {required_bytes / (1024 ** 3):.2f} GB "
+            f"(+{margin / (1024 ** 3):.1f} GB margin): {free / (1024 ** 3):.2f} GB left"
+        )
+
+
+def prepare_scanned_artwork(
+    image_path: str,
+    output_path: str,
+    max_width: int = ARTWORK_MAX_WIDTH,
+    jpeg_quality: int = ARTWORK_JPEG_QUALITY,
+) -> str:
+    """Turn the scanned drawing (jpg/png, any size) into the artwork JPEG.
+
+    The scan is never cropped: it is only shrunk to ``max_width`` so the whole
+    sheet stays in the thumbnail and the shop listing. A transparent PNG is
+    flattened onto white, the way the paper looks.
+    """
+    import numpy as np
+
+    cv2 = _import_cv2()
+    frame = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    if frame is None:
+        raise RuntimeError(f"Could not read the scanned artwork: {image_path}")
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        alpha = frame[:, :, 3:4].astype("float32") / 255.0
+        rgb = frame[:, :, :3].astype("float32")
+        frame = (rgb * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
+    elif frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+    frame = _shrink_frame(cv2, frame, max_width)
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    params = [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)]
+    if not cv2.imwrite(output_path, frame, params):
+        raise RuntimeError(f"Could not write the artwork JPEG: {output_path}")
+    if os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"The artwork JPEG is empty: {output_path}")
+    return output_path
 
 
 def build_vertical_timelapse(

@@ -11,9 +11,72 @@ FOLDERS = ds.DriveFolders(raw="raw-folder", ready="ready-folder", archive="archi
 NOW = datetime(2026, 11, 21, 12, 0, 0, tzinfo=timezone.utc)
 
 
+def modified(age_seconds=3600):
+    return (NOW - timedelta(seconds=age_seconds)).isoformat().replace("+00:00", "Z")
+
+
 def video_info(file_id="file1", name="drawing.mp4", age_seconds=3600):
-    modified = (NOW - timedelta(seconds=age_seconds)).isoformat().replace("+00:00", "Z")
-    return {"id": file_id, "name": name, "mimeType": "video/mp4", "modifiedTime": modified}
+    return {"id": file_id, "name": name, "mimeType": "video/mp4", "modifiedTime": modified(age_seconds)}
+
+
+def ref(file_id="v1", name="part1.mp4", size=1024, duration=120.0, age_seconds=3600):
+    return ds.DriveFileRef(
+        id=file_id, name=name, size=size,
+        modified_time=modified(age_seconds), duration_seconds=duration,
+    )
+
+
+def video_item(file_id="file1", name="drawing.mp4", age_seconds=3600, duration=120.0):
+    """A loose video dropped straight into 01_RAW_VIDEO."""
+    return ds.RawItem(
+        id=file_id,
+        name=name,
+        kind=ds.KIND_VIDEO,
+        stem=os.path.splitext(name)[0],
+        modified_time=modified(age_seconds),
+        videos=[ref(file_id, name, duration=duration)],
+    )
+
+
+def project_item(
+    item_id="folder1",
+    name="GO_20261121_sushi",
+    age_seconds=3600,
+    videos=None,
+    images=None,
+):
+    return ds.RawItem(
+        id=item_id,
+        name=name,
+        kind=ds.KIND_PROJECT,
+        stem=ds.strip_go_prefix(name),
+        modified_time=modified(age_seconds),
+        videos=videos if videos is not None else [ref("v1", "part1.mp4"), ref("v2", "part2.mp4")],
+        images=images if images is not None else [],
+    )
+
+
+class _Response:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def execute(self):
+        return self.payload
+
+
+def service_for_children(children_by_parent):
+    """Fake Drive that answers each `'<id>' in parents` query from a dict."""
+    service = mock.MagicMock()
+
+    def listing(**kwargs):
+        query = str(kwargs.get("q", ""))
+        for parent, children in children_by_parent.items():
+            if f"'{parent}' in parents" in query:
+                return _Response({"files": children})
+        return _Response({"files": []})
+
+    service.files.return_value.list.side_effect = listing
+    return service
 
 
 def fake_service(pages):
@@ -107,6 +170,15 @@ class SettledTests(unittest.TestCase):
     def test_naive_now_is_read_as_utc(self):
         info = video_info(age_seconds=600)
         self.assertTrue(ds.is_settled(info, now=datetime(2026, 11, 21, 12, 0, 0)))
+
+    def test_loose_video_still_waits_a_minute(self):
+        self.assertFalse(ds.item_is_settled(video_item(age_seconds=30), now=NOW))
+        self.assertTrue(ds.item_is_settled(video_item(age_seconds=90), now=NOW))
+
+    def test_go_folder_only_waits_a_few_seconds_after_the_rename(self):
+        self.assertFalse(ds.item_is_settled(project_item(age_seconds=1), now=NOW))
+        self.assertTrue(ds.item_is_settled(project_item(age_seconds=30), now=NOW))
+        self.assertTrue(ds.item_is_settled(project_item(age_seconds=30), now=NOW, min_age_seconds=600))
 
 
 class DownloadTests(unittest.TestCase):
@@ -206,6 +278,105 @@ class StateTests(unittest.TestCase):
         self.assertFalse(ds.is_processed(reloaded, "f2"))
 
 
+class GoFolderNamingTests(unittest.TestCase):
+    def test_only_go_folders_are_picked_up(self):
+        for name in ("GO_20261121_sushi", "go_sakura", "Go_cat"):
+            self.assertTrue(ds.is_go_folder_name(name), name)
+        for name in ("20261121_sushi", "GONZO", "my_GO_folder", ""):
+            self.assertFalse(ds.is_go_folder_name(name), name)
+
+    def test_the_prefix_is_stripped_from_the_output_stem(self):
+        self.assertEqual(ds.strip_go_prefix("GO_20261121_sushi"), "20261121_sushi")
+        self.assertEqual(ds.strip_go_prefix("go_20261121_sushi"), "20261121_sushi")
+        self.assertEqual(ds.strip_go_prefix("GO_  spaced  "), "spaced")
+        # A bare GO_ keeps its own name instead of becoming an empty stem.
+        self.assertEqual(ds.strip_go_prefix("GO_"), "GO_")
+        self.assertEqual(ds.strip_go_prefix("sushi"), "sushi")
+
+    def test_natural_sort_keeps_part_numbers_in_order(self):
+        names = ["part10.mp4", "part2.mp4", "part1.mp4"]
+        self.assertEqual(
+            sorted(names, key=ds.natural_sort_key),
+            ["part1.mp4", "part2.mp4", "part10.mp4"],
+        )
+
+    def test_completion_clip_sorts_after_the_drawing_clips(self):
+        names = ["finish.mp4", "part10.mp4", "part2.mp4", "09_final_touch.MOV"]
+        self.assertEqual(
+            sorted(names, key=ds.natural_sort_key),
+            ["part2.mp4", "part10.mp4", "09_final_touch.MOV", "finish.mp4"],
+        )
+
+    def test_image_and_video_names_are_told_apart(self):
+        for name in ("scan.jpg", "SCAN.JPEG", "art.png"):
+            self.assertTrue(ds.is_raw_image_name(name), name)
+        for name in ("clip.mp4", "notes.txt", ""):
+            self.assertFalse(ds.is_raw_image_name(name), name)
+
+
+class PendingItemTests(unittest.TestCase):
+    def test_go_folder_and_loose_video_are_both_listed(self):
+        service = service_for_children({
+            "raw-folder": [
+                {"id": "f1", "name": "GO_20261121_sushi", "mimeType": ds.FOLDER_MIME_TYPE,
+                 "modifiedTime": modified(3600)},
+                {"id": "f2", "name": "uploading_sakura", "mimeType": ds.FOLDER_MIME_TYPE,
+                 "modifiedTime": modified(3600)},
+                {"id": "v9", "name": "old_drawing.mp4", "mimeType": "video/mp4",
+                 "modifiedTime": modified(3600)},
+                {"id": "t1", "name": "notes.txt", "mimeType": "text/plain",
+                 "modifiedTime": modified(3600)},
+            ],
+            "f1": [
+                {"id": "v10", "name": "part10.mp4", "mimeType": "video/mp4", "size": "2048",
+                 "modifiedTime": modified(3600),
+                 "videoMediaMetadata": {"durationMillis": "90000"}},
+                {"id": "v2", "name": "part2.mp4", "mimeType": "video/mp4", "size": "1024",
+                 "modifiedTime": modified(3600),
+                 "videoMediaMetadata": {"durationMillis": "30000"}},
+                {"id": "v3", "name": "finish.mp4", "mimeType": "video/mp4",
+                 "modifiedTime": modified(3600)},
+                {"id": "i1", "name": "scan.png", "mimeType": "image/png", "size": "5000",
+                 "modifiedTime": modified(3600)},
+                {"id": "i2", "name": "scan_close.jpg", "mimeType": "image/jpeg",
+                 "modifiedTime": modified(3600)},
+            ],
+        })
+
+        items = ds.list_pending_raw_items(service, "raw-folder")
+
+        self.assertEqual([item.name for item in items], ["GO_20261121_sushi", "old_drawing.mp4"])
+        project, loose = items
+        self.assertEqual(project.kind, ds.KIND_PROJECT)
+        self.assertEqual(project.stem, "20261121_sushi")
+        self.assertEqual([clip.name for clip in project.videos], ["part2.mp4", "part10.mp4", "finish.mp4"])
+        self.assertEqual([scan.name for scan in project.images], ["scan.png", "scan_close.jpg"])
+        self.assertEqual([clip.duration_seconds for clip in project.videos], [30.0, 90.0, None])
+        self.assertEqual(project.videos[0].size, 1024)
+        self.assertEqual(loose.kind, ds.KIND_VIDEO)
+        self.assertEqual(loose.stem, "old_drawing")
+        self.assertEqual([clip.name for clip in loose.videos], ["old_drawing.mp4"])
+
+    def test_a_go_folder_without_a_video_is_still_reported(self):
+        service = service_for_children({
+            "raw-folder": [{"id": "f1", "name": "GO_empty", "mimeType": ds.FOLDER_MIME_TYPE,
+                            "modifiedTime": modified(3600)}],
+            "f1": [],
+        })
+        items = ds.list_pending_raw_items(service, "raw-folder")
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].videos, [])
+
+    def test_nothing_waiting_means_an_empty_list(self):
+        self.assertEqual(ds.list_pending_raw_items(service_for_children({}), "raw-folder"), [])
+
+    def test_the_listing_asks_for_the_clip_durations(self):
+        service = service_for_children({"raw-folder": []})
+        ds.list_pending_raw_items(service, "raw-folder")
+        fields = service.files.return_value.list.call_args.kwargs["fields"]
+        self.assertIn("videoMediaMetadata(durationMillis", fields)
+
+
 class SyncOnceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -218,10 +389,11 @@ class SyncOnceTests(unittest.TestCase):
                 handle.write(b"x")
             self.artifacts[name] = path
         self.logs = []
+        self.sources = []
 
     def _pipeline(self, artifacts=None, video_id="yt-123"):
-        def pipeline(local_path):
-            self.pipeline_input = local_path
+        def pipeline(source):
+            self.sources.append(source)
             return dict(
                 {
                     "final_video": self.artifacts["clip_final.mp4"],
@@ -234,8 +406,8 @@ class SyncOnceTests(unittest.TestCase):
             )
         return pipeline
 
-    def _run(self, videos=None, pipeline=None, **kwargs):
-        videos = [video_info()] if videos is None else videos
+    def _run(self, items=None, pipeline=None, keep_local_raw=True, **kwargs):
+        items = [video_item()] if items is None else items
         download_dir = os.path.join(self.tmp.name, "input")
 
         def downloader(svc, fid, path):
@@ -247,7 +419,7 @@ class SyncOnceTests(unittest.TestCase):
         download = mock.MagicMock(side_effect=downloader)
         upload = mock.MagicMock(side_effect=lambda svc, path, folder: {"id": f"up-{os.path.basename(path)}"})
         mover = mock.MagicMock(return_value={"id": "file1"})
-        with mock.patch.object(ds, "list_raw_videos", return_value=videos):
+        with mock.patch.object(ds, "list_pending_raw_items", return_value=items):
             results = ds.sync_once(
                 object(), FOLDERS, pipeline or self._pipeline(),
                 download_dir=download_dir,
@@ -257,6 +429,7 @@ class SyncOnceTests(unittest.TestCase):
                 uploader=upload,
                 mover=mover,
                 log=self.logs.append,
+                keep_local_raw=keep_local_raw,
                 **kwargs,
             )
         return results, download, upload, mover
@@ -267,31 +440,65 @@ class SyncOnceTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["status"], "done")
         self.assertEqual(results[0]["video_id"], "yt-123")
-        download.assert_called_once()
-        self.assertEqual(upload.call_count, 4)
+        self.assertEqual(len(upload.call_args_list), 4)
         for call in upload.call_args_list:
             self.assertEqual(call.args[2], FOLDERS.ready)
         mover.assert_called_once_with(mock.ANY, "file1", FOLDERS.archive, FOLDERS.raw)
+        download.assert_not_called()  # the pipeline pulls its own clips
 
         state = ds.load_state(self.state_path)
         self.assertTrue(ds.is_processed(state, "file1"))
         self.assertEqual(len(state["processed"]["file1"]["uploaded"]), 4)
 
-    def test_second_scan_does_not_render_the_same_file_again(self):
+    def test_the_pipeline_receives_what_it_needs_to_download_a_clip(self):
+        self._run()
+        source = self.sources[0]
+        self.assertEqual(source.item_id, "file1")
+        self.assertEqual(source.stem, "drawing")
+        self.assertEqual(source.kind, ds.KIND_VIDEO)
+        self.assertEqual([clip.name for clip in source.videos], ["drawing.mp4"])
+        self.assertTrue(callable(source.fetch))
+        dest = os.path.join(source.work_dir, "clip.mp4")
+        self.assertEqual(source.fetch("file1", dest), dest)
+        with open(dest, "rb") as handle:
+            self.assertEqual(handle.read(), b"raw")
+
+    def test_a_project_folder_is_archived_as_a_whole(self):
+        item = project_item(images=[ref("i1", "scan.png", duration=None)])
+        results, _, upload, mover = self._run(items=[item])
+        self.assertEqual(results[0]["status"], "done")
+        self.assertEqual(results[0]["kind"], ds.KIND_PROJECT)
+        mover.assert_called_once_with(mock.ANY, "folder1", FOLDERS.archive, FOLDERS.raw)
+        source = self.sources[0]
+        self.assertEqual(source.stem, "20261121_sushi")
+        self.assertEqual(len(source.videos), 2)
+        self.assertEqual(len(source.images), 1)
+        self.assertEqual(upload.call_count, 4)
+
+    def test_second_scan_does_not_render_the_same_item_again(self):
         self._run()
         results, download, _, _ = self._run()
         self.assertEqual(results, [])
         download.assert_not_called()
+        self.assertEqual(len(self.sources), 1)
 
     def test_fresh_upload_is_skipped_until_it_settles(self):
-        results, download, _, mover = self._run(videos=[video_info(age_seconds=5)])
+        results, download, _, mover = self._run(items=[video_item(age_seconds=5)])
         self.assertEqual(results, [])
         download.assert_not_called()
         mover.assert_not_called()
         self.assertTrue(any("still uploading" in line for line in self.logs))
 
-    def test_pipeline_failure_keeps_the_file_in_the_raw_folder(self):
-        def boom(local_path):
+    def test_a_go_folder_without_a_video_is_skipped(self):
+        results, download, upload, mover = self._run(items=[project_item(videos=[])])
+        self.assertEqual(results, [])
+        download.assert_not_called()
+        upload.assert_not_called()
+        mover.assert_not_called()
+        self.assertTrue(any("no video" in line for line in self.logs))
+
+    def test_pipeline_failure_keeps_the_item_in_the_raw_folder(self):
+        def boom(source):
             raise RuntimeError("ffmpeg exploded")
 
         results, _, upload, mover = self._run(pipeline=boom)
@@ -302,14 +509,13 @@ class SyncOnceTests(unittest.TestCase):
         self.assertFalse(ds.is_processed(ds.load_state(self.state_path), "file1"))
 
     def test_publish_failure_is_reported_and_not_marked_done(self):
-        download = mock.MagicMock(side_effect=lambda svc, fid, path: path)
         upload = mock.MagicMock(return_value={"id": "up"})
         mover = mock.MagicMock(side_effect=ds.DriveSyncError("drive said no"))
-        with mock.patch.object(ds, "list_raw_videos", return_value=[video_info()]):
+        with mock.patch.object(ds, "list_pending_raw_items", return_value=[video_item()]):
             results = ds.sync_once(
                 object(), FOLDERS, self._pipeline(),
                 state_path=self.state_path, now=NOW,
-                downloader=download, uploader=upload, mover=mover,
+                uploader=upload, mover=mover,
                 log=self.logs.append,
             )
         self.assertEqual(results[0]["status"], "publish_failed")
@@ -321,9 +527,41 @@ class SyncOnceTests(unittest.TestCase):
         _, _, upload, _ = self._run(pipeline=pipeline)
         self.assertEqual(upload.call_count, 3)
 
-    def test_local_copy_can_be_dropped_after_success(self):
-        _, _, _, _ = self._run(keep_local_raw=False)
+    def test_the_work_directory_is_removed_after_success(self):
+        def pipeline(source):
+            os.makedirs(source.work_dir, exist_ok=True)
+            with open(os.path.join(source.work_dir, "raw.mp4"), "wb") as handle:
+                handle.write(b"big")
+            return self._pipeline()(source)
+
+        self._run(pipeline=pipeline, keep_local_raw=False)
         self.assertEqual(os.listdir(os.path.join(self.tmp.name, "input")), [])
+
+    def test_keep_local_raw_leaves_the_work_directory(self):
+        def pipeline(source):
+            os.makedirs(source.work_dir, exist_ok=True)
+            with open(os.path.join(source.work_dir, "raw.mp4"), "wb") as handle:
+                handle.write(b"big")
+            return self._pipeline()(source)
+
+        self._run(pipeline=pipeline, keep_local_raw=True)
+        self.assertEqual(os.listdir(os.path.join(self.tmp.name, "input")), ["file1_drawing"])
+
+    def test_one_failing_item_does_not_stop_the_next(self):
+        calls = []
+
+        def pipeline(source):
+            calls.append(source.name)
+            if source.name.endswith("bad.mp4"):
+                raise RuntimeError("bad clip")
+            return self._pipeline()(source)
+
+        results, _, _, _ = self._run(
+            items=[video_item("bad", "bad.mp4"), video_item("good", "good.mp4")],
+            pipeline=pipeline,
+        )
+        self.assertEqual([result["status"] for result in results], ["failed", "done"])
+        self.assertEqual(len(calls), 2)
 
 
 class WatchTests(unittest.TestCase):

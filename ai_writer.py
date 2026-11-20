@@ -57,7 +57,7 @@ def choose_best_style(
     return str(grouped.idxmax())
 
 
-def build_script_prompt(style_key: str, config: dict) -> str:
+def build_script_prompt(style_key: str, config: dict, reference_scan: bool = False) -> str:
     """The Gemini prompt for one Short; kept pure so it can be unit tested."""
     styles_cfg = config["evolution"]["styles"]
     style_desc = styles_cfg[style_key]["description"]
@@ -71,10 +71,17 @@ def build_script_prompt(style_key: str, config: dict) -> str:
             f"narration ultra-minimal (max {ASMR_NARRATION_MAX_WORDS} words) and let the "
             f"pastel strokes breathe."
         )
+    scan_note = ""
+    if reference_scan:
+        scan_note = (
+            "\nThe first attached image is a high-resolution scan of the finished artwork; "
+            "treat it as the definitive reference for the subject, colours and details, "
+            "and let the time-lapse keyframes show how it was drawn."
+        )
 
     return f"""
 You are a creative director for the global art channel "CrayonJapan".
-Analyze the attached making-of keyframes of a hand-drawn postcard artwork.
+Analyze the attached making-of keyframes of a hand-drawn postcard artwork.{scan_note}
 
 Context:
 - Art Material: {material} (Japanese professional oil pastels)
@@ -121,6 +128,7 @@ def generate_making_script(
     style_key: str,
     config: dict,
     model_name: str = MODEL_NAME,
+    reference_scan: bool = False,
 ) -> dict:
     """Send the keyframes to Gemini and return the parsed script dict."""
     from google import genai
@@ -131,7 +139,7 @@ def generate_making_script(
         raise RuntimeError("GEMINI_API_KEY is not set (add it to .env)")
 
     client = genai.Client(api_key=api_key)
-    prompt = build_script_prompt(style_key, config)
+    prompt = build_script_prompt(style_key, config, reference_scan=reference_scan)
 
     contents: List[object] = [prompt]
     for path in keyframe_paths:

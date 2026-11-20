@@ -7,12 +7,15 @@
  *
  * Flow
  *   1. watchRawVideo() runs from a 1-minute time-driven trigger.
- *   2. It lists 01_RAW_VIDEO, skips files younger than a minute (the phone
- *      upload is still finishing) and files that were already dispatched.
- *   3. It POSTs a repository_dispatch to shodai4/crayonjapan-auto-maker with the
- *      file id/name and a fresh Drive access token from ScriptApp.
- *   4. GitHub Actions renders the video, writes the package into
- *      02_READY_TO_POST and moves the raw file into 03_ARCHIVE.
+ *   2. It lists 01_RAW_VIDEO and looks for two kinds of work:
+ *        - a subfolder renamed to GO_...  (one artwork, several raw clips)
+ *        - a loose .mp4 / .mov / .avi file
+ *      Folders without the GO_ prefix are still being uploaded and ignored.
+ *   3. It skips items that were already dispatched, then POSTs a
+ *      repository_dispatch to shodai4/crayonjapan-auto-maker with the item
+ *      id/name/kind and a fresh Drive access token from ScriptApp.
+ *   4. GitHub Actions renders the Short, writes the package into
+ *      02_READY_TO_POST and moves the source into 03_ARCHIVE.
  *
  * Script properties this file expects (Project settings -> Script properties):
  *   RAW_FOLDER_ID   id of 01_RAW_VIDEO                      (required)
@@ -29,15 +32,16 @@
 var DISPATCH_EVENT_TYPE = 'raw_video_uploaded';
 var DEFAULT_GITHUB_REPO = 'shodai4/crayonjapan-auto-maker';
 var VIDEO_EXTENSION = /\.(mp4|mov|avi)$/i;
-var MIN_AGE_MS = 60 * 1000;              // let the upload settle first
-var RETRY_AFTER_MS = 6 * 60 * 60 * 1000; // a file still in RAW after 6 h may be retried
-var MAX_DISPATCH_PER_SWEEP = 1;          // one run renders every waiting file anyway
+var GO_FOLDER_PATTERN = /^GO_/i;         // the "this artwork is finished" signal
+var MIN_AGE_MS = 60 * 1000;              // a loose file must settle first
+var FOLDER_MIN_AGE_MS = 10 * 1000;       // the GO_ rename itself is the signal
+var RETRY_AFTER_MS = 6 * 60 * 60 * 1000; // an item still in RAW after 6 h may be retried
 var LOG_PROPERTY = 'raw_dispatch_log';
 var LOG_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
 /**
- * Reads 01_RAW_VIDEO and starts the render when something new is waiting.
- * Runs every minute; safe to run by hand from the editor.
+ * Reads 01_RAW_VIDEO and starts the render when a GO_ folder or a new video is
+ * waiting. Runs every minute; safe to run by hand from the editor.
  */
 function watchRawVideo() {
   var props = PropertiesService.getScriptProperties();
@@ -55,43 +59,72 @@ function watchRawVideo() {
 
   var log = readDispatchLog(props);
   var now = Date.now();
-  var waiting = [];
-  var files = DriveApp.getFolderById(folderId).getFiles();
-
-  while (files.hasNext()) {
-    var file = files.next();
-    if (!VIDEO_EXTENSION.test(file.getName())) {
-      continue;
-    }
-    var id = file.getId();
-    var dispatchedAt = log[id] || 0;
-    if (dispatchedAt && now - dispatchedAt < RETRY_AFTER_MS) {
-      continue; // already handed to GitHub (or a run is still going)
-    }
-    if (now - file.getLastUpdated().getTime() < MIN_AGE_MS) {
-      continue; // still being uploaded
-    }
-    waiting.push(file);
-    if (waiting.length >= MAX_DISPATCH_PER_SWEEP) {
-      break;
-    }
-  }
+  var waiting = collectWaitingItems(folderId, log, now);
 
   if (!waiting.length) {
     return; // nothing new; stay quiet so the 1-minute trigger does not spam logs
   }
 
+  // One dispatch is enough: the Actions run scans the folder and renders every
+  // waiting item, so the rest are marked here only to keep the log accurate.
   dispatchToGitHub(waiting[0], props);
 
   for (var i = 0; i < waiting.length; i++) {
-    log[waiting[i].getId()] = now;
+    log[waiting[i].id] = now;
   }
   writeDispatchLog(props, log, now);
-  console.log('[raw] dispatched ' + waiting.length + ' file(s) to GitHub Actions.');
+  console.log('[raw] dispatched ' + waiting.length + ' item(s) to GitHub Actions.');
 }
 
-/** POSTs repository_dispatch for one Drive file and returns true on 204. */
-function dispatchToGitHub(file, props) {
+/**
+ * Everything in 01_RAW_VIDEO that is ready to render: GO_ folders first (an
+ * artwork folder is usually several recordings at once), then loose videos.
+ */
+function collectWaitingItems(folderId, log, now) {
+  var folder = DriveApp.getFolderById(folderId);
+  var items = [];
+
+  var subfolders = folder.getFolders();
+  while (subfolders.hasNext()) {
+    var sub = subfolders.next();
+    if (!GO_FOLDER_PATTERN.test(sub.getName())) {
+      continue; // still uploading: the folder gets the GO_ prefix when it is done
+    }
+    if (alreadyDispatched(log, sub.getId(), now)) {
+      continue;
+    }
+    if (now - sub.getLastUpdated().getTime() < FOLDER_MIN_AGE_MS) {
+      continue; // renamed a moment ago; give Drive a few seconds to settle
+    }
+    items.push({ id: sub.getId(), name: sub.getName(), kind: 'folder' });
+  }
+
+  var files = folder.getFiles();
+  while (files.hasNext()) {
+    var file = files.next();
+    if (!VIDEO_EXTENSION.test(file.getName())) {
+      continue;
+    }
+    if (alreadyDispatched(log, file.getId(), now)) {
+      continue;
+    }
+    if (now - file.getLastUpdated().getTime() < MIN_AGE_MS) {
+      continue; // still being uploaded
+    }
+    items.push({ id: file.getId(), name: file.getName(), kind: 'file' });
+  }
+
+  return items;
+}
+
+/** True while an item is inside its idempotency window. */
+function alreadyDispatched(log, id, now) {
+  var dispatchedAt = log[id] || 0;
+  return Boolean(dispatchedAt && now - dispatchedAt < RETRY_AFTER_MS);
+}
+
+/** POSTs repository_dispatch for one Drive folder/file and returns true on 204. */
+function dispatchToGitHub(item, props) {
   var token = props.getProperty('GITHUB_TOKEN');
   if (!token) {
     console.error(
@@ -104,8 +137,12 @@ function dispatchToGitHub(file, props) {
   var payload = {
     event_type: DISPATCH_EVENT_TYPE,
     client_payload: {
-      file_id: file.getId(),
-      file_name: file.getName(),
+      item_id: item.id,
+      item_name: item.name,
+      item_type: item.kind,
+      // kept for older workflow versions that only knew about single files
+      file_id: item.id,
+      file_name: item.name,
       dispatched_at: new Date().toISOString(),
       drive_token: ScriptApp.getOAuthToken()
     }
@@ -130,7 +167,7 @@ function dispatchToGitHub(file, props) {
       'GitHub dispatch failed (' + code + '): ' + response.getContentText().slice(0, 300)
     );
   }
-  console.log('[raw] sent ' + file.getName() + ' (' + file.getId() + ') to ' + repo);
+  console.log('[raw] sent ' + item.kind + ' ' + item.name + ' (' + item.id + ') to ' + repo);
   return true;
 }
 
@@ -148,10 +185,10 @@ function installRawVideoTrigger() {
   return 'installed';
 }
 
-/** Forgets the dispatched files so the next sweep retries them (handy while testing). */
+/** Forgets the dispatched items so the next sweep retries them (handy while testing). */
 function clearDispatchLog() {
   PropertiesService.getScriptProperties().deleteProperty(LOG_PROPERTY);
-  console.log('[raw] dispatch log cleared; the next sweep will treat every file as new.');
+  console.log('[raw] dispatch log cleared; the next sweep will treat every item as new.');
   return 'cleared';
 }
 
@@ -164,8 +201,25 @@ function describeRawFolder() {
   }
   var log = readDispatchLog(props);
   var now = Date.now();
-  var files = DriveApp.getFolderById(folderId).getFiles();
+  var folder = DriveApp.getFolderById(folderId);
   var count = 0;
+
+  var subfolders = folder.getFolders();
+  while (subfolders.hasNext()) {
+    var sub = subfolders.next();
+    var ready = GO_FOLDER_PATTERN.test(sub.getName());
+    console.log(
+      '[folder] ' + sub.getName() + ' | id=' + sub.getId() +
+      ' | go=' + (ready ? 'yes' : 'no') +
+      ' | age=' + Math.round((now - sub.getLastUpdated().getTime()) / 1000) + 's' +
+      ' | dispatched=' + (log[sub.getId()] ? 'yes' : 'no')
+    );
+    if (ready) {
+      count++;
+    }
+  }
+
+  var files = folder.getFiles();
   while (files.hasNext()) {
     var file = files.next();
     if (!VIDEO_EXTENSION.test(file.getName())) {
@@ -173,12 +227,12 @@ function describeRawFolder() {
     }
     count++;
     console.log(
-      file.getName() + ' | id=' + file.getId() +
+      '[file] ' + file.getName() + ' | id=' + file.getId() +
       ' | age=' + Math.round((now - file.getLastUpdated().getTime()) / 1000) + 's' +
       ' | dispatched=' + (log[file.getId()] ? 'yes' : 'no')
     );
   }
-  console.log('[raw] ' + count + ' video file(s) in 01_RAW_VIDEO.');
+  console.log('[raw] ' + count + ' renderable item(s) in 01_RAW_VIDEO.');
   return count;
 }
 

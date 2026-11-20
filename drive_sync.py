@@ -3,9 +3,14 @@
 Folder layout inside the personal Drive::
 
     AI秘書 / 12_動画自動作成/
-        01_RAW_VIDEO/      <- drop the raw drawing recording here
+        01_RAW_VIDEO/      <- one subfolder per artwork, renamed GO_... when complete
         02_READY_TO_POST/  <- finished MP4, artwork JPEG and English metadata
-        03_ARCHIVE/        <- the raw recording, once it has been rendered
+        03_ARCHIVE/        <- the GO_ folder, once it has been rendered
+
+A subfolder only counts once its name starts with ``GO_`` (case-insensitive):
+that is the user's signal that every clip and the finished scan are uploaded.
+Folders without the prefix are still being filled and are left alone. A loose
+video file dropped straight into 01_RAW_VIDEO keeps the old single-file flow.
 
 The repository is public, so no folder ID or account address is hard-coded
 here: the three IDs come from the environment (``.env``) and the OAuth token is
@@ -20,8 +25,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -42,6 +49,7 @@ TOKEN_JSON_ENV = "GDRIVE_TOKEN_JSON"
 ACCESS_TOKEN_ENV = "GDRIVE_ACCESS_TOKEN"
 
 RAW_EXTENSIONS = (".mp4", ".mov", ".avi")
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png")
 MIME_BY_EXTENSION = {
     ".mp4": "video/mp4",
     ".mov": "video/quicktime",
@@ -55,15 +63,35 @@ MIME_BY_EXTENSION = {
 }
 FOLDER_MIME_TYPE = "application/vnd.google-apps.folder"
 FILE_FIELDS = "id,name,mimeType,size,modifiedTime,md5Checksum"
+# A project scan also needs each clip's own length: Drive reports it in
+# videoMediaMetadata, so the plan can be built before a 6 GB file is pulled.
+ITEM_FILE_FIELDS = (
+    "id,name,mimeType,size,modifiedTime,"
+    "videoMediaMetadata(durationMillis,width,height)"
+)
+
+# The user's signal that an upload is finished: the folder is renamed to GO_...
+GO_PREFIX = "GO_"
+GO_FOLDER_PATTERN = re.compile(r"^GO_", re.IGNORECASE)
+KIND_PROJECT = "project"
+KIND_VIDEO = "video"
+
+# Names that mean "this clip shows the finished picture" and therefore sort last
+# inside a project folder.
+COMPLETION_CLIP_PATTERN = re.compile(
+    r"(?:^|[_\-\.\s])(finish|finished|final|complete|completed|end|done|完成)(?:$|[_\-\.,\s\d])",
+    re.IGNORECASE,
+)
 
 DEFAULT_MIN_AGE_SECONDS = 60
+DEFAULT_GO_FOLDER_MIN_AGE_SECONDS = 5
 DEFAULT_INTERVAL_SECONDS = 60
 STATE_VERSION = 1
 
 # Artifacts the pipeline returns and that end up in 02_READY_TO_POST.
 ARTIFACT_KEYS = ("final_video", "artwork", "metadata_text", "metadata_json")
 
-Pipeline = Callable[[str], dict]
+Pipeline = Callable[["ProjectSource"], dict]
 Log = Callable[[str], None]
 
 
@@ -80,6 +108,52 @@ class DriveFolders:
     raw: str
     ready: str
     archive: str
+
+
+@dataclass(frozen=True)
+class DriveFileRef:
+    """One child of a project folder (or the single video of a plain item)."""
+
+    id: str
+    name: str
+    size: int = 0
+    modified_time: Optional[str] = None
+    duration_seconds: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class RawItem:
+    """Something waiting in 01_RAW_VIDEO: a GO_ folder or a loose video."""
+
+    id: str
+    name: str
+    kind: str
+    stem: str
+    modified_time: Optional[str] = None
+    videos: List[DriveFileRef] = field(default_factory=list)
+    images: List[DriveFileRef] = field(default_factory=list)
+
+    @property
+    def is_project(self) -> bool:
+        return self.kind == KIND_PROJECT
+
+
+@dataclass(frozen=True)
+class ProjectSource:
+    """What the pipeline receives; it downloads clips one at a time."""
+
+    item_id: str
+    name: str
+    stem: str
+    kind: str
+    work_dir: str
+    videos: List[DriveFileRef]
+    images: List[DriveFileRef]
+    fetch: Callable[[str, str], str]
+
+    @property
+    def is_project(self) -> bool:
+        return self.kind == KIND_PROJECT
 
 
 def load_drive_folders(env: Optional[Dict[str, str]] = None) -> DriveFolders:
@@ -103,6 +177,53 @@ def load_drive_folders(env: Optional[Dict[str, str]] = None) -> DriveFolders:
 
 def is_raw_video_name(name: str) -> bool:
     return str(name or "").lower().endswith(RAW_EXTENSIONS)
+
+
+def is_raw_image_name(name: str) -> bool:
+    return str(name or "").lower().endswith(IMAGE_EXTENSIONS)
+
+
+def is_go_folder_name(name: str) -> bool:
+    """True for the only folders the pipeline may touch: ``GO_...``.
+
+    Anything else in 01_RAW_VIDEO is a folder whose upload is still in progress,
+    so it is left alone until it is renamed with the GO_ prefix.
+    """
+    return bool(GO_FOLDER_PATTERN.match(str(name or "")))
+
+
+def strip_go_prefix(name: str) -> str:
+    """``GO_20261121_sushi`` -> ``20261121_sushi`` (the output name stem)."""
+    text = str(name or "").strip()
+    match = GO_FOLDER_PATTERN.match(text)
+    if not match:
+        return text
+    stripped = text[match.end():].strip()
+    return stripped or text
+
+
+def natural_sort_key(name: str):
+    """Sort ``part2.mp4`` before ``part10.mp4`` and keep the completion last.
+
+    Digits are compared as numbers. A clip that looks like the finished shot
+    (``finish``, ``final``, ``complete``, ``end``, ``完成``...) is ranked after the
+    drawing clips, because it is the end of the timeline the finish-preview
+    hook is cut from.
+    """
+    text = str(name or "")
+    parts = re.split(r"(\d+)", text.lower())
+    key = []
+    for part in parts:
+        if not part:
+            continue
+        key.append((0, int(part)) if part.isdigit() else (1, part))
+    stem = os.path.splitext(os.path.basename(text))[0].lower()
+    rank = 1 if COMPLETION_CLIP_PATTERN.search(stem) else 0
+    return (rank, key)
+
+
+def sort_naturally(items: Sequence[dict]) -> List[dict]:
+    return sorted(items, key=lambda info: natural_sort_key(str(info.get("name", ""))))
 
 
 def guess_mime_type(path: str) -> str:
@@ -222,7 +343,7 @@ def _drive_media_upload(path: str):
 # Drive operations
 # ---------------------------------------------------------------------------
 
-def _list_all(service, query: str, page_size: int = 100) -> List[dict]:
+def _list_all(service, query: str, page_size: int = 100, fields: str = FILE_FIELDS) -> List[dict]:
     files: List[dict] = []
     page_token = None
     while True:
@@ -231,7 +352,7 @@ def _list_all(service, query: str, page_size: int = 100) -> List[dict]:
             .list(
                 q=query,
                 pageSize=page_size,
-                fields=f"nextPageToken, files({FILE_FIELDS})",
+                fields=f"nextPageToken, files({fields})",
                 pageToken=page_token,
                 spaces="drive",
             )
@@ -262,13 +383,97 @@ def list_raw_videos(
     return sorted(videos, key=lambda info: str(info.get("name", "")).lower())
 
 
+def _duration_from_metadata(info: dict) -> Optional[float]:
+    metadata = info.get("videoMediaMetadata") or {}
+    try:
+        millis = float(metadata.get("durationMillis") or 0)
+    except (TypeError, ValueError):
+        return None
+    return millis / 1000.0 if millis > 0 else None
+
+
+def _file_ref(info: dict) -> DriveFileRef:
+    try:
+        size = int(info.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    return DriveFileRef(
+        id=str(info.get("id", "")),
+        name=str(info.get("name", "")),
+        size=size,
+        modified_time=info.get("modifiedTime"),
+        duration_seconds=_duration_from_metadata(info),
+    )
+
+
+def list_project_files(service, folder_id: str):
+    """The videos and scanned images inside one GO_ folder, naturally sorted."""
+    query = f"'{folder_id}' in parents and trashed = false and mimeType != '{FOLDER_MIME_TYPE}'"
+    children = _list_all(service, query, fields=ITEM_FILE_FIELDS)
+    videos = sort_naturally([info for info in children if is_raw_video_name(str(info.get("name", "")))])
+    images = sort_naturally([info for info in children if is_raw_image_name(str(info.get("name", "")))])
+    return [_file_ref(info) for info in videos], [_file_ref(info) for info in images]
+
+
+def list_pending_raw_items(service, folder_id: str) -> List[RawItem]:
+    """Everything in 01_RAW_VIDEO that may be rendered right now.
+
+    * a subfolder whose name starts with ``GO_`` (case-insensitive) - a project
+      of several raw clips plus an optional scan;
+    * a loose ``.mp4`` / ``.mov`` / ``.avi`` file - the old single-video flow.
+
+    Other folders are uploads still in progress and are ignored until renamed.
+    Items come back oldest name first so the queue stays predictable.
+    """
+    query = f"'{folder_id}' in parents and trashed = false"
+    children = _list_all(service, query, fields=ITEM_FILE_FIELDS)
+
+    items: List[RawItem] = []
+    for info in sort_naturally(children):
+        name = str(info.get("name", ""))
+        item_id = str(info.get("id", ""))
+        if not item_id:
+            continue
+        if info.get("mimeType") == FOLDER_MIME_TYPE:
+            if not is_go_folder_name(name):
+                continue
+            videos, images = list_project_files(service, item_id)
+            items.append(
+                RawItem(
+                    id=item_id,
+                    name=name,
+                    kind=KIND_PROJECT,
+                    stem=strip_go_prefix(name),
+                    modified_time=info.get("modifiedTime"),
+                    videos=videos,
+                    images=images,
+                )
+            )
+        elif is_raw_video_name(name):
+            items.append(
+                RawItem(
+                    id=item_id,
+                    name=name,
+                    kind=KIND_VIDEO,
+                    stem=os.path.splitext(name)[0],
+                    modified_time=info.get("modifiedTime"),
+                    videos=[_file_ref(info)],
+                )
+            )
+    return items
+
+
 def download_video(
     service,
     file_id: str,
     dest_path: str,
     fetcher: Optional[Callable[[str, object], None]] = None,
 ) -> str:
-    """Download one Drive file to ``dest_path`` (partial file never left behind)."""
+    """Download one Drive file to ``dest_path`` (partial file never left behind).
+
+    ``MediaIoBaseDownload`` streams the bytes in chunks straight to disk, so a
+    multi-GB recording is never held in memory.
+    """
     fetch = fetcher or _drive_media_fetcher(service)
     directory = os.path.dirname(dest_path)
     if directory:
@@ -413,6 +618,32 @@ def is_settled(
     return reference - modified >= timedelta(seconds=min_age_seconds)
 
 
+def item_is_settled(
+    item: RawItem,
+    now: Optional[datetime] = None,
+    min_age_seconds: int = DEFAULT_MIN_AGE_SECONDS,
+    go_min_age_seconds: int = DEFAULT_GO_FOLDER_MIN_AGE_SECONDS,
+) -> bool:
+    """Whether an item is complete enough to render.
+
+    A loose video waits ``min_age_seconds`` (its upload is still finishing).
+    A ``GO_`` project does not need that: the rename is the explicit "done"
+    signal, so only a few seconds are waited out in case the folder was just
+    renamed while an upload was still wrapping up.
+    """
+    if item.is_project:
+        return is_settled(
+            {"modifiedTime": item.modified_time},
+            now=now,
+            min_age_seconds=go_min_age_seconds,
+        )
+    return is_settled(
+        {"modifiedTime": item.modified_time},
+        now=now,
+        min_age_seconds=min_age_seconds,
+    )
+
+
 def _safe_local_name(file_id: str, name: str) -> str:
     cleaned = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in os.path.basename(name))
     cleaned = cleaned or "video.mp4"
@@ -426,6 +657,7 @@ def sync_once(
     download_dir: str = "input",
     state_path: str = DEFAULT_STATE_PATH,
     min_age_seconds: int = DEFAULT_MIN_AGE_SECONDS,
+    go_min_age_seconds: int = DEFAULT_GO_FOLDER_MIN_AGE_SECONDS,
     keep_local_raw: bool = True,
     now: Optional[datetime] = None,
     downloader: Optional[Callable[[object, str, str], str]] = None,
@@ -433,10 +665,14 @@ def sync_once(
     mover: Optional[Callable[[object, str, str, Optional[str]], dict]] = None,
     log: Log = print,
 ) -> List[dict]:
-    """One scan: pull new raw videos, render them, publish to 02_READY_TO_POST.
+    """One scan: pull new raw items, render them, publish to 02_READY_TO_POST.
 
-    A video is only marked done after its artifacts are uploaded *and* the raw
-    file has been moved to 03_ARCHIVE, so an interruption repeats at most one
+    The pipeline receives a ``ProjectSource`` that can download each clip on
+    demand, so a project's multi-GB recordings are fetched one at a time (and
+    deleted again by the pipeline) instead of all at once.
+
+    An item is only marked done after its artifacts are uploaded *and* the
+    source has been moved to 03_ARCHIVE, so an interruption repeats at most one
     render instead of silently losing a drawing.
     """
     download = downloader or (lambda svc, fid, path: download_video(svc, fid, path))
@@ -446,30 +682,46 @@ def sync_once(
     state = load_state(state_path)
     results: List[dict] = []
     try:
-        videos = list_raw_videos(service, folders.raw)
+        items = list_pending_raw_items(service, folders.raw)
     except DriveSyncError as exc:
         log(f"[drive] could not list {RAW_FOLDER_ENV}: {exc}")
         return results
 
-    for info in videos:
-        file_id = str(info.get("id", ""))
-        name = str(info.get("name", ""))
-        if not file_id:
+    for item in items:
+        if not item.id or is_processed(state, item.id):
             continue
-        if is_processed(state, file_id):
+        if not item_is_settled(
+            item, now=now,
+            min_age_seconds=min_age_seconds,
+            go_min_age_seconds=go_min_age_seconds,
+        ):
+            log(f"[drive] skip (still uploading): {item.name}")
             continue
-        if not is_settled(info, now=now, min_age_seconds=min_age_seconds):
-            log(f"[drive] skip (still uploading): {name}")
+        if not item.videos:
+            log(f"[drive] skip (no video inside yet): {item.name}")
             continue
 
-        local_path = os.path.join(download_dir, _safe_local_name(file_id, name))
+        work_dir = os.path.join(download_dir, _safe_local_name(item.id, item.stem))
+        source = ProjectSource(
+            item_id=item.id,
+            name=item.name,
+            stem=item.stem,
+            kind=item.kind,
+            work_dir=work_dir,
+            videos=list(item.videos),
+            images=list(item.images),
+            fetch=lambda file_id, path: download(service, file_id, path),
+        )
         try:
-            log(f"[drive] downloading {name}")
-            download(service, file_id, local_path)
-            artifacts = pipeline(local_path) or {}
-        except Exception as exc:  # one bad video must not stop the watcher
-            log(f"[drive] failed: {name}: {exc}")
-            results.append({"file_id": file_id, "name": name, "status": "failed", "error": str(exc)})
+            log(f"[drive] rendering {item.name} ({len(item.videos)} clip(s))")
+            artifacts = pipeline(source) or {}
+        except Exception as exc:  # one bad item must not stop the watcher
+            log(f"[drive] failed: {item.name}: {exc}")
+            results.append(
+                {"file_id": item.id, "name": item.name, "status": "failed", "error": str(exc)}
+            )
+            if not keep_local_raw:
+                shutil.rmtree(work_dir, ignore_errors=True)
             continue
 
         uploaded: List[str] = []
@@ -480,13 +732,13 @@ def sync_once(
                     created = upload(service, path, folders.ready)
                     uploaded.append(str(created.get("id", "")))
                     log(f"[drive] uploaded {os.path.basename(path)}")
-            move(service, file_id, folders.archive, folders.raw)
+            move(service, item.id, folders.archive, folders.raw)
         except Exception as exc:
-            log(f"[drive] publish failed: {name}: {exc}")
+            log(f"[drive] publish failed: {item.name}: {exc}")
             results.append(
                 {
-                    "file_id": file_id,
-                    "name": name,
+                    "file_id": item.id,
+                    "name": item.name,
                     "status": "publish_failed",
                     "error": str(exc),
                     "artifacts": artifacts,
@@ -497,18 +749,19 @@ def sync_once(
 
         mark_processed(
             state,
-            file_id,
-            name=name,
+            item.id,
+            name=item.name,
             video_id=str(artifacts.get("video_id") or ""),
             uploaded=uploaded,
         )
         save_state(state, state_path)
-        if not keep_local_raw and os.path.exists(local_path):
-            os.remove(local_path)
+        if not keep_local_raw:
+            shutil.rmtree(work_dir, ignore_errors=True)
         results.append(
             {
-                "file_id": file_id,
-                "name": name,
+                "file_id": item.id,
+                "name": item.name,
+                "kind": item.kind,
                 "status": "done",
                 "video_id": str(artifacts.get("video_id") or ""),
                 "artifacts": artifacts,

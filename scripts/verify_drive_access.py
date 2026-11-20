@@ -4,7 +4,8 @@ Run from the repository root::
 
     python scripts/verify_drive_access.py
 
-It prints how many raw videos are waiting and never prints a credential.
+It prints how many GO_ folders and loose videos are waiting and never prints a
+credential.
 Exit codes: 0 ready, 1 Drive refused the credentials, 2 configuration missing.
 """
 
@@ -39,12 +40,22 @@ def main() -> int:
 
     try:
         service = drive_sync.build_drive_service()
-        videos = drive_sync.list_raw_videos(service, folders.raw)
+        items = drive_sync.list_pending_raw_items(service, folders.raw)
     except Exception as exc:  # noqa: BLE001 - the message is the whole point
         print(f"[verify] Drive access failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    print(f"[verify] Drive access OK; {len(videos)} raw video(s) waiting in 01_RAW_VIDEO")
+    projects = [item for item in items if item.is_project]
+    loose = [item for item in items if not item.is_project]
+    print(
+        f"[verify] Drive access OK; {len(projects)} GO_ folder(s) and "
+        f"{len(loose)} loose video(s) waiting in 01_RAW_VIDEO"
+    )
+    for item in items[:10]:
+        print(
+            f"[verify]   {item.kind}: {item.name} "
+            f"({len(item.videos)} clip(s), {len(item.images)} scan(s))"
+        )
     if not str(os.environ.get("GEMINI_API_KEY", "") or "").strip():
         print(
             "[verify] Warning: GEMINI_API_KEY is empty, so a new recording will stop at the "

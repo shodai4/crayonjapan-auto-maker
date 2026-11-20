@@ -198,33 +198,235 @@ class ProcessVideoBundleTests(unittest.TestCase):
             self.assertEqual(main.process_new_video("input/clip.mp4", self.config), "yt-9")
 
 
+class ProcessProjectBundleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = main.load_config(os.path.join(ROOT, "config.yaml"))
+        self.out = os.path.join(self.tmp.name, "output")
+        self.work = os.path.join(self.tmp.name, "work")
+        self.fetched = []
+        self.runner_cmds = []
+
+    def _clip(self, file_id, name, duration=120.0, size=1024):
+        return drive_sync.DriveFileRef(id=file_id, name=name, size=size, duration_seconds=duration)
+
+    def _source(self, videos=None, images=None, stem="20261121_sushi"):
+        clips = videos if videos is not None else [
+            self._clip("v1", "part1.mp4", 120.0),
+            self._clip("v2", "part2.mp4", 240.0),
+        ]
+
+        def fetch(file_id, path):
+            self.fetched.append((file_id, path))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(b"raw-bytes")
+            return path
+
+        return drive_sync.ProjectSource(
+            item_id="folder1",
+            name=f"GO_{stem}",
+            stem=stem,
+            kind=drive_sync.KIND_PROJECT,
+            work_dir=self.work,
+            videos=clips,
+            images=images or [],
+            fetch=fetch,
+        )
+
+    def _runner(self, cmd):
+        self.runner_cmds.append(list(cmd))
+        if "concat" in cmd:
+            list_path = cmd[cmd.index("-i") + 1]
+            if os.path.exists(list_path):
+                with open(list_path, "r", encoding="utf-8") as handle:
+                    self.concat_order = [
+                        line.rsplit("/", 1)[-1].rstrip("'")
+                        for line in handle.read().splitlines()
+                    ]
+        target = cmd[-1]
+        if isinstance(target, str) and target.endswith(".mp4"):
+            with open(target, "wb") as handle:
+                handle.write(b"segment")
+
+    def _run(self, source, keep_local_raw=False):
+        def fake_artwork(video_path, output_path, offset_seconds=0.0):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "wb") as handle:
+                handle.write(b"jpeg")
+            self.artwork_source = video_path
+            return output_path
+
+        def fake_scan(image_path, output_path):
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            with open(output_path, "wb") as handle:
+                handle.write(b"scan-jpeg")
+            self.scan_source = image_path
+            return output_path
+
+        with (
+            mock.patch.object(main, "choose_best_style", return_value="style_B_story"),
+            mock.patch.object(main, "has_audio_stream", return_value=True),
+            mock.patch.object(
+                main, "probe_duration",
+                side_effect=lambda path: 120.0 if path.endswith("part1.mp4") else 240.0,
+            ),
+            mock.patch.object(main, "extract_final_artwork", side_effect=fake_artwork),
+            mock.patch.object(main, "prepare_scanned_artwork", side_effect=fake_scan),
+            mock.patch.object(main, "extract_keyframes", return_value=[]),
+            mock.patch.object(main, "generate_making_script", return_value=dict(SCRIPT)) as script,
+            mock.patch.object(main.asyncio, "run"),
+            mock.patch.object(main, "mux_audio_and_subtitles"),
+            mock.patch.object(main, "append_performance_row"),
+            mock.patch.object(main, "ensure_disk_space"),
+        ):
+            bundle = main.process_project_bundle(
+                source, self.config, output_dir=self.out, upload=False,
+                keep_local_raw=keep_local_raw, runner=self._runner,
+            )
+        return bundle, script
+
+    def test_output_names_come_from_the_folder_without_the_go_prefix(self):
+        bundle, _ = self._run(self._source())
+        self.assertEqual(bundle["base_name"], "20261121_sushi")
+        self.assertEqual(bundle["final_video"], os.path.join(self.out, "20261121_sushi_final.mp4"))
+        self.assertEqual(bundle["artwork"], os.path.join(self.out, "20261121_sushi_artwork.jpg"))
+        self.assertEqual(bundle["metadata_text"], os.path.join(self.out, "20261121_sushi_metadata.txt"))
+        self.assertEqual(bundle["clip_count"], 2)
+
+    def test_the_hook_is_cut_from_the_last_clip_and_comes_first(self):
+        self._run(self._source())
+        hooks = [cmd for cmd in self.runner_cmds if "-ss" in cmd]
+        self.assertEqual(len(hooks), 1)
+        self.assertTrue(hooks[0][hooks[0].index("-i") + 1].endswith("part2.mp4"))
+        self.assertIn("concat", self.runner_cmds[-1])
+        self.assertEqual(len(self.concat_order), 3)
+        self.assertIn("hook", self.concat_order[0])
+        self.assertIn("seg00", self.concat_order[1])
+        self.assertIn("seg01", self.concat_order[2])
+
+    def test_each_clip_is_downloaded_once_and_deleted_again(self):
+        self._run(self._source())
+        self.assertEqual([call[0] for call in self.fetched], ["v1", "v2"])
+        for _, path in self.fetched:
+            self.assertFalse(os.path.exists(path), path)
+        self.assertFalse(os.path.exists(self.work))
+
+    def test_a_scanned_image_becomes_the_artwork_and_the_gemini_reference(self):
+        scan = self._clip("i1", "scan.jpg", duration=None, size=500)
+        bundle, script = self._run(self._source(images=[scan]))
+        self.assertTrue(bundle["artwork_from_scan"])
+        self.assertEqual([call[0] for call in self.fetched], ["i1", "v1", "v2"])
+        self.assertTrue(self.scan_source.endswith("scan.jpg"))
+        with open(bundle["artwork"], "rb") as handle:
+            self.assertEqual(handle.read(), b"scan-jpeg")
+        frames = script.call_args.args[0]
+        self.assertEqual(frames[0], bundle["artwork"])
+        self.assertTrue(script.call_args.kwargs["reference_scan"])
+
+    def test_without_a_scan_the_artwork_comes_from_the_last_clip(self):
+        bundle, script = self._run(self._source())
+        self.assertFalse(bundle["artwork_from_scan"])
+        self.assertTrue(self.artwork_source.endswith("part2.mp4"))
+        self.assertFalse(script.call_args.kwargs["reference_scan"])
+
+    def test_clip_proportions_follow_their_lengths(self):
+        bundle, _ = self._run(self._source())
+        plan = bundle["plan"]
+        self.assertAlmostEqual(
+            plan["segment_durations"][1] / plan["segment_durations"][0], 2.0
+        )
+        self.assertAlmostEqual(sum(plan["segment_durations"]), plan["main_duration"])
+
+    def test_keep_local_raw_keeps_the_downloaded_clips(self):
+        self._run(self._source(), keep_local_raw=True)
+        self.assertEqual(len(os.listdir(self.work)), 2)
+
+    def test_a_shorter_final_clip_does_not_get_a_longer_hook(self):
+        videos = [self._clip("v1", "part1.mp4", 120.0), self._clip("v2", "finish.mp4", 2.0)]
+        with mock.patch.object(main, "probe_duration", return_value=2.0):
+            self._run(self._source(videos=videos))
+        hook = next(cmd for cmd in self.runner_cmds if "-ss" in cmd)
+        self.assertEqual(hook[hook.index("-t") + 1], "2.000")
+        self.assertEqual(hook[hook.index("-ss") + 1], "0.000")
+
+
 class DriveModeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = main.load_config(os.path.join(ROOT, "config.yaml"))
+
+    def _source(self, kind="video", videos=None, images=None, name="drawing.mp4"):
+        work_dir = os.path.join(self.tmp.name, "work")
+        writes = []
+
+        def fetch(file_id, path):
+            writes.append((file_id, path))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as handle:
+                handle.write(b"raw")
+            return path
+
+        clips = videos if videos is not None else [drive_sync.DriveFileRef(id="v1", name=name)]
+        return drive_sync.ProjectSource(
+            item_id="item1",
+            name=("GO_20261121_sushi" if kind == "project" else name),
+            stem=("20261121_sushi" if kind == "project" else os.path.splitext(name)[0]),
+            kind=kind,
+            work_dir=work_dir,
+            videos=clips,
+            images=images or [],
+            fetch=fetch,
+        ), writes
+
     def test_missing_folder_ids_exit_with_a_hint(self):
         args = mock.Mock(no_upload=True, artwork_offset=0.0, drive_state="s.json",
                          drive_min_age=60, drive_once=True, drive_interval=None)
-        config = main.load_config(os.path.join(ROOT, "config.yaml"))
         with mock.patch.object(drive_sync, "load_drive_folders", side_effect=drive_sync.MissingFolderIdError("DRIVE_RAW_FOLDER_ID is not set")), \
                 mock.patch.object(drive_sync, "build_drive_service") as build_service:
-            self.assertEqual(main.run_drive_mode(args, config), 2)
+            self.assertEqual(main.run_drive_mode(args, self.config), 2)
         build_service.assert_not_called()
 
     def test_drive_once_passes_the_pipeline_and_reports(self):
         args = mock.Mock(no_upload=True, artwork_offset=1.5, drive_state="s.json",
                          drive_min_age=30, drive_once=True, drive_interval=None)
-        config = main.load_config(os.path.join(ROOT, "config.yaml"))
         folders = drive_sync.DriveFolders("raw", "ready", "archive")
+        source, writes = self._source()
         with mock.patch.object(drive_sync, "load_drive_folders", return_value=folders), \
                 mock.patch.object(drive_sync, "build_drive_service", return_value=object()), \
                 mock.patch.object(drive_sync, "sync_once", return_value=[{"status": "done"}]) as sync, \
-                mock.patch.object(main, "process_video_bundle") as bundle:
-            self.assertEqual(main.run_drive_mode(args, config), 0)
+                mock.patch.object(main, "process_video_bundle") as bundle, \
+                mock.patch.object(main, "ensure_disk_space"):
+            self.assertEqual(main.run_drive_mode(args, self.config), 0)
 
             pipeline = sync.call_args.args[2]
-            pipeline("input/clip.mp4")
+            pipeline(source)
             bundle.assert_called_once_with(
-                "input/clip.mp4", config, upload=False, artwork_offset_seconds=1.5
+                writes[0][1], self.config, upload=False,
+                artwork_offset_seconds=1.5, base_name="drawing",
             )
+            self.assertEqual(writes[0][0], "v1")
+            self.assertFalse(os.path.exists(writes[0][1]))  # raw copy removed again
             self.assertEqual(sync.call_args.kwargs["min_age_seconds"], 30)
+
+    def test_a_project_source_goes_to_the_project_pipeline(self):
+        args = mock.Mock(no_upload=True, artwork_offset=0.0, drive_state="s.json",
+                         drive_min_age=30, drive_once=True, drive_interval=None)
+        folders = drive_sync.DriveFolders("raw", "ready", "archive")
+        source, writes = self._source(kind="project")
+        with mock.patch.object(drive_sync, "load_drive_folders", return_value=folders), \
+                mock.patch.object(drive_sync, "build_drive_service", return_value=object()), \
+                mock.patch.object(drive_sync, "sync_once", return_value=[{"status": "done"}]) as sync, \
+                mock.patch.object(main, "process_project_bundle", return_value={}) as project:
+            main.run_drive_mode(args, self.config)
+            pipeline = sync.call_args.args[2]
+            pipeline(source)
+        project.assert_called_once_with(
+            source, self.config, upload=False, artwork_offset_seconds=0.0
+        )
+        self.assertEqual(writes, [])
 
 
 if __name__ == "__main__":
