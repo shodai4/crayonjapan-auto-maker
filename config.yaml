@@ -1,0 +1,32 @@
+brand:
+  name: "CrayonJapan"
+  shop_url: "https://crayonjapan.base.shop/"
+  material_name: "Sakura Cray-Pas Specialist"
+  material_desc: "Japanese professional oil pastels"
+  theme: "Happy everyday moments"
+
+video:
+  target_duration_sec: 38
+  hook_duration_sec: 2.5
+  aspect_ratio: "9:16"
+  width: 1080
+  height: 1920
+  motion_threshold: 1.8
+
+evolution:
+  exploration_rate: 0.25
+  styles:
+    style_A_material:
+      weight: 0.34
+      description: "Focus on Sakura Cray-Pas Specialist texture, rich pigment, and color layering techniques."
+    style_B_story:
+      weight: 0.33
+      description: "Warm storytelling about happy everyday moments and why this daily motif was chosen."
+    style_C_asmr:
+      weight: 0.33
+      description: "Minimal narration, letting the satisfying oil pastel strokes and rhythm lead the video."
+
+youtube:
+  default_privacy: "unlisted"
+  category_id: "22"
+  default_language: "en"

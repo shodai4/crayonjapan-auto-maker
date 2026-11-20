@@ -1,0 +1,21 @@
+# Secrets - never commit these
+.env
+client_secret.json
+token.json
+
+# Local media (raw drawings and rendered output)
+input/
+output/
+*.mp4
+*.mov
+*.avi
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# OS
+.DS_Store
