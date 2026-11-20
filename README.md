@@ -13,7 +13,7 @@ viewers actually watch.
 3. **Finished artwork still** – the completed illustration is pulled from the last frame of the
    raw recording (full frame, no 9:16 crop) and saved as a JPEG for the thumbnail and the shop
    listing.
-4. **Gemini script** – four keyframes are sent to `gemini-2.5-flash`, which returns the title,
+4. **Gemini script** – four keyframes are sent to `gemini-3.8-flash`, which returns the title,
    on-screen hook text, English narration, description and tags as JSON.
 5. **Voice + subtitles** – `edge-tts` (en-US-JennyNeural) narrates, and word-level subtitles
    are burned into the video.
