@@ -128,6 +128,15 @@ class GasScriptTests(unittest.TestCase):
         self.assertIn("return;", body)
         self.assertNotIn("throw new Error", body)
 
+    def test_a_failed_dispatch_is_logged_and_retried_not_thrown(self):
+        body = self.text[self.text.index("function watchRawVideo"):self.text.index("function collectWaitingItems")]
+        self.assertIn("try {", body)
+        self.assertIn("catch (err)", body)
+        self.assertIn("dispatch failed", body)
+        # dispatching is inside the try, and the log is only written after it
+        self.assertLess(body.index("dispatchToGitHub(waiting[0]"), body.index("catch (err)"))
+        self.assertLess(body.index("catch (err)"), body.index("writeDispatchLog"))
+
     def test_describe_lists_folders_and_files(self):
         self.assertIn("describeRawFolder", self.text)
         describe = self.text[self.text.index("function describeRawFolder"):]

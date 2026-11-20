@@ -67,7 +67,14 @@ function watchRawVideo() {
 
   // One dispatch is enough: the Actions run scans the folder and renders every
   // waiting item, so the rest are marked here only to keep the log accurate.
-  dispatchToGitHub(waiting[0], props);
+  try {
+    dispatchToGitHub(waiting[0], props);
+  } catch (err) {
+    // Never throw from the time-driven trigger (it would mail the owner every
+    // minute). Nothing is logged as dispatched, so the next sweep retries.
+    console.error('[raw] dispatch failed; retrying next sweep: ' + message(err));
+    return;
+  }
 
   for (var i = 0; i < waiting.length; i++) {
     log[waiting[i].id] = now;
@@ -115,6 +122,11 @@ function collectWaitingItems(folderId, log, now) {
   }
 
   return items;
+}
+
+/** One-line error text for the log, without ever dumping a token. */
+function message(err) {
+  return err && err.message ? err.message : String(err);
 }
 
 /** True while an item is inside its idempotency window. */
