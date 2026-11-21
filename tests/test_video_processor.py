@@ -168,7 +168,7 @@ class ProjectCommandTests(unittest.TestCase):
         self.assertNotIn("crop", vf)
 
     def test_segment_speeds_the_clip_up_and_mutes_by_default(self):
-        cmd = vp.build_project_segment_command("in.mp4", "seg.mp4", 0.05)
+        cmd = vp.build_segment_video_command("in.mp4", "seg.mp4", 0.05)
         vf = cmd[cmd.index("-vf") + 1]
         self.assertTrue(vf.startswith("setpts=0.050000*PTS,"))
         self.assertIn("force_original_aspect_ratio=decrease", vf)
@@ -178,24 +178,8 @@ class ProjectCommandTests(unittest.TestCase):
         self.assertIn("yuv420p", cmd)
         self.assertEqual(cmd[-1], "seg.mp4")
 
-    def test_asmr_segment_keeps_and_stretches_the_original_audio(self):
-        cmd = vp.build_project_segment_command("in.mp4", "seg.mp4", 0.05, keep_audio=True, has_audio=True)
-        af = cmd[cmd.index("-af") + 1]
-        self.assertEqual(af, f"{vp.build_atempo_filter(20.0)},apad")
-        self.assertIn("0:a:0", cmd)
-        self.assertNotIn("-an", cmd)
-        self.assertIn("aac", cmd)
-        self.assertIn("48000", cmd)
-        self.assertIn("-shortest", cmd)
-
-    def test_a_silent_clip_gets_a_silent_track_when_audio_is_kept(self):
-        cmd = vp.build_project_segment_command("in.mp4", "seg.mp4", 0.05, keep_audio=True, has_audio=False)
-        self.assertTrue(any("anullsrc" in part for part in cmd))
-        self.assertIn("1:a:0", cmd)
-        self.assertIn("-shortest", cmd)
-
     def test_hook_segment_is_not_sped_up(self):
-        cmd = vp.build_project_hook_command("last.mp4", "hook.mp4", 56.0, 2.5)
+        cmd = vp.build_segment_video_command("last.mp4", "hook.mp4", seek=56.0, length=2.5)
         self.assertIn("-ss", cmd)
         self.assertEqual(cmd[cmd.index("-ss") + 1], "56.000")
         self.assertEqual(cmd[cmd.index("-t") + 1], "2.500")
@@ -204,10 +188,99 @@ class ProjectCommandTests(unittest.TestCase):
         self.assertIn("fps=30", vf)
         self.assertIn("-an", cmd)
 
-    def test_hook_keeps_audio_for_asmr(self):
-        cmd = vp.build_project_hook_command("last.mp4", "hook.mp4", 0.0, 2.5, keep_audio=True, has_audio=True)
-        self.assertNotIn("-an", cmd)
-        self.assertIn("apad", cmd[cmd.index("-af") + 1])
+    def test_a_clip_whose_speed_is_unknown_keeps_natural_speed(self):
+        for bad in (0, -1, float("nan"), "fast", None):
+            with self.subTest(bad=bad):
+                cmd = vp.build_segment_video_command("in.mp4", "seg.mp4", bad)
+                self.assertNotIn("setpts", cmd[cmd.index("-vf") + 1])
+
+
+class SegmentRenderTests(unittest.TestCase):
+    """ASMR segments are three safe passes: picture, sound, then a join.
+
+    A single command with `-af "...apad"` plus `-shortest` stayed on frame=0
+    for an hour (2026-11-21), so the split is a regression guard, not a detail.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "seg.mp4")
+        self.commands = []
+
+    def _render(self, **kwargs):
+        def runner(cmd):
+            self.commands.append(list(cmd))
+            target = cmd[-1]
+            if isinstance(target, str) and target.endswith(".mp4"):
+                with open(target, "wb") as handle:
+                    handle.write(b"segment")
+        return vp.render_project_segment("in.mp4", self.out, runner=runner, **kwargs)
+
+    def test_asmr_segment_is_picture_sound_and_join(self):
+        result = self._render(pts_multiplier=0.05, keep_audio=True, has_audio=True)
+        self.assertEqual(result, self.out)
+        self.assertEqual(len(self.commands), 3)
+        picture, sound, join = self.commands
+
+        vf = picture[picture.index("-vf") + 1]
+        self.assertTrue(vf.startswith("setpts=0.050000*PTS,"))
+        self.assertIn("force_original_aspect_ratio=decrease", vf)
+        self.assertIn("-an", picture)
+        self.assertNotIn("-af", picture)
+
+        self.assertIn("-vn", sound)
+        self.assertEqual(sound[sound.index("-af") + 1], vp.build_atempo_filter(20.0))
+        self.assertIn("0:a:0", sound)
+        self.assertIn("aac", sound)
+
+        self.assertEqual(join[join.index("-c:v") + 1], "copy")
+        self.assertIn("aac", join)
+        self.assertIn("-shortest", join)
+        self.assertEqual(join[-1], self.out)
+
+    def test_no_call_ever_combines_apad_with_shortest(self):
+        self._render(pts_multiplier=0.02, keep_audio=True, has_audio=True)
+        for cmd in self.commands:
+            self.assertFalse(any("apad" in str(part) for part in cmd), cmd)
+            if "-shortest" in cmd:
+                self.assertNotIn("-af", cmd)
+
+    def test_a_silent_clip_gets_a_bounded_silent_bed_when_audio_is_kept(self):
+        self._render(pts_multiplier=0.05, keep_audio=True, has_audio=False, duration=30.0)
+        picture, sound, join = self.commands
+        self.assertTrue(any("anullsrc" in str(part) for part in sound))
+        self.assertIn("0:a:0", sound)
+        # An endless bed would never finish on its own, so it is cut to length.
+        self.assertEqual(sound[sound.index("-t") + 1], "30.000")
+        self.assertNotIn("-af", sound)  # a silent bed only has to be long enough
+        self.assertIn("-shortest", join)
+
+    def test_a_hook_without_sound_gets_the_hook_length_as_its_bed(self):
+        self._render(keep_audio=True, has_audio=False, seek=56.0, length=2.5)
+        sound = self.commands[1]
+        self.assertEqual(sound[sound.index("-t") + 1], "2.500")
+
+    def test_the_join_temporaries_are_removed(self):
+        self._render(pts_multiplier=0.05, keep_audio=True, has_audio=True)
+        self.assertEqual(os.listdir(self.tmp.name), ["seg.mp4"])
+
+    def test_a_muted_segment_is_still_a_single_pass(self):
+        self._render(pts_multiplier=0.05, keep_audio=False, has_audio=True)
+        self.assertEqual(len(self.commands), 1)
+        self.assertIn("-an", self.commands[0])
+        self.assertNotIn("-vn", self.commands[0])
+
+    def test_the_hook_is_cut_at_natural_speed_and_keeps_its_sound(self):
+        self._render(keep_audio=True, has_audio=True, seek=56.0, length=2.5)
+        picture, sound, join = self.commands
+        self.assertEqual(picture[picture.index("-ss") + 1], "56.000")
+        self.assertEqual(picture[picture.index("-t") + 1], "2.500")
+        self.assertNotIn("setpts", picture[picture.index("-vf") + 1])
+        self.assertEqual(sound[sound.index("-ss") + 1], "56.000")
+        self.assertEqual(sound[sound.index("-t") + 1], "2.500")
+        self.assertNotIn("-af", sound)  # natural speed needs no atempo
+        self.assertIn("-shortest", join)
 
     def test_concat_list_holds_every_segment_in_order(self):
         content = vp.build_segments_concat_list_content(["hook.mp4", "seg0.mp4", "seg1.mp4"])

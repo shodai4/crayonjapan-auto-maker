@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import random
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import pandas as pd
 
@@ -27,6 +27,10 @@ RETRYABLE_STATUS_CODES = frozenset({404, 429, 500, 502, 503, 504})
 REQUIRED_SCRIPT_KEYS = ("title", "hook_text", "narration", "description", "tags")
 ASMR_STYLE_KEY = "style_C_asmr"
 ASMR_NARRATION_MAX_WORDS = 25
+# Setting this environment variable (or the workflow_dispatch input that feeds
+# it) forces one style for a single run, e.g. while a fix is being verified.
+# Unset/empty keeps the usual learned pick, so normal runs stay automatic.
+STYLE_OVERRIDE_ENV = "STYLE_OVERRIDE"
 
 
 def load_performance(csv_path: str) -> Optional[pd.DataFrame]:
@@ -39,6 +43,25 @@ def load_performance(csv_path: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def requested_style_override(
+    config: dict,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """The style forced through ``STYLE_OVERRIDE``, if it names a known one."""
+    env = os.environ if environ is None else environ
+    requested = str(env.get(STYLE_OVERRIDE_ENV, "") or "").strip()
+    if not requested:
+        return None
+    styles = config["evolution"]["styles"]
+    if requested in styles:
+        return requested
+    print(
+        f"[style] ignoring {STYLE_OVERRIDE_ENV}={requested!r}: "
+        f"not one of {', '.join(styles)}"
+    )
+    return None
+
+
 def choose_best_style(
     csv_path: str,
     config: dict,
@@ -48,6 +71,12 @@ def choose_best_style(
     rng = rng or random
     styles_cfg = config["evolution"]["styles"]
     style_names: List[str] = list(styles_cfg.keys())
+
+    override = requested_style_override(config)
+    if override:
+        print(f"[style] {STYLE_OVERRIDE_ENV}={override} in use; the learned pick is skipped")
+        return override
+
     explore_rate = float(config["evolution"].get("exploration_rate", 0.25))
 
     df = load_performance(csv_path)

@@ -33,6 +33,11 @@ class ChooseStyleTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.csv = os.path.join(self.tmp.name, "performance.csv")
+        # These tests describe the automatic pick, so a one-run STYLE_OVERRIDE
+        # from the environment must not leak into them.
+        patcher = mock.patch.dict(os.environ, {"STYLE_OVERRIDE": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_missing_csv_returns_a_known_style(self):
         style = ai_writer.choose_best_style(self.csv, CONFIG)
@@ -74,6 +79,46 @@ class ChooseStyleTests(unittest.TestCase):
             self.assertIn(
                 ai_writer.choose_best_style(self.csv, CONFIG), CONFIG["evolution"]["styles"]
             )
+
+
+class StyleOverrideTests(unittest.TestCase):
+    """STYLE_OVERRIDE pins one style for a single run and is otherwise inert."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.csv = os.path.join(self.tmp.name, "performance.csv")
+
+    def test_a_known_style_wins_over_the_learned_pick(self):
+        write_csv(self.csv, STATS_ROWS)
+        with mock.patch.dict(os.environ, {"STYLE_OVERRIDE": "style_C_asmr"}):
+            self.assertEqual(ai_writer.choose_best_style(self.csv, CONFIG), "style_C_asmr")
+
+    def test_surrounding_spaces_are_trimmed(self):
+        with mock.patch.dict(os.environ, {"STYLE_OVERRIDE": "  style_B_story  "}):
+            self.assertEqual(ai_writer.choose_best_style(self.csv, CONFIG), "style_B_story")
+
+    def test_an_unknown_name_falls_back_to_the_usual_pick(self):
+        write_csv(self.csv, STATS_ROWS)
+        with mock.patch.dict(os.environ, {"STYLE_OVERRIDE": "style_Z_typo"}), \
+                mock.patch.object(ai_writer.random, "random", return_value=0.9):
+            self.assertEqual(ai_writer.choose_best_style(self.csv, CONFIG), "style_B_story")
+
+    def test_unset_or_blank_keeps_the_usual_pick(self):
+        write_csv(self.csv, STATS_ROWS)
+        for value in ("", "   "):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {"STYLE_OVERRIDE": value}), \
+                    mock.patch.object(ai_writer.random, "random", return_value=0.9):
+                self.assertEqual(ai_writer.choose_best_style(self.csv, CONFIG), "style_B_story")
+
+    def test_the_helper_reads_the_environment_it_is_given(self):
+        self.assertEqual(
+            ai_writer.requested_style_override(CONFIG, {"STYLE_OVERRIDE": "style_A_material"}),
+            "style_A_material",
+        )
+        self.assertIsNone(ai_writer.requested_style_override(CONFIG, {}))
+        self.assertIsNone(ai_writer.requested_style_override(CONFIG, {"STYLE_OVERRIDE": "nope"}))
 
 
 class ParseScriptJsonTests(unittest.TestCase):

@@ -24,8 +24,6 @@ from analytics_updater import CSV_COLUMNS
 from metadata_writer import write_metadata_files
 from video_processor import (
     DEFAULT_ARTWORK_OFFSET,
-    build_project_hook_command,
-    build_project_segment_command,
     build_vertical_timelapse,
     compute_project_plan,
     concat_segments,
@@ -35,6 +33,7 @@ from video_processor import (
     has_audio_stream,
     prepare_scanned_artwork,
     probe_duration,
+    render_project_segment,
     run_command,
 )
 from youtube_uploader import upload_short
@@ -445,25 +444,26 @@ def process_project_bundle(
                 hook_length = min(plan["hook_duration"], max(duration, 0.1))
                 hook_start = min(plan["hook_start"], max(duration - hook_length, 0.0))
                 hook_path = f"{vertical_stem}_hook.mp4"
-                runner(
-                    build_project_hook_command(
-                        local, hook_path,
-                        hook_start=max(hook_start, 0.0),
-                        hook_duration=hook_length,
-                        keep_audio=keep_audio,
-                        has_audio=audio,
-                    )
+                render_project_segment(
+                    local, hook_path,
+                    keep_audio=keep_audio,
+                    has_audio=audio,
+                    runner=runner,
+                    seek=max(hook_start, 0.0),
+                    length=hook_length,
+                    duration=hook_length,
                 )
                 hook_paths.append(hook_path)
 
             segment_path = f"{vertical_stem}_seg{index:02d}.mp4"
-            runner(
-                build_project_segment_command(
-                    local, segment_path,
-                    pts_multiplier=plan["pts_multiplier"],
-                    keep_audio=keep_audio,
-                    has_audio=audio,
-                )
+            render_project_segment(
+                local, segment_path,
+                pts_multiplier=plan["pts_multiplier"],
+                keep_audio=keep_audio,
+                has_audio=audio,
+                runner=runner,
+                # The planned length bounds a silent bed for a clip with no sound.
+                duration=plan["segment_durations"][index],
             )
             body_paths.append(segment_path)
 

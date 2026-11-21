@@ -494,99 +494,191 @@ def compute_project_plan(
     }
 
 
-def _segment_inputs(keep_audio: bool, has_audio: bool) -> List[str]:
-    """Extra FFmpeg inputs needed so every segment carries the same streams."""
-    if keep_audio and not has_audio:
-        return [
-            "-f", "lavfi",
-            "-i", f"anullsrc=r={PROJECT_AUDIO_RATE}:cl=stereo",
-        ]
-    return []
+# ASMR (audio-keeping) segments are written as two separate streams and joined
+# afterwards. Asking one FFmpeg command to speed the picture up *and* pad the
+# sound (`-af "...,apad"` together with `-shortest`) left the renderer on
+# `frame=0` for an hour on 2026-11-21: `apad` never ends, so `-shortest` waits
+# forever and no frame is written. A picture-only pass (`-an`), a sound-only
+# pass (`-vn`) and a stream-copy join finish deterministically.
+
+def _seek_input_args(seek: Optional[float], length: Optional[float]) -> List[str]:
+    """``-ss`` / ``-t`` before ``-i`` so FFmpeg seeks the input itself."""
+    args: List[str] = []
+    if seek is not None:
+        try:
+            start = max(float(seek), 0.0)
+        except (TypeError, ValueError):
+            start = 0.0
+        args += ["-ss", f"{start:.3f}"]
+    if length is not None:
+        try:
+            size = max(float(length), 0.1)
+        except (TypeError, ValueError):
+            size = HOOK_TAIL_SECONDS
+        args += ["-t", f"{size:.3f}"]
+    return args
 
 
-def _segment_output_args(keep_audio: bool, has_audio: bool) -> List[str]:
-    """Maps and codec arguments shared by the hook and the body segments."""
-    if not keep_audio:
-        return ["-an", *SEGMENT_VIDEO_CODEC_ARGS]
-    audio_map = "0:a:0" if has_audio else "1:a:0"
-    return [
-        "-map", "0:v:0",
-        "-map", audio_map,
-        *SEGMENT_VIDEO_CODEC_ARGS,
-        *SEGMENT_AUDIO_CODEC_ARGS,
-        "-shortest",
-    ]
-
-
-def build_project_segment_command(
-    input_path: str,
-    output_path: str,
-    pts_multiplier: float,
-    keep_audio: bool = False,
-    has_audio: bool = True,
-    width: int = PROJECT_WIDTH,
-    height: int = PROJECT_HEIGHT,
-    fps: int = PROJECT_FPS,
-) -> List[str]:
-    """Speed one raw clip up and write its short 9:16 segment.
-
-    ``pts_multiplier`` is the shared time scale (0.01 = 100x faster), so the
-    segment is ``clip_duration * pts_multiplier`` seconds long. Audio, when kept
-    (ASMR), is stretched by the same factor and padded so ``-shortest`` ends on
-    the picture.
-    """
+def _coerce_pts(pts_multiplier: Optional[float]) -> Optional[float]:
+    """A usable time scale, or None for "keep the natural speed"."""
+    if pts_multiplier is None:
+        return None
     try:
         pts = float(pts_multiplier)
     except (TypeError, ValueError):
-        pts = 1.0
+        return None
     if not math.isfinite(pts) or pts <= 0:
-        pts = 1.0
-
-    vf = f"setpts={pts:.6f}*PTS,{build_fit_filter(width, height, fps)}"
-    cmd = ["ffmpeg", "-y", "-i", input_path]
-    cmd += _segment_inputs(keep_audio, has_audio)
-    cmd += ["-vf", vf]
-    if keep_audio:
-        cmd += ["-af", f"{build_atempo_filter(1.0 / pts)},apad"]
-    cmd += _segment_output_args(keep_audio, has_audio)
-    cmd.append(output_path)
-    return cmd
+        return None
+    return pts
 
 
-def build_project_hook_command(
+def build_segment_video_command(
     input_path: str,
     output_path: str,
-    hook_start: float,
-    hook_duration: float,
-    keep_audio: bool = False,
-    has_audio: bool = True,
+    pts_multiplier: Optional[float] = None,
     width: int = PROJECT_WIDTH,
     height: int = PROJECT_HEIGHT,
     fps: int = PROJECT_FPS,
+    seek: Optional[float] = None,
+    length: Optional[float] = None,
 ) -> List[str]:
-    """2.5 s finish preview cut from the tail of the last clip, natural speed."""
-    try:
-        start = max(float(hook_start), 0.0)
-    except (TypeError, ValueError):
-        start = 0.0
-    try:
-        length = max(float(hook_duration), 0.1)
-    except (TypeError, ValueError):
-        length = HOOK_TAIL_SECONDS
+    """Picture only (``-an``), fitted to the 9:16 canvas.
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-ss", f"{start:.3f}",
-        "-t", f"{length:.3f}",
-        "-i", input_path,
-    ]
-    cmd += _segment_inputs(keep_audio, has_audio)
-    cmd += ["-vf", build_fit_filter(width, height, fps)]
-    if keep_audio:
-        cmd += ["-af", "apad"]
-    cmd += _segment_output_args(keep_audio, has_audio)
-    cmd.append(output_path)
+    ``pts_multiplier`` is the shared time scale (0.01 = 100x faster); None keeps
+    the natural speed, which is what the 2.5 s finish preview needs.
+    """
+    pts = _coerce_pts(pts_multiplier)
+    fit = build_fit_filter(width, height, fps)
+    vf = fit if pts is None else f"setpts={pts:.6f}*PTS,{fit}"
+    cmd = ["ffmpeg", "-y", *_seek_input_args(seek, length), "-i", input_path]
+    cmd += ["-vf", vf, "-an", *SEGMENT_VIDEO_CODEC_ARGS, output_path]
     return cmd
+
+
+def build_segment_audio_command(
+    input_path: str,
+    output_path: str,
+    speed_factor: float = 1.0,
+    has_audio: bool = True,
+    seek: Optional[float] = None,
+    length: Optional[float] = None,
+    silence_seconds: Optional[float] = None,
+) -> List[str]:
+    """Sound only (``-vn``), sped up with the bounded atempo chain.
+
+    Never pads: a clip without sound gets a silent bed of a fixed length
+    instead, so every joined segment carries the same streams, the concat
+    demuxer accepts them, and nothing in the graph is endless.
+    """
+    if has_audio:
+        cmd = ["ffmpeg", "-y", *_seek_input_args(seek, length), "-i", input_path]
+    else:
+        # The sound pass reads one input only, so the bed is 0:a:0, and it needs
+        # a real length: an unbounded `anullsrc` would never finish on its own.
+        try:
+            bed = max(float(silence_seconds or 0.0), 0.1)
+        except (TypeError, ValueError):
+            bed = 0.1
+        cmd = ["ffmpeg", "-y", "-t", f"{bed:.3f}"]
+        cmd += ["-f", "lavfi", "-i", f"anullsrc=r={PROJECT_AUDIO_RATE}:cl=stereo"]
+    source_map = "0:a:0"
+    try:
+        speed = float(speed_factor)
+    except (TypeError, ValueError):
+        speed = 1.0
+    if math.isfinite(speed) and speed > 0 and abs(speed - 1.0) > 1e-9:
+        cmd += ["-af", build_atempo_filter(speed)]
+    cmd += ["-vn", "-map", source_map, *SEGMENT_AUDIO_CODEC_ARGS, output_path]
+    return cmd
+
+
+def build_segment_join_command(
+    video_path: str,
+    audio_path: str,
+    output_path: str,
+) -> List[str]:
+    """Copy the picture, encode the sound, and end on the shorter stream."""
+    return [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-c:v", "copy",
+        *SEGMENT_AUDIO_CODEC_ARGS,
+        "-shortest",
+        output_path,
+    ]
+
+
+def _silence_length(
+    duration: Optional[float],
+    length: Optional[float],
+    temp_video: str,
+) -> Optional[float]:
+    """How long the silent bed must be: the plan's segment, else the render."""
+    for value in (duration, length):
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(seconds) and seconds > 0:
+            return seconds
+    if os.path.exists(temp_video):
+        return probe_duration(temp_video)
+    return None
+
+
+def render_project_segment(
+    input_path: str,
+    output_path: str,
+    pts_multiplier: Optional[float] = None,
+    keep_audio: bool = False,
+    has_audio: bool = True,
+    runner: Runner = run_command,
+    width: int = PROJECT_WIDTH,
+    height: int = PROJECT_HEIGHT,
+    fps: int = PROJECT_FPS,
+    seek: Optional[float] = None,
+    length: Optional[float] = None,
+    duration: Optional[float] = None,
+) -> str:
+    """Render one short segment of a project.
+
+    A muted render (the story/material styles) is a single pass. An ASMR render
+    is three safe passes - picture, sound, then a stream-copy join - so no FFmpeg
+    invocation ever puts `apad` and `-shortest` together.
+    """
+    if not keep_audio:
+        runner(build_segment_video_command(
+            input_path, output_path, pts_multiplier, width, height, fps, seek, length
+        ))
+        return output_path
+
+    stem = os.path.splitext(output_path)[0]
+    temp_video = f"{stem}_silent.mp4"
+    temp_audio = f"{stem}_sound.m4a"
+    pts = _coerce_pts(pts_multiplier)
+    speed = 1.0 / pts if pts else 1.0
+    try:
+        runner(build_segment_video_command(
+            input_path, temp_video, pts_multiplier, width, height, fps, seek, length
+        ))
+        runner(build_segment_audio_command(
+            input_path, temp_audio,
+            # A silent bed is not sped up: it only has to be long enough.
+            speed_factor=speed if has_audio else 1.0,
+            has_audio=has_audio,
+            seek=seek,
+            length=length,
+            silence_seconds=_silence_length(duration, length, temp_video),
+        ))
+        runner(build_segment_join_command(temp_video, temp_audio, output_path))
+    finally:
+        for path in (temp_video, temp_audio):
+            if os.path.exists(path):
+                os.remove(path)
+    return output_path
 
 
 def build_segments_concat_list_content(paths: Sequence[str]) -> str:
