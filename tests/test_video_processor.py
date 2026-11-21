@@ -437,6 +437,31 @@ class ZoomOutroCommandTests(unittest.TestCase):
             [name for name in os.listdir(self.tmp.name) if name.endswith("_zoom.mp4")], []
         )
 
+    def test_a_narration_that_cannot_fit_is_reported(self):
+        base = os.path.join(self.tmp.name, "cut_base.mp4")
+        with open(base, "wb") as handle:
+            handle.write(b"cut")
+        artwork = os.path.join(self.tmp.name, "art_artwork.jpg")
+        with open(artwork, "wb") as handle:
+            handle.write(b"jpeg")
+        out = os.path.join(self.tmp.name, "cut_vertical.mp4")
+
+        def runner(cmd):
+            target = cmd[-1]
+            if isinstance(target, str) and target.endswith(".mp4"):
+                with open(target, "wb") as handle:
+                    handle.write(b"segment")
+
+        with mock.patch.object(vp, "probe_duration", return_value=41.0), \
+                mock.patch("builtins.print") as printed:
+            plan = vp.assemble_finale(
+                base, artwork, out, target_total=45.0, narration_seconds=70.0, runner=runner
+            )
+        self.assertAlmostEqual(plan["zoom_outro_seconds"], vp.ZOOM_OUTRO_MAX_SECONDS)
+        self.assertTrue(
+            any("last words will be cut" in str(call.args[0]) for call in printed.call_args_list)
+        )
+
     def test_a_missing_scan_falls_back_to_the_cut(self):
         base = os.path.join(self.tmp.name, "cut_base.mp4")
         with open(base, "wb") as handle:

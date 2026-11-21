@@ -933,6 +933,18 @@ def assemble_finale(
     base = probe_duration(base_video)
     total = compute_finale_total(target_total, narration_seconds)
     outro_seconds = compute_zoom_outro_seconds(base, total)
+    if narration_seconds:
+        try:
+            spoken = float(narration_seconds)
+        except (TypeError, ValueError):
+            spoken = 0.0
+        # The zoom can only grow to ZOOM_OUTRO_MAX_SECONDS: past that the Shorts
+        # guard wins, and `-shortest` would end the mux before the last words.
+        if spoken > 0 and spoken + NARRATION_TAIL_SECONDS > base + outro_seconds + 0.05:
+            print(
+                f"      warning: the narration runs {spoken:.1f}s but the picture can "
+                f"only reach {base + outro_seconds:.1f}s; its last words will be cut"
+            )
 
     if not os.path.exists(artwork_path):
         print(f"      no artwork for the closing zoom ({artwork_path}); keeping the cut as is")
