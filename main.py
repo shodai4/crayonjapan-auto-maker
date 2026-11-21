@@ -19,7 +19,12 @@ import pandas as pd
 import yaml
 
 import drive_sync
-from ai_writer import ASMR_STYLE_KEY, choose_best_style, generate_making_script
+from ai_writer import (
+    ASMR_STYLE_KEY,
+    TRANSLATION_KEYS,
+    choose_best_style,
+    generate_making_script,
+)
 from analytics_updater import CSV_COLUMNS
 from metadata_writer import write_metadata_files
 from video_processor import (
@@ -339,6 +344,12 @@ def _publish_bundle(
     )
 
     print("[6/6] Writing the English metadata bundle...")
+    missing_ja = [key for key in TRANSLATION_KEYS if not script_data.get(key)]
+    if missing_ja:
+        print(
+            f"      Gemini sent no {', '.join(missing_ja)}; "
+            "the pack marks that translation as missing"
+        )
     metadata_paths = write_metadata_files(
         script_data,
         output_dir=output_dir,

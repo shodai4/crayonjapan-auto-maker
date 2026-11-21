@@ -151,6 +151,9 @@ SCRIPT = {
     "narration": "This postcard started as an empty sheet.",
     "description": "Original postcard at CrayonJapan.",
     "tags": ["oil pastel", "postcard"],
+    "title_ja": "オイルパステルのポストカード #Shorts",
+    "hook_ja": "ちいさなポストカード1枚",
+    "narration_ja": "このポストカードは、まっ白な紙から始まりました。",
 }
 
 
@@ -211,6 +214,17 @@ class ProcessVideoBundleTests(unittest.TestCase):
         self.assertEqual(metadata["shop_url"], "https://crayonjapan.base.shop/")
         self.assertEqual(metadata["artwork_image"], "clip_artwork.jpg")
         self.assertEqual(metadata["short_video"], "clip_final.mp4")
+
+    def test_metadata_text_pack_carries_the_japanese_narration(self):
+        bundle, _, _, _, _, _ = self._run()
+        with open(bundle["metadata_text"], "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("=== NARRATION (EN) ===", text)
+        self.assertIn(SCRIPT["narration"], text)
+        self.assertIn("=== NARRATION (JA) ===", text)
+        self.assertIn(SCRIPT["narration_ja"], text)
+        self.assertIn(SCRIPT["title_ja"], text)
+        self.assertIn(SCRIPT["hook_ja"], text)
 
     def test_no_upload_skips_youtube_and_the_csv_row(self):
         bundle, _, _, _, upload_short, row = self._run(upload=False)

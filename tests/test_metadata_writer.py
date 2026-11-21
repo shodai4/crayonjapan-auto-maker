@@ -11,6 +11,9 @@ SCRIPT = {
     "narration": "This pastel postcard began as an empty sheet.",
     "description": "A one-of-a-kind original postcard. Shop: https://crayonjapan.base.shop/",
     "tags": ["oil pastel", " crayon ", "", "postcard art"],
+    "title_ja": "パステルの桜ポストカード #Shorts",
+    "hook_ja": "ちいさなポストカード1枚",
+    "narration_ja": "このパステルのポストカードは、まっ白な紙から始まりました。",
 }
 
 GENERATED_AT = "2026-11-21T03:30:00+09:00"
@@ -78,6 +81,52 @@ class FormatMetadataTextTests(unittest.TestCase):
         self.assertIn("=== TITLE ===", text)
 
 
+class JapaneseTranslationTests(unittest.TestCase):
+    """The pack carries the English narration and the Japanese the artist checks."""
+
+    def test_json_keeps_the_japanese_translations(self):
+        metadata = build()
+        self.assertEqual(metadata["artwork_title_ja"], SCRIPT["title_ja"])
+        self.assertEqual(metadata["hook_text_ja"], SCRIPT["hook_ja"])
+        self.assertEqual(metadata["narration_ja"], SCRIPT["narration_ja"])
+
+    def test_text_lists_each_english_block_before_its_japanese(self):
+        text = mw.format_metadata_text(build())
+        headings = [
+            "=== TITLE ===",
+            "=== TITLE (JA) ===",
+            "=== HOOK TEXT (first 2.5s) ===",
+            "=== HOOK TEXT (JA) ===",
+            "=== NARRATION (EN) ===",
+            "=== NARRATION (JA) ===",
+            "=== DESCRIPTION ===",
+            "=== TAGS ===",
+            "=== SHOP ===",
+        ]
+        positions = [text.index(heading) for heading in headings]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_text_carries_the_full_english_narration_and_its_japanese(self):
+        text = mw.format_metadata_text(build())
+        self.assertIn(SCRIPT["narration"], text)
+        self.assertIn(SCRIPT["narration_ja"], text)
+        self.assertIn(SCRIPT["title_ja"], text)
+        self.assertIn(SCRIPT["hook_ja"], text)
+
+    def test_missing_translations_are_marked_not_left_blank(self):
+        script = dict(SCRIPT, title_ja="", hook_ja="", narration_ja="")
+        metadata = mw.build_art_metadata(script, base_name="clip", generated_at=GENERATED_AT)
+        text = mw.format_metadata_text(metadata)
+        self.assertEqual(text.count(mw.TRANSLATION_MISSING), 3)
+
+    def test_an_older_script_without_japanese_still_writes_the_pack(self):
+        script = {key: SCRIPT[key] for key in ("title", "hook_text", "narration", "description", "tags")}
+        metadata = mw.build_art_metadata(script, base_name="clip", generated_at=GENERATED_AT)
+        text = mw.format_metadata_text(metadata)
+        self.assertIn(SCRIPT["narration"], text)
+        self.assertNotIn("None", text)
+
+
 class WriteMetadataFilesTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -104,9 +153,13 @@ class WriteMetadataFilesTests(unittest.TestCase):
             saved = json.load(handle)
         self.assertEqual(saved["artwork_id"], "clip")
         self.assertEqual(saved["style"], "style_A_material")
+        self.assertEqual(saved["narration_ja"], SCRIPT["narration_ja"])
 
         with open(paths["text"], "r", encoding="utf-8") as handle:
-            self.assertIn("=== TITLE ===", handle.read())
+            text = handle.read()
+        self.assertIn("=== TITLE ===", text)
+        self.assertIn("=== NARRATION (JA) ===", text)
+        self.assertIn(SCRIPT["narration_ja"], text)
 
     def test_creates_a_missing_output_directory(self):
         nested = os.path.join(self.tmp.name, "output", "day1")

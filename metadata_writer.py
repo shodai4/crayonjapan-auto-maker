@@ -3,7 +3,8 @@
 Two files land next to the rendered Short so the same package can be dropped
 into ``02_READY_TO_POST`` and reused for the BASE shop listing:
 
-* ``{stem}_metadata.txt``       - paste-ready title / description / tags
+* ``{stem}_metadata.txt``       - paste-ready title / description / tags, plus
+  the full English narration with its Japanese translation for the check
 * ``{stem}_art_metadata.json``  - the same data as structured art metadata
 
 Keeping this separate from ``ai_writer.py`` means the Gemini reply stays the
@@ -21,6 +22,9 @@ JST = timezone(timedelta(hours=9))
 
 METADATA_TEXT_SUFFIX = "_metadata.txt"
 ART_METADATA_SUFFIX = "_art_metadata.json"
+# Shown inside the pack when Gemini sent no Japanese for a field, so a missing
+# translation is visible instead of silently blank.
+TRANSLATION_MISSING = "（日本語訳なし）"
 
 
 def _clean(value: object) -> str:
@@ -36,6 +40,11 @@ def _clean_tags(tags: object) -> List[str]:
         if text:
             cleaned.append(text)
     return cleaned
+
+
+def _block(value: object) -> str:
+    """A translated block, or a clear note that the reply had no Japanese."""
+    return _clean(value) or TRANSLATION_MISSING
 
 
 def build_art_metadata(
@@ -55,6 +64,10 @@ def build_art_metadata(
         "hook_text": _clean(script_data.get("hook_text")),
         "description_en": _clean(script_data.get("description")),
         "narration_en": _clean(script_data.get("narration")),
+        # Japanese translations, for the artist's check before posting.
+        "artwork_title_ja": _clean(script_data.get("title_ja")),
+        "hook_text_ja": _clean(script_data.get("hook_ja")),
+        "narration_ja": _clean(script_data.get("narration_ja")),
         "tags": _clean_tags(script_data.get("tags")),
         "material": _clean(material_name),
         "style": _clean(style_key),
@@ -81,8 +94,20 @@ def format_metadata_text(metadata: Dict[str, object]) -> str:
         "=== TITLE ===",
         _clean(metadata.get("artwork_title")),
         "",
+        "=== TITLE (JA) ===",
+        _block(metadata.get("artwork_title_ja")),
+        "",
         "=== HOOK TEXT (first 2.5s) ===",
         _clean(metadata.get("hook_text")),
+        "",
+        "=== HOOK TEXT (JA) ===",
+        _block(metadata.get("hook_text_ja")),
+        "",
+        "=== NARRATION (EN) ===",
+        _clean(metadata.get("narration_en")),
+        "",
+        "=== NARRATION (JA) ===",
+        _block(metadata.get("narration_ja")),
         "",
         "=== DESCRIPTION ===",
         _clean(metadata.get("description_en")),

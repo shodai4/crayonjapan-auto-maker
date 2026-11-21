@@ -24,7 +24,24 @@ API_VERSION = "v1beta"
 FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.8-flash")
 # 404 retired/unknown model, 429 free-tier quota, 5xx overload.
 RETRYABLE_STATUS_CODES = frozenset({404, 429, 500, 502, 503, 504})
+# The artist checks every script in Japanese before it is posted, so the reply
+# carries the three Japanese fields next to their English originals. They are
+# optional (an older or partial reply must still render); the metadata pack
+# simply says the translation is missing.
+TRANSLATION_KEYS = ("title_ja", "hook_ja", "narration_ja")
 REQUIRED_SCRIPT_KEYS = ("title", "hook_text", "narration", "description", "tags")
+# Gemini occasionally answers with the key names of its own proposal ("hook",
+# "script") or a different spelling of a Japanese field, so one naming slip does
+# not throw away a whole render. The first accepted name is the canonical one.
+SCRIPT_KEY_ALIASES = {
+    "hook_text": ("hook_text", "hook"),
+    "narration": ("narration", "script"),
+}
+TRANSLATION_KEY_ALIASES = {
+    "title_ja": ("title_ja", "title_jp", "title_japanese"),
+    "hook_ja": ("hook_ja", "hook_text_ja", "hook_jp", "hook_japanese"),
+    "narration_ja": ("narration_ja", "script_ja", "narration_jp", "script_japanese"),
+}
 ASMR_STYLE_KEY = "style_C_asmr"
 # The voice now has to carry the whole Short. The earlier 65-85 word script (and
 # the 25-word ASMR cap) left the second half of the video silent, which the
@@ -177,9 +194,39 @@ Generate a JSON response with the following keys:
 3. "narration": Natural, engaging English voiceover script of {NARRATION_MIN_WORDS}-{NARRATION_MAX_WORDS} words (~40-45 seconds, this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Mention {material} naturally and end with the warm call-to-action described above. Do not leave a silent stretch longer than a breath anywhere in the Short.
 4. "description": YouTube description including artwork story, material ({material}), shop link ({shop_url}), and hashtags (#SakuraCrayPas #CrayPasSpecialist #OilPastelArt #JapaneseArtSupplies #OriginalPostcard #CrayonJapan).
 5. "tags": List of 10 relevant English tags.
+6. "title_ja": The same title in natural Japanese, keeping "#Shorts" and any emoji.
+7. "hook_ja": The same on-screen hook in natural Japanese, short enough to read in 2.5 seconds.
+8. "narration_ja": The whole narration translated into natural, warm Japanese so the artist can check it before posting - the same meaning and order as "narration", one Japanese sentence per English sentence, no emoji and no stage directions. It is a translation only: never add or drop a fact, and never write a different script.
+
+Every Japanese field must translate the English field beside it, not re-imagine it.
 
 Return strictly valid JSON without markdown fences.{asmr_note}
 """.strip()
+
+
+def _text(value: object) -> str:
+    """A stripped string, or '' for anything that is not one."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def adopt_script_key_aliases(data: dict) -> None:
+    """Copy an accepted alias onto the canonical key when that key is empty."""
+    for canonical, aliases in SCRIPT_KEY_ALIASES.items():
+        if _text(data.get(canonical)):
+            continue
+        for alias in aliases:
+            if _text(data.get(alias)):
+                data[canonical] = data[alias]
+                break
+
+
+def translation_text(data: dict, key: str) -> str:
+    """The Japanese field under any accepted spelling, or '' when absent."""
+    for alias in TRANSLATION_KEY_ALIASES[key]:
+        text = _text(data.get(alias))
+        if text:
+            return text
+    return ""
 
 
 def parse_script_json(raw_text: str) -> dict:
@@ -191,6 +238,7 @@ def parse_script_json(raw_text: str) -> dict:
     data = json.loads(text)
     if not isinstance(data, dict):
         raise ValueError("Gemini reply is not a JSON object")
+    adopt_script_key_aliases(data)
     missing = [key for key in REQUIRED_SCRIPT_KEYS if key not in data]
     if missing:
         raise ValueError(f"Gemini reply is missing required keys: {', '.join(missing)}")
@@ -201,6 +249,10 @@ def parse_script_json(raw_text: str) -> dict:
     data["tags"] = [str(tag).strip() for tag in tags if str(tag).strip()][:10]
     for key in ("title", "hook_text", "narration", "description"):
         data[key] = str(data[key]).strip()
+    # A missing translation becomes an empty string rather than an error, so the
+    # render and the English upload pack are never lost over it.
+    for key in TRANSLATION_KEYS:
+        data[key] = translation_text(data, key)
     return data
 
 

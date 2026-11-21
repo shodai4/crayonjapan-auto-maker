@@ -47,6 +47,10 @@ SCRIPT = {
     "narration": "This postcard started as an empty sheet of paper.",
     "description": "Original postcard at CrayonJapan.",
     "tags": ["oil pastel", "postcard"],
+    # Stand-in for the Japanese fields Gemini returns with every script.
+    "title_ja": "世界に1枚のオイルパステルポストカード #Shorts",
+    "hook_ja": "ちいさなポストカード",
+    "narration_ja": "このポストカードは、まっ白な紙から始まりました。",
 }
 
 FFPROBE_SHIM = '''#!/usr/bin/env python3

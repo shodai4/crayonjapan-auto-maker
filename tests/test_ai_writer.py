@@ -209,6 +209,65 @@ class PromptTests(unittest.TestCase):
                 self.assertIn("never invent a fact", prompt)
 
 
+class JapaneseTranslationTests(unittest.TestCase):
+    """Gemini returns the Japanese the artist checks before the Short is posted."""
+
+    REPLY = {
+        "title": "Painting a Cyndaquil Card #Shorts",
+        "hook_text": "Found a fire-type treasure today!",
+        "narration": "This tiny card began as a blank sheet of paper.",
+        "description": "Shop: https://crayonjapan.base.shop/",
+        "tags": ["pokemon", "oil pastel"],
+        "title_ja": "  ヒノアラシのカードを描いてみた #Shorts  ",
+        "hook_ja": "今日、ほのおタイプの宝物を見つけたよ！",
+        "narration_ja": "この小さなカードは、まっ白な紙から始まりました。",
+    }
+
+    def test_every_style_asks_for_the_three_japanese_fields(self):
+        for style in CONFIG["evolution"]["styles"]:
+            with self.subTest(style=style):
+                prompt = ai_writer.build_script_prompt(style, CONFIG)
+                for key in ai_writer.TRANSLATION_KEYS:
+                    self.assertIn(f'"{key}"', prompt)
+                self.assertIn("translation only", prompt)
+
+    def test_the_prompt_keeps_the_earlier_script_rules(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
+        self.assertIn(f"{ai_writer.NARRATION_MIN_WORDS}-", prompt)
+        self.assertIn("never invent a fact", prompt)
+
+    def test_parse_keeps_the_japanese_fields_and_trims_them(self):
+        data = ai_writer.parse_script_json(json.dumps(self.REPLY))
+        self.assertEqual(data["title_ja"], "ヒノアラシのカードを描いてみた #Shorts")
+        self.assertEqual(data["hook_ja"], self.REPLY["hook_ja"])
+        self.assertEqual(data["narration_ja"], self.REPLY["narration_ja"])
+        self.assertEqual(data["narration"], self.REPLY["narration"])
+
+    def test_the_key_names_of_geminis_own_proposal_are_accepted(self):
+        reply = dict(self.REPLY)
+        reply.pop("title_ja")
+        reply["script_ja"] = reply.pop("narration_ja")
+        reply["hook"] = reply.pop("hook_text")
+        reply["script"] = reply.pop("narration")
+        data = ai_writer.parse_script_json(json.dumps(reply))
+        self.assertEqual(data["narration_ja"], self.REPLY["narration_ja"])
+        self.assertEqual(data["hook_text"], self.REPLY["hook_text"])
+        self.assertEqual(data["narration"], self.REPLY["narration"])
+        self.assertEqual(data["title_ja"], "")
+
+    def test_a_reply_without_japanese_still_parses(self):
+        reply = {key: self.REPLY[key] for key in ai_writer.REQUIRED_SCRIPT_KEYS}
+        data = ai_writer.parse_script_json(json.dumps(reply))
+        for key in ai_writer.TRANSLATION_KEYS:
+            self.assertEqual(data[key], "")
+
+    def test_blank_or_non_text_translations_become_empty(self):
+        reply = dict(self.REPLY, title_ja="   ", hook_ja=None, narration_ja=["x"])
+        data = ai_writer.parse_script_json(json.dumps(reply))
+        for key in ai_writer.TRANSLATION_KEYS:
+            self.assertEqual(data[key], "")
+
+
 class _FakeApiError(Exception):
     """Stands in for google.genai.errors.APIError without the SDK."""
 
@@ -291,6 +350,24 @@ class GenerateScriptFallbackTests(unittest.TestCase):
                 mock.patch.object(ai_writer, "create_client", return_value=_FakeClient(replies, calls)) as factory:
             data = ai_writer.generate_making_script([], "style_A_material", CONFIG, **kwargs)
         return data, calls, factory
+
+    def test_the_japanese_fields_reach_the_caller(self):
+        script = dict(
+            VALID_SCRIPT,
+            title_ja="ちいさなパステルのねこ #Shorts",
+            hook_ja="三筆だけ",
+            narration_ja="世界に1枚だけのポストカードです。",
+        )
+        data, _, _ = self._run({ai_writer.MODEL_NAME: json.dumps(script)})
+        self.assertEqual(data["title_ja"], script["title_ja"])
+        self.assertEqual(data["hook_ja"], script["hook_ja"])
+        self.assertEqual(data["narration_ja"], script["narration_ja"])
+
+    def test_a_reply_without_japanese_still_returns_a_script(self):
+        data, _, _ = self._run({ai_writer.MODEL_NAME: json.dumps(VALID_SCRIPT)})
+        self.assertEqual(data["title"], VALID_SCRIPT["title"])
+        for key in ai_writer.TRANSLATION_KEYS:
+            self.assertEqual(data[key], "")
 
     def test_a_working_primary_model_is_used_once(self):
         data, calls, _ = self._run({ai_writer.MODEL_NAME: json.dumps(VALID_SCRIPT)})
