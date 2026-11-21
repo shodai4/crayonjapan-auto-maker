@@ -24,7 +24,10 @@ from analytics_updater import CSV_COLUMNS
 from metadata_writer import write_metadata_files
 from video_processor import (
     DEFAULT_ARTWORK_OFFSET,
+    ZOOM_OUTRO_SECONDS,
+    assemble_finale,
     build_vertical_timelapse,
+    compute_finish_window,
     compute_project_plan,
     concat_segments,
     ensure_disk_space,
@@ -32,6 +35,7 @@ from video_processor import (
     extract_keyframes,
     has_audio_stream,
     prepare_scanned_artwork,
+    probe_audio_seconds,
     probe_duration,
     render_project_segment,
     run_command,
@@ -282,15 +286,23 @@ def _publish_bundle(
     output_dir: str,
     upload: bool,
     reference_scan: bool = False,
+    finale: Optional[dict] = None,
 ) -> dict:
-    """Script, voice, subtitles, upload pack and (optionally) the upload."""
+    """Script, voice, subtitles, upload pack and (optionally) the upload.
+
+    ``finale`` turns the hook/body/finish cut into the final picture: after the
+    voice is measured, a slow zoom over the artwork is appended so the video
+    ends with the narration instead of cutting it off.
+    """
     audio_path = f"{output_dir}/{base_name}.mp3"
     srt_path = f"{output_dir}/{base_name}.srt"
     final_video = f"{output_dir}/{base_name}_final.mp4"
     keyframe_dir = f"{output_dir}/{base_name}_frames"
 
     print("[3/6] Extracting keyframes & writing the English script...")
-    frames = extract_keyframes(raw_vertical, keyframe_dir)
+    # The finale is appended later, so the frames come from the cut that exists.
+    frames_source = (finale or {}).get("base_video") or raw_vertical
+    frames = extract_keyframes(frames_source, keyframe_dir)
     if reference_scan:
         # The finished scan is the strongest reference for colours and details,
         # so Gemini sees it first, next to the time-lapse keyframes.
@@ -302,10 +314,28 @@ def _publish_bundle(
     print(f"[4/6] Generating English voiceover ({style_key})...")
     asyncio.run(synthesize_voice(script_data["narration"], audio_path, srt_path))
 
+    vertical = raw_vertical
+    finale_plan = None
+    if finale:
+        print("[4.5/6] Holding the finish slowly and zooming into the artwork...")
+        finale_plan = assemble_finale(
+            base_video=finale["base_video"],
+            artwork_path=artwork_path,
+            output_path=raw_vertical,
+            target_total=float(finale["target_total"]),
+            narration_seconds=probe_audio_seconds(audio_path),
+            runner=finale["runner"],
+        )
+        print(
+            f"      cut {finale_plan['base_seconds']:.1f}s + zoom "
+            f"{finale_plan['zoom_outro_seconds']:.1f}s = "
+            f"{finale_plan['total_seconds']:.1f}s"
+        )
+
     print("[5/6] Burning subtitles and mixing audio...")
     keep_audio = should_keep_audio(style_key)
     mux_audio_and_subtitles(
-        raw_vertical, audio_path, srt_path, final_video, keep_original_audio=keep_audio
+        vertical, audio_path, srt_path, final_video, keep_original_audio=keep_audio
     )
 
     print("[6/6] Writing the English metadata bundle...")
@@ -348,6 +378,7 @@ def _publish_bundle(
         "metadata_json": metadata_paths["json"],
         "script": script_data,
         "video_id": video_id,
+        "finale": finale_plan,
     }
 
 
@@ -439,15 +470,24 @@ def process_project_bundle(
     clips = list(source.videos)
     style_key = choose_best_style(CSV_PATH, config)
     keep_audio = should_keep_audio(style_key)
+    target_total = float(config["video"]["target_duration_sec"])
+    hook_seconds = float(config["video"]["hook_duration_sec"])
+    # The cut leaves room for the finale: the finish shot replayed slowly, then a
+    # closing zoom over the artwork. Both are only appended after the voice is
+    # measured, so their length can follow the narration.
+    finish_window = compute_finish_window(clips[-1].duration_seconds if clips else None)
+    timelapse_target = target_total - finish_window["screen_seconds"] - ZOOM_OUTRO_SECONDS
     plan = compute_project_plan(
         [clip.duration_seconds for clip in clips],
-        target_duration=float(config["video"]["target_duration_sec"]),
-        hook_duration=float(config["video"]["hook_duration_sec"]),
+        target_duration=timelapse_target,
+        hook_duration=hook_seconds,
     )
 
     print(
         f"[1/6] Editing project {source.name}: {len(clips)} clip(s), "
-        f"{plan['total_duration']:.0f}s -> {plan['main_duration']:.0f}s (style={style_key})"
+        f"{plan['total_duration']:.0f}s -> {plan['main_duration']:.0f}s "
+        f"+ {finish_window['screen_seconds']:.1f}s finish + zoom "
+        f"(style={style_key})"
     )
 
     # The scan comes first (it is small): if it is there the artwork is settled
@@ -471,6 +511,7 @@ def process_project_bundle(
 
     hook_paths: List[str] = []
     body_paths: List[str] = []
+    finish_paths: List[str] = []
     for index, clip in enumerate(clips):
         local = _clip_local_path(work_dir, index, clip)
         ensure_disk_space(work_dir, clip.size)
@@ -497,6 +538,22 @@ def process_project_bundle(
                 )
                 hook_paths.append(hook_path)
 
+                # Finale, part one: the same last moment, played slowly, so the
+                # finished piece is actually looked at before the zoom begins.
+                finish = compute_finish_window(duration)
+                finish_path = f"{vertical_stem}_finish.mp4"
+                render_project_segment(
+                    local, finish_path,
+                    pts_multiplier=finish["pts_multiplier"],
+                    keep_audio=keep_audio,
+                    has_audio=audio,
+                    runner=runner,
+                    seek=finish["start"],
+                    length=finish["source_seconds"],
+                    duration=finish["screen_seconds"],
+                )
+                finish_paths.append(finish_path)
+
             segment_path = f"{vertical_stem}_seg{index:02d}.mp4"
             render_project_segment(
                 local, segment_path,
@@ -518,11 +575,12 @@ def process_project_bundle(
             if not keep_local_raw and os.path.exists(local):
                 os.remove(local)  # the original still lives in Drive until archived
 
-    print("[2/6] Concatenating the rendered segments (hook + clips)...")
+    print("[2/6] Concatenating the rendered segments (hook + clips + finish)...")
+    base_video = f"{vertical_stem}_base.mp4"
     try:
-        concat_segments(hook_paths + body_paths, raw_vertical, runner=runner)
+        concat_segments(hook_paths + body_paths + finish_paths, base_video, runner=runner)
     finally:
-        for path in hook_paths + body_paths:
+        for path in hook_paths + body_paths + finish_paths:
             if os.path.exists(path):
                 os.remove(path)
 
@@ -535,7 +593,10 @@ def process_project_bundle(
         output_dir=output_dir,
         upload=upload,
         reference_scan=reference_scan,
+        finale={"base_video": base_video, "target_total": target_total, "runner": runner},
     )
+    if not keep_local_raw and os.path.exists(base_video):
+        os.remove(base_video)  # only the final, zoom-finished Short is kept
     if not keep_local_raw:
         shutil.rmtree(work_dir, ignore_errors=True)
     return dict(

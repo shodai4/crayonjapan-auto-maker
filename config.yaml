@@ -4,9 +4,18 @@ brand:
   material_name: "Sakura Cray-Pas Specialist"
   material_desc: "Japanese professional oil pastels"
   theme: "Happy everyday moments"
+  # Facts taken from the artist's own channel (https://www.youtube.com/@shodai_ART,
+  # 2026-11-21): they are the voice's background, not lines to advertise with.
+  # The solo exhibition has already finished, so it is only ever past tense.
+  channel_url: "https://www.youtube.com/@shodai_ART"
+  artist_notes:
+    - "Shodai draws with Sakura Cray-Pas Specialist oil pastels - the professional grade with rich, lightfast pigment - and posts a making-of almost every day at 18:00 on the Japanese channel 'クレヨンのしょうだい' (@shodai_ART)."
+    - "He picks small, ordinary things from everyday Japanese life - a snack, a waffle, a Pokémon card found on the ground - and gives them warm, bright colour."
+    - "What he likes most is the feel of the pigment on paper: colours you can layer, and the momentum of a single confident line."
+    - "Past work: a 100-day drawing project that ended with a solo exhibition at Atelier Sangatsu in Nakazaki-cho, Osaka. The exhibition is over now, so it may only ever be mentioned in the past."
 
 video:
-  target_duration_sec: 38
+  target_duration_sec: 45
   hook_duration_sec: 2.5
   aspect_ratio: "9:16"
   width: 1080

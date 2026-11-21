@@ -330,6 +330,127 @@ class ConcatSegmentsTests(unittest.TestCase):
             vp.concat_segments(["seg.mp4"], self.out, runner=lambda cmd: None)
 
 
+class FinalePlanTests(unittest.TestCase):
+    """The closing slow finish + zoom: lengths must always fit a Short."""
+
+    def test_the_finish_shot_slows_the_tail_of_the_last_clip(self):
+        window = vp.compute_finish_window(240.0)
+        self.assertAlmostEqual(window["source_seconds"], 4.0)
+        self.assertAlmostEqual(window["start"], 236.0)
+        self.assertAlmostEqual(window["screen_seconds"], 4.0 / 0.75, places=3)
+        self.assertAlmostEqual(window["pts_multiplier"], 1.333333, places=6)
+
+    def test_a_clip_shorter_than_the_hold_is_shown_from_its_start(self):
+        window = vp.compute_finish_window(2.0)
+        self.assertAlmostEqual(window["source_seconds"], 2.0)
+        self.assertAlmostEqual(window["start"], 0.0)
+
+    def test_an_unknown_length_still_gives_a_usable_window(self):
+        for bad in (None, 0, -5, "fast", float("nan")):
+            with self.subTest(bad=bad):
+                window = vp.compute_finish_window(bad)
+                self.assertGreater(window["source_seconds"], 0)
+                self.assertGreater(window["screen_seconds"], 0)
+
+    def test_the_planned_total_is_kept_when_the_voice_fits(self):
+        self.assertAlmostEqual(vp.compute_finale_total(45.0, 38.0), 45.0)
+        self.assertAlmostEqual(vp.compute_finale_total(45.0, None), 45.0)
+
+    def test_a_longer_voice_extends_the_picture(self):
+        self.assertAlmostEqual(vp.compute_finale_total(45.0, 47.0), 48.0)
+
+    def test_the_total_never_passes_the_shorts_limit(self):
+        self.assertAlmostEqual(vp.compute_finale_total(45.0, 70.0), vp.SHORTS_MAX_SECONDS)
+
+    def test_the_zoom_fills_the_gap_up_to_its_range(self):
+        self.assertAlmostEqual(vp.compute_zoom_outro_seconds(41.0, 45.0), 4.0)
+        self.assertAlmostEqual(vp.compute_zoom_outro_seconds(44.0, 45.0), vp.ZOOM_OUTRO_MIN_SECONDS)
+        self.assertAlmostEqual(vp.compute_zoom_outro_seconds(30.0, 45.0), vp.ZOOM_OUTRO_MAX_SECONDS)
+
+
+class ZoomOutroCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_the_scan_is_fitted_so_the_zoom_never_crops_it(self):
+        vf = vp.build_zoom_outro_filter(4.0)
+        inner_w = int(1080 / vp.ZOOM_OUTRO_END) // 2 * 2
+        inner_h = int(1920 / vp.ZOOM_OUTRO_END) // 2 * 2
+        self.assertIn(f"scale={inner_w}:{inner_h}:force_original_aspect_ratio=decrease", vf)
+        self.assertIn("pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=white", vf)
+        self.assertIn("zoompan=z='1.0000+0.3000*on/119'", vf)
+        self.assertIn("s=1080x1920", vf)
+        self.assertIn("fps=30", vf)
+        self.assertTrue(vf.endswith("format=yuv420p"))
+
+    def test_the_command_carries_a_silent_bed_for_the_concat(self):
+        cmd = vp.build_zoom_outro_command("art.jpg", "zoom.mp4", duration=4.0)
+        self.assertEqual(cmd[cmd.index("-i") + 1], "art.jpg")
+        self.assertTrue(any("anullsrc" in str(part) for part in cmd))
+        self.assertIn("48000", " ".join(cmd))
+        self.assertEqual(cmd[cmd.index("-frames:v") + 1], "120")
+        self.assertIn("libx264", cmd)
+        self.assertIn("aac", cmd)
+        self.assertIn("-shortest", cmd)
+        self.assertEqual(cmd[-1], "zoom.mp4")
+
+    def test_a_longer_zoom_renders_more_frames(self):
+        cmd = vp.build_zoom_outro_command("art.jpg", "zoom.mp4", duration=6.0)
+        self.assertEqual(cmd[cmd.index("-frames:v") + 1], "180")
+
+    def test_create_zoom_outro_reports_an_empty_render(self):
+        with self.assertRaises(RuntimeError):
+            vp.create_zoom_outro("art.jpg", os.path.join(self.tmp.name, "z.mp4"),
+                                 runner=lambda cmd: None)
+
+    def test_assemble_finale_appends_the_zoom_and_cleans_up(self):
+        base = os.path.join(self.tmp.name, "cut_base.mp4")
+        with open(base, "wb") as handle:
+            handle.write(b"cut")
+        artwork = os.path.join(self.tmp.name, "art_artwork.jpg")
+        with open(artwork, "wb") as handle:
+            handle.write(b"jpeg")
+        out = os.path.join(self.tmp.name, "cut_vertical.mp4")
+        commands = []
+
+        def runner(cmd):
+            commands.append(list(cmd))
+            target = cmd[-1]
+            if isinstance(target, str) and target.endswith(".mp4"):
+                with open(target, "wb") as handle:
+                    handle.write(b"segment")
+
+        with mock.patch.object(vp, "probe_duration", return_value=41.0):
+            plan = vp.assemble_finale(
+                base, artwork, out, target_total=45.0, narration_seconds=44.5, runner=runner
+            )
+
+        self.assertEqual(plan["zoom_outro"], 1)
+        self.assertAlmostEqual(plan["zoom_outro_seconds"], 4.5)
+        self.assertAlmostEqual(plan["total_seconds"], 45.5)
+        self.assertEqual(len(commands), 2)  # the zoom render, then one concat
+        self.assertIn("zoompan", " ".join(commands[0]))
+        self.assertIn("concat", commands[1])
+        self.assertTrue(os.path.exists(out))
+        self.assertEqual(
+            [name for name in os.listdir(self.tmp.name) if name.endswith("_zoom.mp4")], []
+        )
+
+    def test_a_missing_scan_falls_back_to_the_cut(self):
+        base = os.path.join(self.tmp.name, "cut_base.mp4")
+        with open(base, "wb") as handle:
+            handle.write(b"cut")
+        out = os.path.join(self.tmp.name, "cut_vertical.mp4")
+        with mock.patch.object(vp, "probe_duration", return_value=41.0):
+            plan = vp.assemble_finale(
+                base, os.path.join(self.tmp.name, "missing.jpg"), out,
+                target_total=45.0, runner=lambda cmd: None,
+            )
+        self.assertEqual(plan["zoom_outro"], 0)
+        self.assertTrue(os.path.exists(out))
+
+
 class DiskGuardTests(unittest.TestCase):
     def test_enough_space_passes(self):
         usage = mock.Mock(free=10 * 1024 ** 3)

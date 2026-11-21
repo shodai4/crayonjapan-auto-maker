@@ -26,7 +26,16 @@ FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.8-flash")
 RETRYABLE_STATUS_CODES = frozenset({404, 429, 500, 502, 503, 504})
 REQUIRED_SCRIPT_KEYS = ("title", "hook_text", "narration", "description", "tags")
 ASMR_STYLE_KEY = "style_C_asmr"
-ASMR_NARRATION_MAX_WORDS = 25
+# The voice now has to carry the whole Short. The earlier 65-85 word script (and
+# the 25-word ASMR cap) left the second half of the video silent, which the
+# artist asked to remove: 100-120 words at the edge-tts pace is 40-45 seconds of
+# nearly continuous speech, matching a ~45 s cut.
+NARRATION_MIN_WORDS = 100
+NARRATION_MAX_WORDS = 120
+# ASMR still keeps the drawing sound in front, so it talks a little less and
+# leans on short beats - but never returns to long silences.
+ASMR_NARRATION_MIN_WORDS = 85
+ASMR_NARRATION_MAX_WORDS = 105
 # Setting this environment variable (or the workflow_dispatch input that feeds
 # it) forces one style for a single run, e.g. while a fix is being verified.
 # Unset/empty keeps the usual learned pick, so normal runs stay automatic.
@@ -106,10 +115,33 @@ def build_script_prompt(style_key: str, config: dict, reference_scan: bool = Fal
     asmr_note = ""
     if style_key == ASMR_STYLE_KEY:
         asmr_note = (
-            f"\nThis is the ASMR style: the drawing sound carries the video, so keep the "
-            f"narration ultra-minimal (max {ASMR_NARRATION_MAX_WORDS} words) and let the "
-            f"pastel strokes breathe."
+            f"\nThis is the ASMR style: the drawing sound stays in front, so speak "
+            f"softly and calmly ({ASMR_NARRATION_MIN_WORDS}-{ASMR_NARRATION_MAX_WORDS} words). "
+            f"Leave at most a one-second beat between sentences - never a long silence - "
+            f"and keep every sentence short enough to say in one breath."
         )
+    else:
+        asmr_note = (
+            f"\nKeep the voice moving for the whole Short: {NARRATION_MIN_WORDS}-"
+            f"{NARRATION_MAX_WORDS} words, one sentence flowing into the next, with no "
+            f"long pauses and no filler."
+        )
+    artist_notes = [
+        str(note).strip()
+        for note in (config["brand"].get("artist_notes") or [])
+        if str(note).strip()
+    ]
+    artist_block = ""
+    if artist_notes:
+        lines = "\n".join(f"- {note}" for note in artist_notes)
+        artist_block = (
+            "\nArtist context (background for the voice; use only what fits the footage, "
+            "and never invent a fact that is not here or visible in the frames):\n" + lines + "\n"
+        )
+    try:
+        total_seconds = int(round(float(config["video"].get("target_duration_sec", 45))))
+    except (TypeError, ValueError):
+        total_seconds = 45
     scan_note = ""
     if reference_scan:
         scan_note = (
@@ -128,11 +160,21 @@ Context:
 - Theme: {theme}
 - Shop URL: {shop_url}
 - Selected Narrative Style ({style_key}): {style_desc}
+{artist_block}
+The finished Short is about {total_seconds} seconds long and the voiceover runs almost
+the whole way through it. Plan the narration on this timeline:
+- 0-3 s: a strong hook in the very first sentence. No greeting, no warm-up.
+- 3-35 s: detailed description of the process, colour by colour, what the hand is
+doing right now. Keep talking: a new sentence starts before the previous one has
+faded, with no long pauses and no "and then... and then".
+- 35 s onward: one short thought about the finished piece, then the call to action
+(this 1-of-1 original postcard is available at CrayonJapan, link in the
+description and bio).
 
 Generate a JSON response with the following keys:
 1. "title": Catchy English YouTube Shorts title (under 65 chars, include #Shorts).
 2. "hook_text": Short punchy on-screen hook text for the first 2.5 seconds (max 7 words).
-3. "narration": Natural, engaging English voiceover script (~65-85 words for a 35-40s video). Mention {material} naturally and end with a warm call-to-action that this 1-of-1 original postcard is available at CrayonJapan (link in description/bio). If style is style_C_asmr, keep narration ultra-minimal (max 25 words).
+3. "narration": Natural, engaging English voiceover script of {NARRATION_MIN_WORDS}-{NARRATION_MAX_WORDS} words (~40-45 seconds, this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Mention {material} naturally and end with the warm call-to-action described above. Do not leave a silent stretch longer than a breath anywhere in the Short.
 4. "description": YouTube description including artwork story, material ({material}), shop link ({shop_url}), and hashtags (#SakuraCrayPas #CrayPasSpecialist #OilPastelArt #JapaneseArtSupplies #OriginalPostcard #CrayonJapan).
 5. "tags": List of 10 relevant English tags.
 

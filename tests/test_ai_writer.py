@@ -186,10 +186,27 @@ class PromptTests(unittest.TestCase):
         self.assertIn(CONFIG["evolution"]["styles"]["style_A_material"]["description"], prompt)
         self.assertNotIn("the drawing sound carries the video", prompt)
 
-    def test_asmr_prompt_asks_for_minimal_narration(self):
+    def test_asmr_prompt_talks_across_the_short_while_the_drawing_sounds(self):
         prompt = ai_writer.build_script_prompt("style_C_asmr", CONFIG)
-        self.assertIn("the drawing sound carries the video", prompt)
-        self.assertIn("25 words", prompt)
+        self.assertIn("the drawing sound stays in front", prompt)
+        self.assertIn(f"{ai_writer.ASMR_NARRATION_MIN_WORDS}-{ai_writer.ASMR_NARRATION_MAX_WORDS} words", prompt)
+        self.assertIn("never a long silence", prompt)
+
+    def test_a_normal_style_asks_for_a_full_script(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
+        self.assertIn(f"{ai_writer.NARRATION_MIN_WORDS}-", prompt)
+        self.assertIn(f"{ai_writer.NARRATION_MAX_WORDS} words", prompt)
+        self.assertIn("0-3 s", prompt)
+        self.assertIn("3-35 s", prompt)
+        self.assertIn("no long pauses", prompt)
+
+    def test_the_prompt_carries_the_artist_context_from_the_config(self):
+        for style in CONFIG["evolution"]["styles"]:
+            with self.subTest(style=style):
+                prompt = ai_writer.build_script_prompt(style, CONFIG)
+                for note in CONFIG["brand"]["artist_notes"]:
+                    self.assertIn(note, prompt)
+                self.assertIn("never invent a fact", prompt)
 
 
 class _FakeApiError(Exception):

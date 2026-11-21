@@ -12,24 +12,36 @@ viewers actually watch.
 2. **Vertical time-lapse** – the whole recording is sped up and fitted to 1080x1920 (9:16).
    A project of several recordings is rendered clip by clip: each raw clip becomes its own
    short 9:16 segment proportional to its length, and only those small segments are joined.
-3. **Finished artwork still** – a scanned drawing placed in the project folder becomes the
+3. **Slow finish + closing zoom (finale)** – the tail of the last clip is replayed at 0.75x
+   so the finished piece is actually looked at, then the scanned artwork is pushed in slowly
+   (Ken Burns, 1.0 → 1.3 over ~4 s, 1080x1920 30 fps). The scan is first fitted into the frame
+   divided by the zoom, then padded, so even a landscape postcard keeps every edge: at the end
+   of the pan it fills the width exactly and nothing is cropped. Both parts are ordinary
+   project segments, so the `-c copy` concat and the ASMR pass layout are unchanged.
+4. **Finished artwork still** – a scanned drawing placed in the project folder becomes the
    artwork JPEG (whole sheet, never cropped, shrunk to 1080 px wide) and is given to Gemini;
    without a scan, the completed illustration is pulled from the last frame of the last clip.
-4. **Gemini script** – four keyframes (plus the scanned artwork when there is one) are sent to
+5. **Gemini script** – four keyframes (plus the scanned artwork when there is one) are sent to
    `gemini-3-flash-preview`, which returns the title, on-screen hook text, English narration,
-   description and tags as JSON. The client is pinned to **`v1beta`** (the `gemini-3` models are
-   not served on `v1`, which answers `404 NOT_FOUND`), and if a model is retired, out of
-   free-tier quota or overloaded the next one in `FALLBACK_MODELS` is tried instead.
-5. **Voice + subtitles** – `edge-tts` (en-US-JennyNeural) narrates, and word-level subtitles
-   are burned into the video.
-6. **Upload + record** – the Short is uploaded (unlisted by default) and one row is appended
+   description and tags as JSON. The narration is written to run the whole Short (100-120
+   words, ~40-45 s: hook in the first 3 s, continuous process description up to 35 s, then the
+   call to action) instead of leaving the second half silent, and it is grounded in the
+   artist's own channel in `config.yaml` (`brand.artist_notes`). The client is pinned to
+   **`v1beta`** (the `gemini-3` models are not served on `v1`, which answers `404 NOT_FOUND`),
+   and if a model is retired, out of free-tier quota or overloaded the next one in
+   `FALLBACK_MODELS` is tried instead.
+6. **Voice + subtitles** – `edge-tts` (en-US-JennyNeural) narrates, and word-level subtitles
+   are burned into the video. The narration is measured after it is synthesised: if it runs
+   longer than the planned cut, the closing zoom grows (3-8 s) so `-shortest` never cuts the
+   last line, and the whole Short stays under the 58 s guard.
+7. **Upload + record** – the Short is uploaded (unlisted by default) and one row is appended
    to `analytics/performance.csv`. A plain-text upload pack and an `art_metadata.json` are
    written next to the video.
-7. **Learning loop** – `analytics_updater.py` refreshes views / likes / comments from the
+8. **Learning loop** – `analytics_updater.py` refreshes views / likes / comments from the
    YouTube Data API and the average view percentage from the YouTube Analytics API.
    `choose_best_style()` then reuses the best-performing style, with a 25 % exploration rate
    so the other styles keep getting a chance.
-8. **Google Drive hub (phase 2)** – `drive_sync.py` watches a Drive folder, renders each
+9. **Google Drive hub (phase 2)** – `drive_sync.py` watches a Drive folder, renders each
    waiting artwork (a `GO_` project folder or a loose recording) and drops the finished
    package into a second folder, then moves the source into an archive folder. See
    *Google Drive hub* below.

@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import subprocess
-from typing import Callable, Dict, List, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 # FFmpeg's atempo filter only accepts 0.5 - 2.0 per instance, so larger speed
 # factors are built as a chain of atempo filters (see build_atempo_filter).
@@ -708,6 +709,254 @@ def concat_segments(
     if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
         raise RuntimeError(f"Concatenating the segments produced no video: {output_path}")
     return output_path
+
+
+# ---------------------------------------------------------------------------
+# Finale: hold the finished piece, then zoom slowly into the scan
+# ---------------------------------------------------------------------------
+# The artist asked for an ending with weight: the last strokes at a slower
+# speed, then a slow push-in on the scanned artwork. Both halves are rendered
+# as ordinary project segments (same codec, same 1080x1920 30 fps canvas) so the
+# existing `-c copy` concat and the ASMR pass layout stay untouched.
+FINISH_SLOW_SECONDS = 4.0      # how long the finish shot stays on screen
+FINISH_SLOW_FACTOR = 0.75      # 0.75x: the last strokes play out unhurried
+ZOOM_OUTRO_SECONDS = 4.0       # closing Ken Burns length when nothing says otherwise
+ZOOM_OUTRO_MIN_SECONDS = 3.0
+ZOOM_OUTRO_MAX_SECONDS = 8.0
+ZOOM_OUTRO_START = 1.0
+ZOOM_OUTRO_END = 1.3
+# YouTube Shorts allows 60 s; a little margin keeps a re-encode from crossing it.
+SHORTS_MAX_SECONDS = 58.0
+# The voice may run a moment past the planned cut; the closing zoom absorbs it.
+NARRATION_TAIL_SECONDS = 1.0
+# The pan is rendered on a 2x canvas: zoompan steps in whole input pixels, and
+# a larger source hides that stepping, so the 4 s push-in stays smooth.
+ZOOM_UPSCALE = 2
+
+
+def compute_finish_window(
+    last_clip_seconds: Optional[float],
+    hold_seconds: float = FINISH_SLOW_SECONDS,
+    slow_factor: float = FINISH_SLOW_FACTOR,
+) -> Dict[str, float]:
+    """Source window and on-screen length of the slow finish shot.
+
+    The tail of the last clip is replayed at ``slow_factor`` speed, so
+    ``hold_seconds`` of source becomes a longer, calmer shot. A clip shorter
+    than the hold is shown in full.
+    """
+    try:
+        length = float(last_clip_seconds)
+    except (TypeError, ValueError):
+        length = 0.0
+    if not math.isfinite(length) or length <= 0:
+        length = max(float(hold_seconds), 0.5)
+    try:
+        factor = float(slow_factor)
+    except (TypeError, ValueError):
+        factor = FINISH_SLOW_FACTOR
+    if not math.isfinite(factor) or factor <= 0:
+        factor = FINISH_SLOW_FACTOR
+    source = min(max(float(hold_seconds), 0.5), length)
+    return {
+        "start": round(max(length - source, 0.0), 3),
+        "source_seconds": round(source, 3),
+        "screen_seconds": round(source / factor, 3),
+        # A pts multiplier above 1 slows the picture down.
+        "pts_multiplier": round(1.0 / factor, 6),
+    }
+
+
+def compute_finale_total(
+    target_total: float,
+    narration_seconds: Optional[float] = None,
+    max_total: float = SHORTS_MAX_SECONDS,
+) -> float:
+    """The length the finished Short aims for: the plan, or the voice if longer."""
+    try:
+        target = float(target_total)
+    except (TypeError, ValueError):
+        target = 45.0
+    if not math.isfinite(target) or target <= 0:
+        target = 45.0
+    try:
+        ceiling = max(float(max_total), 1.0)
+    except (TypeError, ValueError):
+        ceiling = SHORTS_MAX_SECONDS
+    total = target
+    if narration_seconds is not None:
+        try:
+            spoken = float(narration_seconds)
+        except (TypeError, ValueError):
+            spoken = 0.0
+        if math.isfinite(spoken) and spoken > 0:
+            # `-shortest` ends the mux on the picture, so the picture has to be
+            # at least as long as the narration it carries.
+            total = max(total, spoken + NARRATION_TAIL_SECONDS)
+    return round(min(total, ceiling), 3)
+
+
+def compute_zoom_outro_seconds(
+    base_seconds: float,
+    target_total: float,
+    min_seconds: float = ZOOM_OUTRO_MIN_SECONDS,
+    max_seconds: float = ZOOM_OUTRO_MAX_SECONDS,
+) -> float:
+    """How long the closing zoom runs so the picture ends with the voice."""
+    try:
+        base = float(base_seconds)
+    except (TypeError, ValueError):
+        base = 0.0
+    if not math.isfinite(base) or base < 0:
+        base = 0.0
+    try:
+        target = float(target_total)
+    except (TypeError, ValueError):
+        target = 0.0
+    if not math.isfinite(target) or target <= 0:
+        target = base + ZOOM_OUTRO_SECONDS
+    wanted = target - base
+    return round(min(max(wanted, float(min_seconds)), float(max_seconds)), 3)
+
+
+def build_zoom_outro_filter(
+    duration: float = ZOOM_OUTRO_SECONDS,
+    width: int = PROJECT_WIDTH,
+    height: int = PROJECT_HEIGHT,
+    fps: int = PROJECT_FPS,
+    zoom_start: float = ZOOM_OUTRO_START,
+    zoom_end: float = ZOOM_OUTRO_END,
+) -> str:
+    """Fit the whole scan on the canvas, then push in without ever cropping it.
+
+    The artwork is first fitted into the frame divided by ``zoom_end`` and
+    padded onto the 1080x1920 canvas. At the end of the pan the visible window
+    is exactly that inner box, so even a landscape postcard keeps every edge
+    (a plain zoompan would cut 30% of it away).
+    """
+    seconds = max(float(duration or 0.0), 0.1)
+    frames = max(int(round(seconds * int(fps))), 1)
+    steps = max(frames - 1, 1)
+    start = min(max(float(zoom_start), 1.0), 10.0)
+    end = min(max(float(zoom_end), start + 0.01), 10.0)
+    inner_w = max(int(int(width) / end) // 2 * 2, 2)
+    inner_h = max(int(int(height) / end) // 2 * 2, 2)
+    return (
+        f"scale={inner_w}:{inner_h}:force_original_aspect_ratio=decrease,"
+        f"pad={int(width)}:{int(height)}:(ow-iw)/2:(oh-ih)/2:color=white,"
+        f"scale={int(width) * ZOOM_UPSCALE}:{int(height) * ZOOM_UPSCALE}:flags=lanczos,"
+        f"setsar=1,"
+        f"zoompan=z='{start:.4f}+{end - start:.4f}*on/{steps}':"
+        f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+        f"d={frames}:s={int(width)}x{int(height)}:fps={int(fps)},"
+        f"format=yuv420p"
+    )
+
+
+def build_zoom_outro_command(
+    artwork_path: str,
+    output_path: str,
+    duration: float = ZOOM_OUTRO_SECONDS,
+    width: int = PROJECT_WIDTH,
+    height: int = PROJECT_HEIGHT,
+    fps: int = PROJECT_FPS,
+    zoom_start: float = ZOOM_OUTRO_START,
+    zoom_end: float = ZOOM_OUTRO_END,
+) -> List[str]:
+    """A still scan turned into a silent 4 s push-in segment for the concat."""
+    seconds = max(float(duration or 0.0), 0.1)
+    frames = max(int(round(seconds * int(fps))), 1)
+    return [
+        "ffmpeg", "-y",
+        "-i", artwork_path,
+        "-f", "lavfi", "-t", f"{seconds:.3f}",
+        "-i", f"anullsrc=r={PROJECT_AUDIO_RATE}:cl=stereo",
+        "-filter_complex",
+        f"[0:v]{build_zoom_outro_filter(seconds, width, height, fps, zoom_start, zoom_end)}[v]",
+        "-map", "[v]", "-map", "1:a:0",
+        "-frames:v", str(frames),
+        *SEGMENT_VIDEO_CODEC_ARGS,
+        *SEGMENT_AUDIO_CODEC_ARGS,
+        "-shortest", output_path,
+    ]
+
+
+def create_zoom_outro(
+    artwork_path: str,
+    output_path: str,
+    duration: float = ZOOM_OUTRO_SECONDS,
+    runner: Runner = run_command,
+    **options,
+) -> str:
+    """Render the closing zoom over the scanned artwork and return its path."""
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    runner(build_zoom_outro_command(artwork_path, output_path, duration=duration, **options))
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"Could not render the closing zoom: {output_path}")
+    return output_path
+
+
+def probe_audio_seconds(audio_path: str) -> Optional[float]:
+    """Length of the narration track, or None when it cannot be read."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", audio_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        value = float(result.stdout.strip())
+    except Exception:
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def assemble_finale(
+    base_video: str,
+    artwork_path: str,
+    output_path: str,
+    target_total: float,
+    narration_seconds: Optional[float] = None,
+    runner: Runner = run_command,
+) -> Dict[str, float]:
+    """Append the closing zoom to the hook/body/finish cut and report the plan.
+
+    The zoom is sized so the picture ends just after the narration, which is
+    what keeps the last spoken line from being cut by `-shortest`. When the
+    scan is missing the cut is used as it is, so a render never fails here.
+    """
+    base = probe_duration(base_video)
+    total = compute_finale_total(target_total, narration_seconds)
+    outro_seconds = compute_zoom_outro_seconds(base, total)
+
+    if not os.path.exists(artwork_path):
+        print(f"      no artwork for the closing zoom ({artwork_path}); keeping the cut as is")
+        shutil.copyfile(base_video, output_path)
+        return {
+            "base_seconds": base,
+            "zoom_outro_seconds": 0.0,
+            "total_seconds": base,
+            "zoom_outro": 0,
+        }
+
+    outro_path = f"{os.path.splitext(output_path)[0]}_zoom.mp4"
+    try:
+        create_zoom_outro(artwork_path, outro_path, duration=outro_seconds, runner=runner)
+        concat_segments([base_video, outro_path], output_path, runner=runner)
+    finally:
+        if os.path.exists(outro_path):
+            os.remove(outro_path)
+    return {
+        "base_seconds": base,
+        "zoom_outro_seconds": outro_seconds,
+        "total_seconds": round(base + outro_seconds, 3),
+        "zoom_outro": 1,
+    }
 
 
 def ensure_disk_space(directory: str, required_bytes: int = 0, margin: int = DISK_MARGIN_BYTES) -> None:

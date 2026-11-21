@@ -305,9 +305,11 @@ class ProcessProjectBundleTests(unittest.TestCase):
             ),
             mock.patch.object(main, "extract_final_artwork", side_effect=fake_artwork),
             mock.patch.object(main, "prepare_scanned_artwork", side_effect=fake_scan),
-            mock.patch.object(main, "extract_keyframes", return_value=[]),
+            mock.patch.object(main, "extract_keyframes", return_value=[]) as keyframes,
             mock.patch.object(main, "generate_making_script", return_value=dict(SCRIPT)) as script,
             mock.patch.object(main.asyncio, "run"),
+            mock.patch.object(main, "probe_audio_seconds", return_value=38.0) as audio_length,
+            mock.patch.object(main, "assemble_finale", side_effect=self._finale) as finale,
             mock.patch.object(main, "mux_audio_and_subtitles"),
             mock.patch.object(main, "append_performance_row"),
             mock.patch.object(main, "ensure_disk_space"),
@@ -316,6 +318,9 @@ class ProcessProjectBundleTests(unittest.TestCase):
                 source, self.config, output_dir=self.out, upload=False,
                 keep_local_raw=keep_local_raw, runner=self._runner,
             )
+        self.keyframes_source = keyframes.call_args.args[0]
+        self.finale_call = finale.call_args
+        self.audio_length = audio_length
         return bundle, script
 
     def test_output_names_come_from_the_folder_without_the_go_prefix(self):
@@ -326,16 +331,69 @@ class ProcessProjectBundleTests(unittest.TestCase):
         self.assertEqual(bundle["metadata_text"], os.path.join(self.out, "20261121_sushi_metadata.txt"))
         self.assertEqual(bundle["clip_count"], 2)
 
+    def _finale(self, base_video, artwork_path, output_path, target_total,
+                narration_seconds=None, runner=None):
+        self.finale_kwargs = {
+            "base_video": base_video,
+            "artwork_path": artwork_path,
+            "output_path": output_path,
+            "target_total": target_total,
+            "narration_seconds": narration_seconds,
+        }
+        with open(output_path, "wb") as handle:
+            handle.write(b"zoomed")
+        return {
+            "base_seconds": 41.0,
+            "zoom_outro_seconds": 4.0,
+            "total_seconds": 45.0,
+            "zoom_outro": 1,
+        }
+
     def test_the_hook_is_cut_from_the_last_clip_and_comes_first(self):
         self._run(self._source())
-        hooks = [cmd for cmd in self.runner_cmds if "-ss" in cmd]
-        self.assertEqual(len(hooks), 1)
-        self.assertTrue(hooks[0][hooks[0].index("-i") + 1].endswith("part2.mp4"))
         self.assertIn("concat", self.runner_cmds[-1])
-        self.assertEqual(len(self.concat_order), 3)
+        self.assertEqual(len(self.concat_order), 4)
         self.assertIn("hook", self.concat_order[0])
         self.assertIn("seg00", self.concat_order[1])
         self.assertIn("seg01", self.concat_order[2])
+        self.assertIn("finish", self.concat_order[3])
+
+    def test_the_cut_keeps_room_for_the_slow_finish_and_the_zoom(self):
+        bundle, _ = self._run(self._source())
+        plan = bundle["plan"]
+        finish_screen = 4.0 / 0.75
+        self.assertAlmostEqual(
+            plan["main_duration"], 45.0 - finish_screen - 4.0 - 2.5, places=3
+        )
+        self.assertAlmostEqual(
+            plan["main_duration"] + 2.5 + finish_screen + 4.0, 45.0, places=3
+        )
+
+    def test_the_last_moment_is_replayed_slowly_before_the_zoom(self):
+        self._run(self._source())
+        # Two seeks: the 2.5 s hook and the 4 s finish shot, both from the tail.
+        cuts = [cmd for cmd in self.runner_cmds if "-ss" in cmd and "concat" not in cmd]
+        self.assertEqual(len(cuts), 2)
+        finish = next(cmd for cmd in cuts if "setpts" in cmd[cmd.index("-vf") + 1])
+        self.assertEqual(finish[finish.index("-ss") + 1], "236.000")
+        self.assertEqual(finish[finish.index("-t") + 1], "4.000")
+        vf = finish[finish.index("-vf") + 1]
+        self.assertTrue(vf.startswith("setpts=1.333333*PTS,"))
+        self.assertTrue(finish[finish.index("-i") + 1].endswith("part2.mp4"))
+
+    def test_the_zoom_is_sized_from_the_measured_narration(self):
+        bundle, _ = self._run(self._source())
+        self.assertEqual(
+            self.finale_kwargs["base_video"],
+            os.path.join(self.out, "20261121_sushi_vertical_base.mp4"),
+        )
+        self.assertEqual(self.finale_kwargs["output_path"], bundle["vertical"])
+        self.assertEqual(self.finale_kwargs["artwork_path"], bundle["artwork"])
+        self.assertAlmostEqual(self.finale_kwargs["target_total"], 45.0)
+        self.assertAlmostEqual(self.finale_kwargs["narration_seconds"], 38.0)
+        self.assertEqual(self.keyframes_source, self.finale_kwargs["base_video"])
+        self.assertFalse(os.path.exists(self.finale_kwargs["base_video"]))
+        self.assertEqual(bundle["finale"]["zoom_outro"], 1)
 
     def test_each_clip_is_downloaded_once_and_deleted_again(self):
         self._run(self._source())
