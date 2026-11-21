@@ -66,6 +66,37 @@ class MuxCommandTests(unittest.TestCase):
         self.assertIn("[v]", fc)
         self.assertIn("[a]", fc)
 
+    def test_without_cues_the_narration_is_still_muxed(self):
+        cmd = main.build_mux_command("v.mp4", "a.mp3", "s.srt", "final.mp4", with_subtitles=False)
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        self.assertNotIn("subtitles=", fc)
+        self.assertIn("apad", fc)
+        self.assertIn("-shortest", cmd)
+
+    def test_an_empty_srt_is_not_burned(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        empty = os.path.join(tmp.name, "empty.srt")
+        with open(empty, "w", encoding="utf-8"):
+            pass
+        self.assertFalse(main.subtitles_available(empty))
+        with mock.patch("subprocess.run") as run:
+            main.mux_audio_and_subtitles("v.mp4", "a.mp3", empty, "f.mp4")
+        cmd = run.call_args[0][0]
+        self.assertNotIn("subtitles=", cmd[cmd.index("-filter_complex") + 1])
+
+    def test_a_filled_srt_is_burned(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        srt = os.path.join(tmp.name, "cues.srt")
+        with open(srt, "w", encoding="utf-8") as handle:
+            handle.write("1\n00:00:01,000 --> 00:00:02,000\nWait\n\n")
+        self.assertTrue(main.subtitles_available(srt))
+        with mock.patch("subprocess.run") as run:
+            main.mux_audio_and_subtitles("v.mp4", "a.mp3", srt, "f.mp4")
+        cmd = run.call_args[0][0]
+        self.assertIn("subtitles=", cmd[cmd.index("-filter_complex") + 1])
+
     def test_mux_uses_mix_only_when_video_has_audio(self):
         with mock.patch.object(main, "has_audio_stream", return_value=True), \
                 mock.patch("subprocess.run") as run:

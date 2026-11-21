@@ -46,6 +46,12 @@ RAW_LOCAL_EXTENSIONS = (".mp4", ".mov", ".avi")
 HOOK_TYPE = "finish_preview_2.5s"
 TTS_VOICE = "en-US-JennyNeural"
 TTS_RATE = "+5%"
+# edge-tts 7 defaults to SentenceBoundary, so the subtitle cues only arrive on
+# the channel we ask for. Word timing matches the previous edge-tts 6 output
+# (one cue per word); either channel is accepted so a version that ignores the
+# request still fills the SRT instead of leaving it empty.
+TTS_BOUNDARY = "WordBoundary"
+SUBTITLE_CHUNK_TYPES = ("WordBoundary", "SentenceBoundary")
 SUBTITLE_STYLE = (
     "Fontsize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
     "Outline=2,Alignment=2,MarginV=65"
@@ -74,17 +80,21 @@ def build_mux_command(
     srt_path: str,
     final_path: str,
     mix_original_audio: bool = False,
+    with_subtitles: bool = True,
 ) -> List[str]:
     """Burn subtitles and lay the narration over the time-lapse.
 
     With `mix_original_audio` the original drawing sound (already speed-adjusted
     in the time-lapse) is mixed under the narration. Narration is padded with
     silence so ``-shortest`` ends on the video, never on a short voice track.
+    Without `with_subtitles` (no cues came back from the voiceover) the picture
+    is simply passed through, so a usable video is still produced.
     """
     subtitles = build_subtitle_filter(srt_path)
+    picture = f"[0:v]{subtitles}[v]" if with_subtitles else "[0:v]null[v]"
     if mix_original_audio:
         filter_complex = (
-            f"[0:v]{subtitles}[v];"
+            f"{picture};"
             "[0:a]volume=0.55[orig];"
             "[1:a]volume=1.0[narr];"
             "[narr]apad[narrpad];"
@@ -92,7 +102,7 @@ def build_mux_command(
         )
         maps = ["-map", "[v]", "-map", "[a]"]
     else:
-        filter_complex = f"[0:v]{subtitles}[v];[1:a]apad[a]"
+        filter_complex = f"{picture};[1:a]apad[a]"
         maps = ["-map", "[v]", "-map", "[a]"]
 
     return [
@@ -149,16 +159,41 @@ async def synthesize_voice(
     """English narration plus word-level SRT subtitles via edge-tts."""
     import edge_tts
 
-    communicate = edge_tts.Communicate(text, voice=voice, rate=rate)
+    communicate = create_communicate(edge_tts, text, voice=voice, rate=rate)
     submaker = edge_tts.SubMaker()
     with open(audio_path, "wb") as file:
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 file.write(chunk["data"])
-            elif chunk["type"] == "WordBoundary":
+            elif chunk["type"] in SUBTITLE_CHUNK_TYPES:
                 feed_word_boundary(submaker, chunk)
+    srt_text = render_srt(submaker)
+    if not srt_text.strip():
+        print(
+            "[voice] edge-tts returned no subtitle cues; "
+            "the video will be rendered without burned-in subtitles"
+        )
     with open(srt_path, "w", encoding="utf-8") as f:
-        f.write(render_srt(submaker))
+        f.write(srt_text)
+
+
+def create_communicate(edge_tts, text: str, voice: str, rate: str):
+    """A Communicate that reports word boundaries, on 7.x and 6.x alike."""
+    try:
+        return edge_tts.Communicate(
+            text, voice=voice, rate=rate, boundary=TTS_BOUNDARY
+        )
+    except TypeError:
+        # edge-tts 6 has no boundary option and always sends WordBoundary.
+        return edge_tts.Communicate(text, voice=voice, rate=rate)
+
+
+def subtitles_available(srt_path: str) -> bool:
+    """True when there is at least one cue to burn into the picture."""
+    try:
+        return os.path.getsize(srt_path) > 0
+    except OSError:
+        return False
 
 
 def mux_audio_and_subtitles(
@@ -172,8 +207,15 @@ def mux_audio_and_subtitles(
     import subprocess
 
     mix = bool(keep_original_audio) and has_audio_stream(video_path)
+    with_subtitles = subtitles_available(srt_path)
+    if not with_subtitles:
+        print("      no subtitle cues: rendering the video without burned subtitles")
     subprocess.run(
-        build_mux_command(video_path, audio_path, srt_path, final_path, mix_original_audio=mix),
+        build_mux_command(
+            video_path, audio_path, srt_path, final_path,
+            mix_original_audio=mix,
+            with_subtitles=with_subtitles,
+        ),
         check=True,
     )
     return final_path

@@ -48,6 +48,92 @@ class SubMaker6:
         )
 
 
+def _fake_module(chunks, calls, supports_boundary=True):
+    """A stand-in edge_tts whose Communicate records what it was asked for."""
+    module = types.ModuleType("edge_tts")
+
+    class Communicate:
+        def __init__(self, text, voice=None, rate=None, boundary=None):
+            if boundary is not None and not supports_boundary:
+                raise TypeError("Communicate() got an unexpected keyword 'boundary'")
+            calls["boundary"] = boundary
+
+        async def stream(self):
+            for chunk in chunks:
+                yield chunk
+
+    class SubMaker:
+        def __init__(self):
+            self.texts = []
+
+        def feed(self, chunk):
+            self.texts.append(chunk["text"])
+
+        def get_srt(self):
+            return "".join(
+                f"{index}\n00:00:01,000 --> 00:00:02,000\n{text}\n\n"
+                for index, text in enumerate(self.texts, start=1)
+            )
+
+    module.Communicate = Communicate
+    module.SubMaker = SubMaker
+    return module
+
+
+class SubtitleBoundaryTests(unittest.TestCase):
+    """edge-tts 7 defaults to SentenceBoundary, which once left the SRT empty."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.audio = os.path.join(self.tmp.name, "voice.mp3")
+        self.srt = os.path.join(self.tmp.name, "voice.srt")
+
+    def _run(self, module):
+        patcher = mock.patch.dict(sys.modules, {"edge_tts": module})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        asyncio.run(main.synthesize_voice("Wait for it", self.audio, self.srt))
+        with open(self.srt, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_word_boundaries_are_requested(self):
+        calls = {}
+        module = _fake_module(CHUNKS, calls)
+        self._run(module)
+        self.assertEqual(calls["boundary"], "WordBoundary")
+
+    def test_an_older_communicate_without_the_option_still_runs(self):
+        calls = {}
+        module = _fake_module(CHUNKS, calls, supports_boundary=False)
+        srt = self._run(module)
+        self.assertIsNone(calls["boundary"])
+        self.assertIn("Wait", srt)
+
+    def test_sentence_boundaries_are_not_dropped(self):
+        calls = {}
+        chunks = [
+            {"type": "audio", "data": b"x"},
+            {"type": "SentenceBoundary", "offset": 1000000, "duration": 9000000,
+             "text": "Wait for the texture."},
+        ]
+        srt = self._run(_fake_module(chunks, calls))
+        self.assertIn("Wait for the texture.", srt)
+
+    def test_a_blank_srt_is_left_empty_for_the_mux_step_to_handle(self):
+        calls = {}
+        class Silent:
+            def __init__(self):
+                pass
+            def feed(self, chunk):
+                pass
+            def get_srt(self):
+                return ""
+        module = _fake_module(CHUNKS, calls)
+        module.SubMaker = Silent
+        self.assertEqual(self._run(module), "")
+
+
 class SynthesizeVoiceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
