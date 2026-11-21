@@ -252,6 +252,62 @@ class UploadAndMoveTests(unittest.TestCase):
         self.assertNotIn("removeParents", kwargs)
 
 
+class ReadyPackageFolderTests(unittest.TestCase):
+    def test_an_existing_folder_of_that_name_is_reused(self):
+        service = service_for_children({
+            "ready-folder": [
+                {"id": "pkg1", "name": "20261121_sushi_20261121_1830",
+                 "mimeType": ds.FOLDER_MIME_TYPE},
+            ],
+        })
+        creator = mock.MagicMock()
+        info = ds.ensure_subfolder(
+            service, "ready-folder", "20261121_sushi_20261121_1830", creator=creator
+        )
+        self.assertEqual(info["id"], "pkg1")
+        creator.assert_not_called()
+
+    def test_a_new_package_folder_is_created_once(self):
+        service = service_for_children({})
+        creator = mock.MagicMock(return_value={"id": "pkg-new"})
+        info = ds.ensure_subfolder(service, "ready-folder", "20261121_sushi_20261121_1830", creator=creator)
+        self.assertEqual(info["id"], "pkg-new")
+        creator.assert_called_once_with(service, "20261121_sushi_20261121_1830", "ready-folder")
+
+    def test_the_lookup_asks_only_for_folders_and_escapes_the_name(self):
+        service = service_for_children({})
+        creator = mock.MagicMock(return_value={"id": "pkg-new"})
+        ds.ensure_subfolder(service, "ready-folder", "it's a folder", creator=creator)
+        query = service.files.return_value.list.call_args.kwargs["q"]
+        self.assertIn(f"mimeType = '{ds.FOLDER_MIME_TYPE}'", query)
+        self.assertIn("name = 'it\\'s a folder'", query)
+
+    def test_create_folder_carries_the_folder_mime_type_and_parent(self):
+        service = mock.MagicMock()
+        service.files.return_value.create.return_value.execute.return_value = {"id": "f-new"}
+        created = ds.create_folder(service, "20261121_sushi_20261121_1830", "ready-folder")
+        self.assertEqual(created["id"], "f-new")
+        kwargs = service.files.return_value.create.call_args.kwargs
+        self.assertEqual(kwargs["body"], {
+            "name": "20261121_sushi_20261121_1830",
+            "mimeType": ds.FOLDER_MIME_TYPE,
+            "parents": ["ready-folder"],
+        })
+
+    def test_the_package_name_is_the_pipeline_output_folder(self):
+        self.assertEqual(
+            ds.ready_package_name({"output_folder": "20261121_sushi_20261121_1830"}),
+            "20261121_sushi_20261121_1830",
+        )
+
+    def test_without_a_named_folder_the_stem_and_the_scan_time_are_used(self):
+        self.assertEqual(
+            ds.ready_package_name({"base_name": "20261121_sushi"}, now=NOW),
+            "20261121_sushi_20261121_1200",
+        )
+        self.assertEqual(ds.ready_package_name({}, now=NOW), "artwork_20261121_1200")
+
+
 class StateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -419,6 +475,7 @@ class SyncOnceTests(unittest.TestCase):
         download = mock.MagicMock(side_effect=downloader)
         upload = mock.MagicMock(side_effect=lambda svc, path, folder: {"id": f"up-{os.path.basename(path)}"})
         mover = mock.MagicMock(return_value={"id": "file1"})
+        self.folder_creator = mock.MagicMock(return_value={"id": "pkg-folder"})
         with mock.patch.object(ds, "list_pending_raw_items", return_value=items):
             results = ds.sync_once(
                 object(), FOLDERS, pipeline or self._pipeline(),
@@ -428,6 +485,7 @@ class SyncOnceTests(unittest.TestCase):
                 downloader=download,
                 uploader=upload,
                 mover=mover,
+                folder_creator=self.folder_creator,
                 log=self.logs.append,
                 keep_local_raw=keep_local_raw,
                 **kwargs,
@@ -441,14 +499,29 @@ class SyncOnceTests(unittest.TestCase):
         self.assertEqual(results[0]["status"], "done")
         self.assertEqual(results[0]["video_id"], "yt-123")
         self.assertEqual(len(upload.call_args_list), 4)
+        # The four artifacts go together into one package folder of 02_READY_TO_POST.
+        self.assertEqual(results[0]["package"], "drawing_20261121_1200")
+        self.folder_creator.assert_called_once_with(
+            mock.ANY, FOLDERS.ready, "drawing_20261121_1200"
+        )
         for call in upload.call_args_list:
-            self.assertEqual(call.args[2], FOLDERS.ready)
+            self.assertEqual(call.args[2], "pkg-folder")
         mover.assert_called_once_with(mock.ANY, "file1", FOLDERS.archive, FOLDERS.raw)
         download.assert_not_called()  # the pipeline pulls its own clips
 
         state = ds.load_state(self.state_path)
         self.assertTrue(ds.is_processed(state, "file1"))
         self.assertEqual(len(state["processed"]["file1"]["uploaded"]), 4)
+
+    def test_the_pipeline_names_the_package_folder(self):
+        pipeline = self._pipeline({"output_folder": "20261121_sushi_20261121_1830"})
+        results, _, upload, _ = self._run(pipeline=pipeline)
+        self.assertEqual(results[0]["package"], "20261121_sushi_20261121_1830")
+        self.folder_creator.assert_called_once_with(
+            mock.ANY, FOLDERS.ready, "20261121_sushi_20261121_1830"
+        )
+        for call in upload.call_args_list:
+            self.assertEqual(call.args[2], "pkg-folder")
 
     def test_the_pipeline_receives_what_it_needs_to_download_a_clip(self):
         self._run()
@@ -516,6 +589,7 @@ class SyncOnceTests(unittest.TestCase):
                 object(), FOLDERS, self._pipeline(),
                 state_path=self.state_path, now=NOW,
                 uploader=upload, mover=mover,
+                folder_creator=mock.MagicMock(return_value={"id": "pkg-folder"}),
                 log=self.logs.append,
             )
         self.assertEqual(results[0]["status"], "publish_failed")

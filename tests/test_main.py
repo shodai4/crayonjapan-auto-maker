@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import pandas as pd
@@ -29,6 +30,42 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(main.should_keep_audio("style_C_asmr"))
         self.assertFalse(main.should_keep_audio("style_A_material"))
         self.assertFalse(main.should_keep_audio("style_B_story"))
+
+
+class OutputFolderTests(unittest.TestCase):
+    def test_the_package_folder_is_the_artwork_name_plus_the_jst_minute(self):
+        jst = timezone(timedelta(hours=9))
+        with tempfile.TemporaryDirectory() as tmp:
+            path, name = main.get_output_dir(
+                "20261121_sushi", tmp, now=datetime(2026, 11, 21, 18, 30, tzinfo=jst)
+            )
+            self.assertEqual(name, "20261121_sushi_20261121_1830")
+            self.assertEqual(path, os.path.join(tmp, name))
+            self.assertTrue(os.path.isdir(path))
+
+    def test_a_second_render_in_the_same_minute_gets_its_own_folder(self):
+        jst = timezone(timedelta(hours=9))
+        now = datetime(2026, 11, 21, 18, 30, tzinfo=jst)
+        with tempfile.TemporaryDirectory() as tmp:
+            first, first_name = main.get_output_dir("20261121_sushi", tmp, now=now)
+            second, second_name = main.get_output_dir("20261121_sushi", tmp, now=now)
+            self.assertNotEqual(first, second)
+            self.assertEqual(first_name, "20261121_sushi_20261121_1830")
+            self.assertEqual(second_name, "20261121_sushi_20261121_1830_2")
+            self.assertTrue(os.path.isdir(second))
+
+    def test_an_unsafe_name_becomes_a_plain_folder_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, name = main.get_output_dir(" GO / sushi ", tmp)
+            self.assertNotIn(" ", name)
+            self.assertNotIn("/", name)
+            self.assertTrue(name.startswith("GO"))
+            self.assertRegex(name, r"_\d{8}_\d{4}$")
+
+    def test_an_empty_name_falls_back_to_artwork(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, name = main.get_output_dir("", tmp)
+            self.assertTrue(name.startswith("artwork_"))
 
 
 class SubtitleTests(unittest.TestCase):
@@ -191,8 +228,12 @@ class ProcessVideoBundleTests(unittest.TestCase):
         bundle, timelapse, artwork, voice, upload_short, row = self._run()
         self.assertEqual(bundle["base_name"], "clip")
         self.assertEqual(bundle["style_key"], "style_B_story")
-        self.assertEqual(bundle["final_video"], os.path.join(self.out, "clip_final.mp4"))
-        self.assertEqual(bundle["artwork"], os.path.join(self.out, "clip_artwork.jpg"))
+        package = bundle["output_dir"]
+        self.assertEqual(os.path.dirname(package), self.out)
+        self.assertRegex(bundle["output_folder"], r"^clip_\d{8}_\d{4}$")
+        self.assertEqual(bundle["output_folder"], os.path.basename(package))
+        self.assertEqual(bundle["final_video"], os.path.join(package, "clip_final.mp4"))
+        self.assertEqual(bundle["artwork"], os.path.join(package, "clip_artwork.jpg"))
         self.assertTrue(os.path.exists(bundle["artwork"]))
         self.assertTrue(os.path.exists(bundle["metadata_text"]))
         self.assertTrue(os.path.exists(bundle["metadata_json"]))
@@ -200,9 +241,11 @@ class ProcessVideoBundleTests(unittest.TestCase):
         voice.assert_called_once()
 
     def test_artwork_comes_from_the_raw_recording_not_the_vertical_crop(self):
-        _, _, artwork, _, _, _ = self._run()
+        bundle, _, artwork, _, _, _ = self._run()
         self.assertEqual(artwork.call_args.args[0], "input/clip.mp4")
-        self.assertEqual(artwork.call_args.args[1], os.path.join(self.out, "clip_artwork.jpg"))
+        self.assertEqual(
+            artwork.call_args.args[1], os.path.join(bundle["output_dir"], "clip_artwork.jpg")
+        )
 
     def test_metadata_bundle_holds_the_english_upload_pack(self):
         bundle, _, _, _, _, _ = self._run()
@@ -237,6 +280,16 @@ class ProcessVideoBundleTests(unittest.TestCase):
         upload_short.assert_called_once()
         row.assert_called_once()
         self.assertEqual(bundle["video_id"], "yt-1")
+
+    def test_each_render_gets_its_own_package_folder(self):
+        first, _, _, _, _, _ = self._run()
+        second, _, _, _, _, _ = self._run()
+        self.assertNotEqual(first["output_dir"], second["output_dir"])
+        self.assertEqual(os.path.dirname(first["output_dir"]), self.out)
+        self.assertEqual(os.path.dirname(second["output_dir"]), self.out)
+        # The second render did not write over the first one's package.
+        self.assertTrue(os.path.exists(first["metadata_text"]))
+        self.assertTrue(os.path.exists(second["metadata_text"]))
 
     def test_process_new_video_still_returns_the_video_id(self):
         with mock.patch.object(main, "process_video_bundle", return_value={"video_id": "yt-9"}):
@@ -339,10 +392,13 @@ class ProcessProjectBundleTests(unittest.TestCase):
 
     def test_output_names_come_from_the_folder_without_the_go_prefix(self):
         bundle, _ = self._run(self._source())
+        package = bundle["output_dir"]
         self.assertEqual(bundle["base_name"], "20261121_sushi")
-        self.assertEqual(bundle["final_video"], os.path.join(self.out, "20261121_sushi_final.mp4"))
-        self.assertEqual(bundle["artwork"], os.path.join(self.out, "20261121_sushi_artwork.jpg"))
-        self.assertEqual(bundle["metadata_text"], os.path.join(self.out, "20261121_sushi_metadata.txt"))
+        self.assertRegex(bundle["output_folder"], r"^20261121_sushi_\d{8}_\d{4}$")
+        self.assertEqual(os.path.dirname(package), self.out)
+        self.assertEqual(bundle["final_video"], os.path.join(package, "20261121_sushi_final.mp4"))
+        self.assertEqual(bundle["artwork"], os.path.join(package, "20261121_sushi_artwork.jpg"))
+        self.assertEqual(bundle["metadata_text"], os.path.join(package, "20261121_sushi_metadata.txt"))
         self.assertEqual(bundle["clip_count"], 2)
 
     def _finale(self, base_video, artwork_path, output_path, target_total,
@@ -399,7 +455,7 @@ class ProcessProjectBundleTests(unittest.TestCase):
         bundle, _ = self._run(self._source())
         self.assertEqual(
             self.finale_kwargs["base_video"],
-            os.path.join(self.out, "20261121_sushi_vertical_base.mp4"),
+            os.path.join(bundle["output_dir"], "20261121_sushi_vertical_base.mp4"),
         )
         self.assertEqual(self.finale_kwargs["output_path"], bundle["vertical"])
         self.assertEqual(self.finale_kwargs["artwork_path"], bundle["artwork"])

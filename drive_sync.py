@@ -12,6 +12,11 @@ that is the user's signal that every clip and the finished scan are uploaded.
 Folders without the prefix are still being filled and are left alone. A loose
 video file dropped straight into 01_RAW_VIDEO keeps the old single-file flow.
 
+One finished drawing also gets its own subfolder inside 02_READY_TO_POST
+(``{base_name}_{YYYYMMDD_HHMM}``), the same name as the render's local output
+folder, so the four artifacts of a Short stay together instead of mixing with
+the next artwork in a flat folder.
+
 The repository is public, so no folder ID or account address is hard-coded
 here: the three IDs come from the environment (``.env``) and the OAuth token is
 kept in ``drive_token.json`` (both git-ignored).
@@ -90,6 +95,9 @@ STATE_VERSION = 1
 
 # Artifacts the pipeline returns and that end up in 02_READY_TO_POST.
 ARTIFACT_KEYS = ("final_video", "artwork", "metadata_text", "metadata_json")
+# Suffix for the package folder's name when the pipeline did not name it:
+# ``{base_name}_{YYYYMMDD_HHMM}``, the render's local output folder name.
+READY_STAMP_FORMAT = "%Y%m%d_%H%M"
 
 Pipeline = Callable[["ProjectSource"], dict]
 Log = Callable[[str], None]
@@ -228,6 +236,66 @@ def sort_naturally(items: Sequence[dict]) -> List[dict]:
 
 def guess_mime_type(path: str) -> str:
     return MIME_BY_EXTENSION.get(os.path.splitext(str(path))[1].lower(), "application/octet-stream")
+
+
+def ready_package_name(
+    artifacts: dict,
+    now: Optional[datetime] = None,
+    fallback_stem: str = "",
+) -> str:
+    """The package folder for one render: ``{base_name}_{YYYYMMDD_HHMM}``.
+
+    The pipeline names the folder itself (``output_folder``) so the local output
+    folder and the Drive subfolder of 02_READY_TO_POST are the same name; the
+    fallback keeps a bare dict-shaped result useful too.
+    """
+    named = str((artifacts or {}).get("output_folder") or "").strip()
+    if named:
+        return named
+    stem = (
+        str((artifacts or {}).get("base_name") or "").strip()
+        or str(fallback_stem or "").strip()
+        or "artwork"
+    )
+    stamp = (now or datetime.now(timezone.utc)).strftime(READY_STAMP_FORMAT)
+    return f"{stem}_{stamp}"
+
+
+def _quote_query_value(value: object) -> str:
+    """A Drive query string literal's inside: backslash and quote escaped."""
+    return str(value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def create_folder(service, name: str, parent_id: str) -> dict:
+    """Create one folder under ``parent_id`` and return its metadata."""
+    body = {
+        "name": str(name),
+        "mimeType": FOLDER_MIME_TYPE,
+        "parents": [parent_id],
+    }
+    return service.files().create(body=body, fields="id,name,webViewLink").execute()
+
+
+def ensure_subfolder(
+    service,
+    parent_id: str,
+    name: str,
+    creator: Optional[Callable[[object, str, str], dict]] = None,
+) -> dict:
+    """The folder ``name`` under ``parent_id``, created only when missing.
+
+    A retried upload finds the folder its first attempt already made instead of
+    leaving two packages behind, so the name alone identifies the package.
+    """
+    lookup = (
+        f"'{parent_id}' in parents and trashed = false "
+        f"and mimeType = '{FOLDER_MIME_TYPE}' "
+        f"and name = '{_quote_query_value(name)}'"
+    )
+    for info in _list_all(service, lookup, fields="id,name"):
+        if str(info.get("name", "")) == str(name):
+            return info
+    return (creator or create_folder)(service, str(name), parent_id)
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +731,7 @@ def sync_once(
     downloader: Optional[Callable[[object, str, str], str]] = None,
     uploader: Optional[Callable[[object, str, str], dict]] = None,
     mover: Optional[Callable[[object, str, str, Optional[str]], dict]] = None,
+    folder_creator: Optional[Callable[[object, str, str], dict]] = None,
     log: Log = print,
 ) -> List[dict]:
     """One scan: pull new raw items, render them, publish to 02_READY_TO_POST.
@@ -671,6 +740,10 @@ def sync_once(
     demand, so a project's multi-GB recordings are fetched one at a time (and
     deleted again by the pipeline) instead of all at once.
 
+    Each package is uploaded into its own subfolder of 02_READY_TO_POST
+    (``{base_name}_{YYYYMMDD_HHMM}``) so the four artifacts of one artwork stay
+    together; the folder is looked up first, so a retry reuses it.
+
     An item is only marked done after its artifacts are uploaded *and* the
     source has been moved to 03_ARCHIVE, so an interruption repeats at most one
     render instead of silently losing a drawing.
@@ -678,6 +751,7 @@ def sync_once(
     download = downloader or (lambda svc, fid, path: download_video(svc, fid, path))
     upload = uploader or (lambda svc, path, folder: upload_file(svc, path, folder))
     move = mover or move_file
+    ensure_folder = folder_creator or ensure_subfolder
 
     state = load_state(state_path)
     results: List[dict] = []
@@ -725,13 +799,17 @@ def sync_once(
             continue
 
         uploaded: List[str] = []
+        package = ready_package_name(artifacts, now=now, fallback_stem=item.stem)
         try:
+            ready_folder = ensure_folder(service, folders.ready, package)
+            ready_folder_id = str(ready_folder.get("id") or folders.ready)
+            log(f"[drive] package -> 02_READY_TO_POST/{package}")
             for key in ARTIFACT_KEYS:
                 path = artifacts.get(key)
                 if path and os.path.exists(path):
-                    created = upload(service, path, folders.ready)
+                    created = upload(service, path, ready_folder_id)
                     uploaded.append(str(created.get("id", "")))
-                    log(f"[drive] uploaded {os.path.basename(path)}")
+                    log(f"[drive] uploaded {package}/{os.path.basename(path)}")
             move(service, item.id, folders.archive, folders.raw)
         except Exception as exc:
             log(f"[drive] publish failed: {item.name}: {exc}")
@@ -742,6 +820,7 @@ def sync_once(
                     "status": "publish_failed",
                     "error": str(exc),
                     "artifacts": artifacts,
+                    "package": package,
                     "uploaded": uploaded,
                 }
             )
@@ -765,6 +844,7 @@ def sync_once(
                 "status": "done",
                 "video_id": str(artifacts.get("video_id") or ""),
                 "artifacts": artifacts,
+                "package": package,
                 "uploaded": uploaded,
             }
         )

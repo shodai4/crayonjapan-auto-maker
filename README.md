@@ -92,7 +92,8 @@ python main.py --drive-once --no-upload   # render + metadata only, no YouTube u
 python analytics_updater.py          # refresh views / likes / comments / avg view %
 ```
 
-Output files land in `./output`:
+Output files land in one folder per drawing, `./output/{base_name}_{YYYYMMDD_HHMM}/`
+(named in JST, the same name the package gets inside Drive's `02_READY_TO_POST`):
 
 | file | what it is |
 | --- | --- |
@@ -117,7 +118,12 @@ AI秘書 / 12_動画自動作成/
             scan.jpg
         GO_20261121_sushi/     <- renamed when the artwork is ready to render
         GO_20261122_cat/       <- another finished artwork, waiting
-    02_READY_TO_POST/      finished MP4 + artwork JPEG + English metadata appear here
+    02_READY_TO_POST/      one folder per rendered Short, named like the output folder
+        20261121_sushi_20261121_1830/
+            20261121_sushi_final.mp4
+            20261121_sushi_artwork.jpg
+            20261121_sushi_metadata.txt
+            20261121_sushi_art_metadata.json
     03_ARCHIVE/            the GO_ folder (or loose recording) moved here once rendered
 ```
 
@@ -138,7 +144,8 @@ Put all the files of one artwork in a subfolder of `01_RAW_VIDEO`:
 for an hour and rename the folder (or just type `GO_` in front of its name) when it is complete.
 The prefix is stripped from the output names, so `GO_20261121_sushi` produces
 `20261121_sushi_final.mp4`, `20261121_sushi_artwork.jpg`, `20261121_sushi_metadata.txt` and
-`20261121_sushi_art_metadata.json`.
+`20261121_sushi_art_metadata.json`, all inside its own package folder
+`20261121_sushi_{YYYYMMDD_HHMM}/`.
 
 A loose `.mp4` / `.mov` / `.avi` dropped straight into `01_RAW_VIDEO` still works exactly as
 before (one recording, artwork from its last frame).
@@ -154,7 +161,9 @@ before (one recording, artwork from its last frame).
    the raw copy again, so an hour-long 6 GB recording never becomes a second 6 GB file on disk;
 4. joins the hook (2.5 s from the end of the last clip) with the segments and finishes the
    Short (script, voice, subtitles);
-5. uploads the four artifacts into `02_READY_TO_POST` with resumable uploads;
+5. uploads the four artifacts into their own subfolder of `02_READY_TO_POST`,
+   named `{base_name}_{YYYYMMDD_HHMM}` (the same name as the local output folder;
+   an existing folder of that name is reused, so a retry never leaves two);
 6. moves the whole `GO_` folder (or the loose file) to `03_ARCHIVE` and records its id in
    `drive_state.json`, so an interrupted run repeats at most one artwork instead of
    re-rendering everything.
@@ -204,6 +213,12 @@ render.
 | `style_B_story` | warm story about the everyday moment behind the motif |
 | `style_C_asmr` | minimal narration; the drawing sound itself carries the video |
 
+Whichever style is chosen, the prompt asks for the three things a Short needs to travel,
+woven into the narration rather than read as a list: a **curiosity-gap hook** in the first
+sentence (0-3 s), **sensory language** for the material (`creamy`, `buttery`, `vibrant`,
+`crisp`), and a **loop-friendly ending** that leads back to the opening or lands on a
+punchline. The narration length, the JSON keys and the Japanese translation are unchanged.
+
 `style_C_asmr` is the one style that keeps the original audio: `build_vertical_timelapse(...,
 keep_audio=True)` keeps the pastel-on-paper sound, and `main.py` mixes that track under the
 narration with `amix`. Because FFmpeg's `atempo` only accepts 0.5–2.0 per stage, the
@@ -217,11 +232,13 @@ python3 -m unittest discover -s tests -t . -v
 ```
 
 The tests cover style selection, CSV handling, FFmpeg command assembly, `atempo` chaining,
-the audio-mixing branch, JSON parsing of Gemini replies, upload body limits, finished-artwork
+the audio-mixing branch, JSON parsing of Gemini replies, the hook/sensory/loop prompt rules,
+upload body limits, finished-artwork
 extraction (OpenCV path and FFmpeg fallback), scanned-artwork resizing, the per-clip project
-plan and its FFmpeg commands, the metadata bundle, the Drive sync orchestration
+plan and its FFmpeg commands, the metadata bundle, the per-render package folder, the Drive
+sync orchestration
 (GO_ folder discovery, natural sorting, prefix stripping, download / upload / archive / state,
-mocked Drive client) and project file invariants.
+the 02_READY_TO_POST subfolder, mocked Drive client) and project file invariants.
 They need `pandas`, `pyyaml` and `opencv-python` only – no FFmpeg run, API key or network
 access.
 

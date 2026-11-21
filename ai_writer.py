@@ -180,18 +180,27 @@ Context:
 {artist_block}
 The finished Short is about {total_seconds} seconds long and the voiceover runs almost
 the whole way through it. Plan the narration on this timeline:
-- 0-3 s: a strong hook in the very first sentence. No greeting, no warm-up.
+- 0-3 s: the hook (point 1 below). No greeting, no warm-up.
 - 3-35 s: detailed description of the process, colour by colour, what the hand is
-doing right now. Keep talking: a new sentence starts before the previous one has
-faded, with no long pauses and no "and then... and then".
-- 35 s onward: one short thought about the finished piece, then the call to action
-(this 1-of-1 original postcard is available at CrayonJapan, link in the
-description and bio).
+doing right now, in words a viewer can almost feel. Keep talking: a new sentence
+starts before the previous one has faded, with no long pauses and no
+"and then... and then".
+- 35 s onward: one short, satisfying punchline about the finished piece, written so
+the ending naturally leads back to the opening hook (point 3 below), then the short
+call to action (this 1-of-1 original postcard is available at CrayonJapan, link in
+the description and bio). The call to action may carry the loop, but the punchline
+has to land first.
+
+Three things every Short has to do, woven into the narration itself (never read
+out as a list, never a checklist):
+1. Hook (0-3s): Start with a curiosity-gap sentence. (e.g., "The secret to realistic texture is..." or "You won't believe how this layer transforms...")
+2. Sensory Language: Use words like 'creamy', 'buttery', 'vibrant', 'crisp' to emphasize the material's quality.
+3. Loop-friendly Ending: The last sentence should naturally lead back to the beginning or end with a strong, satisfying punchline.
 
 Generate a JSON response with the following keys:
 1. "title": Catchy English YouTube Shorts title (under 65 chars, include #Shorts).
 2. "hook_text": Short punchy on-screen hook text for the first 2.5 seconds (max 7 words).
-3. "narration": Natural, engaging English voiceover script of {NARRATION_MIN_WORDS}-{NARRATION_MAX_WORDS} words (~40-45 seconds, this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Mention {material} naturally and end with the warm call-to-action described above. Do not leave a silent stretch longer than a breath anywhere in the Short.
+3. "narration": Natural, engaging English voiceover script of {NARRATION_MIN_WORDS}-{NARRATION_MAX_WORDS} words (~40-45 seconds, this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Open on the curiosity-gap hook, keep the sensory words coming, mention {material} naturally, and close so the ending leads back to the opening or lands as a punchline, with the warm call-to-action in the final line. Do not leave a silent stretch longer than a breath anywhere in the Short.
 4. "description": YouTube description including artwork story, material ({material}), shop link ({shop_url}), and hashtags (#SakuraCrayPas #CrayPasSpecialist #OilPastelArt #JapaneseArtSupplies #OriginalPostcard #CrayonJapan).
 5. "tags": List of 10 relevant English tags.
 6. "title_ja": The same title in natural Japanese, keeping "#Shorts" and any emoji.

@@ -13,8 +13,8 @@ It verifies that
   * the silent clip did not break the concatenation (ASMR keeps audio),
   * the hook + segments are joined, and the raw clips are deleted again,
   * the scan becomes the artwork JPEG (uncropped, 1080 wide),
-  * drive_sync finds the GO_ folder, uploads four artifacts, archives the folder
-    and records it in the state file.
+  * drive_sync finds the GO_ folder, uploads four artifacts into the render's
+    own package subfolder, archives the folder and records it in the state file.
 
 The script is a manual check, not part of the unittest suite (CI has no ffmpeg
 until the workflow installs it, and this one takes a few seconds of CPU).
@@ -221,6 +221,12 @@ def main_check(ffmpeg):
             uploaded.append((os.path.basename(path), folder_id))
             return {"id": f"up-{os.path.basename(path)}"}
 
+        package_folders = []
+
+        def folder_creator(svc, parent_id, name):
+            package_folders.append((parent_id, name))
+            return {"id": f"pkg-{name}"}
+
         def mover(svc, file_id, new_parent, old_parent=None):
             moved.append((file_id, new_parent, old_parent))
             return {"id": file_id}
@@ -256,6 +262,7 @@ def main_check(ffmpeg):
                 downloader=downloader,
                 uploader=uploader,
                 mover=mover,
+                folder_creator=folder_creator,
                 log=lambda line: print(f"     {line}"),
             )
 
@@ -263,9 +270,20 @@ def main_check(ffmpeg):
         failures.append(not check("one item rendered", len(results) == 1 and results[0]["status"] == "done",
                                   str([r.get("status") for r in results])))
         base = "20261121_sushi"
-        vertical = os.path.join(out_dir, f"{base}_vertical.mp4")
-        final = os.path.join(out_dir, f"{base}_final.mp4")
-        artwork = os.path.join(out_dir, f"{base}_artwork.jpg")
+        artifacts = dict((results[0].get("artifacts") or {})) if results else {}
+        package = str(results[0].get("package", "")) if results else ""
+        failures.append(not check("one package folder, named like the render",
+                                  bool(package) and package.startswith(f"{base}_")
+                                  and len(package_folders) == 1
+                                  and package_folders[0] == (folders.ready, package),
+                                  str(package_folders)))
+        vertical = str(artifacts.get("vertical", ""))
+        final = str(artifacts.get("final_video", ""))
+        artwork = str(artifacts.get("artwork", ""))
+        failures.append(not check("the package lives in its own output subfolder",
+                                  all(os.path.dirname(path) == os.path.join(out_dir, package)
+                                      for path in (vertical, final, artwork)),
+                                  package))
 
         info = probe_video(vertical, ffmpeg)
         failures.append(not check("vertical is 1080x1920", (info["width"], info["height"]) == (1080, 1920),
@@ -290,17 +308,20 @@ def main_check(ffmpeg):
                                       for name in os.listdir(os.path.join(work_root, "proj1_20261121_sushi"))
                                   )))
         biggest = max(
-            (os.path.getsize(os.path.join(out_dir, name)) for name in os.listdir(out_dir)
-             if os.path.isfile(os.path.join(out_dir, name))),
+            (os.path.getsize(os.path.join(dirpath, name))
+             for dirpath, _, names in os.walk(out_dir) for name in names
+             if os.path.isfile(os.path.join(dirpath, name))),
             default=0,
         )
         failures.append(not check("no multi-hundred-MB intermediate in output/",
                                   biggest < 120 * 1024 * 1024, f"largest {biggest / 1024 / 1024:.1f} MB"))
 
         names = sorted(name for name, _ in uploaded)
-        failures.append(not check("four artifacts uploaded to 02_READY_TO_POST",
+        failures.append(not check("four artifacts uploaded into the package folder",
                                   names == [f"{base}_art_metadata.json", f"{base}_artwork.jpg",
-                                            f"{base}_final.mp4", f"{base}_metadata.txt"], str(names)))
+                                            f"{base}_final.mp4", f"{base}_metadata.txt"]
+                                  and all(folder == f"pkg-{package}" for _, folder in uploaded),
+                                  str(uploaded)))
         failures.append(not check("the GO_ folder itself was archived",
                                   moved == [("proj1", "archive-folder", "raw-folder")], str(moved)))
         failures.append(not check("state records the archived folder",

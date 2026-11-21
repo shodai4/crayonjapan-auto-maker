@@ -208,6 +208,31 @@ class PromptTests(unittest.TestCase):
                     self.assertIn(note, prompt)
                 self.assertIn("never invent a fact", prompt)
 
+    def test_every_style_asks_for_the_three_short_form_hooks(self):
+        """The buzz elements Gemini proposed: hook, sensory words, a loop."""
+        for style in CONFIG["evolution"]["styles"]:
+            with self.subTest(style=style):
+                prompt = ai_writer.build_script_prompt(style, CONFIG)
+                self.assertIn("Hook (0-3s)", prompt)
+                self.assertIn("curiosity-gap sentence", prompt)
+                self.assertIn("The secret to realistic texture is", prompt)
+                self.assertIn("You won't believe how this layer transforms", prompt)
+                self.assertIn("Sensory Language", prompt)
+                for word in ("creamy", "buttery", "vibrant", "crisp"):
+                    self.assertIn(word, prompt)
+                self.assertIn("Loop-friendly Ending", prompt)
+                self.assertIn("naturally lead back to the beginning", prompt)
+                self.assertIn("satisfying punchline", prompt)
+
+    def test_the_narration_rule_keeps_the_hook_sensory_words_and_the_loop(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
+        narration_line = next(
+            line for line in prompt.splitlines() if line.startswith('3. "narration"')
+        )
+        self.assertIn("curiosity-gap hook", narration_line)
+        self.assertIn("sensory words", narration_line)
+        self.assertIn("leads back to the opening", narration_line)
+
 
 class JapaneseTranslationTests(unittest.TestCase):
     """Gemini returns the Japanese the artist checks before the Short is posted."""

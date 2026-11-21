@@ -26,7 +26,7 @@ from ai_writer import (
     generate_making_script,
 )
 from analytics_updater import CSV_COLUMNS
-from metadata_writer import write_metadata_files
+from metadata_writer import JST, write_metadata_files
 from video_processor import (
     DEFAULT_ARTWORK_OFFSET,
     ZOOM_OUTRO_SECONDS,
@@ -50,7 +50,12 @@ from youtube_uploader import upload_short
 CONFIG_PATH = "config.yaml"
 CSV_PATH = "analytics/performance.csv"
 INPUT_DIR = "input"
+# Local mirror of the Drive hub's 02_READY_TO_POST: the upload-ready package.
 OUTPUT_DIR = "output"
+# One render = one subfolder named ``{base_name}_{YYYYMMDD_HHMM}``, so the four
+# artifacts of a Short never mix with the next one (and Drive gets the same
+# folder, which is what the artist opens on their phone).
+OUTPUT_STAMP_FORMAT = "%Y%m%d_%H%M"
 RAW_LOCAL_EXTENSIONS = (".mp4", ".mov", ".avi")
 HOOK_TYPE = "finish_preview_2.5s"
 TTS_VOICE = "en-US-JennyNeural"
@@ -265,6 +270,35 @@ def append_performance_row(
     return df
 
 
+def get_output_dir(
+    base_name: str,
+    output_root: str = OUTPUT_DIR,
+    now: Optional[datetime] = None,
+) -> tuple[str, str]:
+    """The per-render folder and its name: ``{base}_{YYYYMMDD_HHMM}``.
+
+    Everything one drawing produces (vertical cut, voice, subtitles, final MP4,
+    artwork JPEG, metadata pack) is written inside this folder instead of
+    straight into ``output``, so a package is picked up in one piece and a
+    second render can never overwrite the first. The name is JST, the timezone
+    the artist reads the folder in, and the very same name is reused as the
+    subfolder inside Drive's ``02_READY_TO_POST``.
+    """
+    cleaned = _clean_base_name(base_name)
+    stamp = (now or datetime.now(JST)).strftime(OUTPUT_STAMP_FORMAT)
+    folder = f"{cleaned}_{stamp}"
+    path = os.path.join(output_root, folder)
+    # Two drawings finished in the same minute still get one folder each, and
+    # the name travels to Drive unchanged, so the pair always matches.
+    suffix = 2
+    while os.path.exists(path):
+        folder = f"{cleaned}_{stamp}_{suffix}"
+        path = os.path.join(output_root, folder)
+        suffix += 1
+    os.makedirs(path, exist_ok=True)
+    return path, folder
+
+
 def _clean_base_name(name: str) -> str:
     """Filename-safe output stem (``GO_20261121_sushi`` -> ``20261121_sushi``)."""
     cleaned = "".join(
@@ -290,6 +324,7 @@ def _publish_bundle(
     config: dict,
     output_dir: str,
     upload: bool,
+    output_folder: str = "",
     reference_scan: bool = False,
     finale: Optional[dict] = None,
 ) -> dict:
@@ -379,6 +414,8 @@ def _publish_bundle(
 
     return {
         "base_name": base_name,
+        "output_dir": output_dir,
+        "output_folder": output_folder,
         "style_key": style_key,
         "vertical": raw_vertical,
         "audio": audio_path,
@@ -414,6 +451,8 @@ def process_video_bundle(
     base_name = _clean_base_name(
         base_name if base_name is not None else os.path.splitext(os.path.basename(input_path))[0]
     )
+    # The whole package of this drawing goes into its own named folder.
+    output_dir, output_folder = get_output_dir(base_name, output_dir)
     raw_vertical = f"{output_dir}/{base_name}_vertical.mp4"
     artwork_path = f"{output_dir}/{base_name}_artwork.jpg"
 
@@ -447,6 +486,7 @@ def process_video_bundle(
             config=config,
             output_dir=output_dir,
             upload=upload,
+            output_folder=output_folder,
         ),
     )
 
@@ -471,6 +511,8 @@ def process_project_bundle(
     os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
 
     base_name = _clean_base_name(source.stem)
+    # Same package folder as the single-video flow: one drawing, one folder.
+    output_dir, output_folder = get_output_dir(base_name, output_dir)
     work_dir = source.work_dir or os.path.join(INPUT_DIR, base_name)
     os.makedirs(work_dir, exist_ok=True)
 
@@ -603,6 +645,7 @@ def process_project_bundle(
         config=config,
         output_dir=output_dir,
         upload=upload,
+        output_folder=output_folder,
         reference_scan=reference_scan,
         finale={"base_video": base_video, "target_total": target_total, "runner": runner},
     )
