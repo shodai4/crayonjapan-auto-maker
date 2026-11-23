@@ -896,9 +896,14 @@ def run_drive_mode(args, config: dict) -> int:
     """Phase 2: Google Drive folder in, upload-ready package out."""
     schedule = schedule_settings(config)
     ignore_schedule = getattr(args, "ignore_schedule", False) is True
+    # A run that does not upload (`--no-upload`) posts nothing, so the interval
+    # has nothing to protect: it would only stop the artist's package from being
+    # made and checked on the phone.
+    publishes = not bool(getattr(args, "no_upload", False))
+    gated = args.drive_once and schedule["enabled"] and not ignore_schedule
     max_items: Optional[int] = None
 
-    if args.drive_once and schedule["enabled"] and not ignore_schedule:
+    if gated and publishes:
         # The gate runs before Drive is even touched: a run that may not post
         # has nothing to render, so it must not download, cut or upload either.
         gate = post_interval_state(config, log=print)
@@ -907,6 +912,11 @@ def run_drive_mode(args, config: dict) -> int:
                 return 1
             return 0
         max_items = schedule["max_videos_per_run"]
+    elif gated and not publishes:
+        print(
+            "[schedule] --no-upload: nothing is posted, so the posting interval is "
+            "not checked and every waiting item is rendered into 02_READY_TO_POST"
+        )
     elif args.drive_once and schedule["enabled"] and ignore_schedule:
         print("[schedule] --ignore-schedule: the posting interval is not checked this run")
     if args.drive_watch and schedule["enabled"] and not ignore_schedule:

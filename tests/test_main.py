@@ -815,7 +815,7 @@ class DriveOnceScheduleTests(unittest.TestCase):
 
     def _args(self, **overrides):
         values = dict(
-            no_upload=True, artwork_offset=0.0, drive_state="s.json",
+            no_upload=False, artwork_offset=0.0, drive_state="s.json",
             drive_min_age=60, drive_go_min_age=5, drive_once=True,
             drive_interval=None, drive_watch=False, ignore_schedule=False,
         )
@@ -886,6 +886,12 @@ class DriveOnceScheduleTests(unittest.TestCase):
         sync.assert_not_called()
         watch.assert_called_once()
         self.assertIsNone(watch.call_args.kwargs["max_items"])
+
+    def test_a_render_only_run_is_not_gated(self):
+        code, gate, _, sync, _ = self._drive(self._args(no_upload=True))
+        self.assertEqual(code, 0)
+        gate.assert_not_called()
+        self.assertIsNone(sync.call_args.kwargs["max_items"])
 
     def test_the_ignore_schedule_flag_reaches_drive_mode(self):
         with mock.patch.object(main, "run_drive_mode", return_value=0) as drive, \

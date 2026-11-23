@@ -40,12 +40,13 @@ youtube:
   category_id: "22"
   default_language: "en"
 
-# Posting rhythm, applied by --drive-once (the CI path).
+# Posting rhythm, applied by a publishing --drive-once (the CI path).
 #   enabled: true          -> before anything is downloaded or rendered, read the
 #                             newest upload on the channel; if it is younger than
 #                             min_interval_hours, the run exits 0 and the GO_
 #                             folders wait. Otherwise only max_videos_per_run of
 #                             them (oldest name first) are made and published.
+# `--no-upload` runs post nothing, so they are not gated; and
 # `python main.py --drive-once --ignore-schedule` skips the interval check.
 schedule:
   enabled: true

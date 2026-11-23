@@ -183,8 +183,9 @@ before (one recording, artwork from its last frame).
 
 ### One scan cycle
 
-With `schedule.enabled: true` in `config.yaml` a `--drive-once` run is a **posting slot**, not
-a queue drain: it first reads the newest video on the channel and only then touches Drive.
+With `schedule.enabled: true` in `config.yaml` a publishing `--drive-once` run is a **posting
+slot**, not a queue drain: it first reads the newest video on the channel and only then touches
+Drive. (A `--no-upload` run publishes nothing and is left ungated.)
 
 0. **interval gate** – `channels.list(part="contentDetails", mine=True)` gives the uploads
    playlist, `playlistItems.list(maxResults=1)` its newest entry, and that
@@ -220,9 +221,10 @@ order the drawings were made.
 `--drive-watch`; the default is 60 s. The interval gate belongs to `--drive-once` (the CI path);
 the local watcher is for testing and renders whatever is waiting. `--no-upload` leaves the
 YouTube upload out: the package simply waits in `02_READY_TO_POST` for you to check it on your
-phone (the 48 h gate still applies, so use `--ignore-schedule` for a test render inside the
-window). Without `--no-upload` the Short is uploaded with `youtube.default_privacy` from
-`config.yaml`, which is `public`: the run publishes by itself.
+phone, and since such a run posts nothing the 48 h gate and the one-per-run cap are not applied
+to it - every waiting item is rendered. Without `--no-upload` the Short is uploaded with
+`youtube.default_privacy` from `config.yaml`, which is `public`: a run that passes the gate
+publishes by itself, and `--ignore-schedule` is the only way to post inside the 48 h window.
 
 ## Hand-off mode: Apps Script + GitHub Actions
 
