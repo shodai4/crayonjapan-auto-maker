@@ -30,8 +30,9 @@ viewers actually watch.
    **`v1beta`** (the `gemini-3` models are not served on `v1`, which answers `404 NOT_FOUND`),
    and if a model is retired, out of free-tier quota or overloaded the next one in
    `FALLBACK_MODELS` is tried instead.
-6. **Voice + subtitles** – `edge-tts` (en-US-JennyNeural) narrates, and word-level subtitles
-   are burned into the video. The narration is measured after it is synthesised: if it runs
+6. **Voice + telop** – `edge-tts` (en-US-JennyNeural) narrates, and the word timings it
+   reports become the on-screen telop (see *Telop* below); the SRT cues are still written for
+   the caption track. The narration is measured after it is synthesised: if it runs
    longer than the planned cut, the closing zoom grows (3-8 s) so `-shortest` never cuts the
    last line, and the whole Short stays under the 58 s guard.
 7. **Upload + record** – the Short is uploaded (unlisted by default) and one row is appended
@@ -49,10 +50,32 @@ viewers actually watch.
 ## Requirements
 
 - Python 3.10+
-- FFmpeg 5+ with `libx264`, the `subtitles` (libass) filter, and `ffprobe` on `PATH`
+- FFmpeg 5+ with `libx264`, the `subtitles` and `ass` (libass) filters, and `ffprobe` on `PATH`
+- A bold sans font the caption can rely on: `fonts-dejavu-core` is installed by the workflow
+  (DejaVu Sans Bold); Liberation Sans is used when that is the face present
 - A Gemini API key (Google AI Studio)
 - A Google Cloud OAuth client (type: *Desktop app*) with **YouTube Data API v3** and
   **YouTube Analytics API** enabled for the channel the videos are uploaded to (`@CrayonJapan`)
+
+## Telop
+
+`telop.py` lays out the on-screen text as an ASS document built from the word timings
+`edge-tts` reports (`*_words.json`); `main.py` burns it with FFmpeg's `ass` filter instead of
+the plain SRT cues. Every rule below is covered by `tests/test_telop.py`.
+
+| what | how |
+| --- | --- |
+| Reading comfort | at most **two lines** per card, **one message** per card, and cards close on a sentence end. Lines break on word boundaries only; a card's trailing `.` / `,` / `;` is dropped (`!` and `?` stay, they carry the tone). A card that would flash by in under 0.85 s is merged into a neighbour. |
+| Placement | the caption band sits `MarginV = 380` from the bottom with 170 px side margins, so it clears the Shorts title/description, the like-comment-share column (140 px) and the top bar. The hook and the closing line live in the upper band (380-560 px) and the fixed title at 180 px, which keeps the middle of the frame - the drawing - clear. |
+| Type | DejaVu Sans Bold (auto-detected; Liberation Sans as the fallback) with a black outline and a drop shadow, legible on white paper and on saturated colour. |
+| Emphasis | a keyword or a number is gold and 106 % (gold `&H14C8FF&`); the script can also mark its own words with `**word**`, which are removed before synthesis and highlighted on screen. |
+| Karaoke | one overlay per spoken word, on a layer above the card: that word turns gold, grows to 124 % and gets an underline, then the next word takes over. |
+| Hook | `hook_text` pops in (45 % -> 112 % -> 100 %) over the first 3 s. |
+| Fixed title | `CrayonJapan / <title>` (hashtags and emoji removed, cut on a word boundary) at 40 px, 60 % transparent, for the whole Short. |
+| Closing line | `telop.cta_text` from `config.yaml` over the outro (`Follow for more oil pastel art!`), popping in and holding until the last frame. |
+
+`telop.enabled: false` in `config.yaml` puts the plain SRT burn back; `telop.font` pins a font
+family instead of the auto-detect. The SRT is written either way and stays in the upload pack.
 
 ## Setup
 
@@ -98,7 +121,8 @@ Output files land in one folder per drawing, `./output/{base_name}_{YYYYMMDD_HHM
 | file | what it is |
 | --- | --- |
 | `*_vertical.mp4` | 9:16 time-lapse (intermediate) |
-| `*.mp3`, `*.srt` | narration and word-level subtitles (intermediate) |
+| `*.mp3`, `*.srt` | narration and word-level SRT cues (intermediate) |
+| `*_words.json`, `*.ass` | word timings and the telop document that is burned into the picture |
 | `*_final.mp4` | the upload-ready Short |
 | `*_artwork.jpg` | the finished drawing, full frame, for thumbnail / shop listing |
 | `*_metadata.txt` | paste-ready title, hook text, description, tags |
@@ -160,7 +184,7 @@ before (one recording, artwork from its last frame).
 3. downloads the clips **one at a time**, renders each into its short 9:16 segment and deletes
    the raw copy again, so an hour-long 6 GB recording never becomes a second 6 GB file on disk;
 4. joins the hook (2.5 s from the end of the last clip) with the segments and finishes the
-   Short (script, voice, subtitles);
+   Short (script, voice, telop);
 5. uploads the four artifacts into their own subfolder of `02_READY_TO_POST`,
    named `{base_name}_{YYYYMMDD_HHMM}` (the same name as the local output folder;
    an existing folder of that name is reused, so a retry never leaves two);

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -202,6 +203,21 @@ class SynthesizeVoiceTests(unittest.TestCase):
 
         with self.assertRaises(RuntimeError):
             self._synthesize()
+
+    def test_the_word_timings_are_saved_for_the_telop(self):
+        self._install_fake_edge_tts(SubMaker7)
+        words_path = os.path.join(self.tmp.name, "voice_words.json")
+
+        asyncio.run(
+            main.synthesize_voice(
+                "Wait for it", self.audio_path, self.srt_path, words_path=words_path
+            )
+        )
+
+        with open(words_path, "r", encoding="utf-8") as handle:
+            words = json.load(handle)["words"]
+        self.assertEqual([word["text"] for word in words], ["Wait", "for it"])
+        self.assertAlmostEqual(words[0]["start"], 0.1, places=3)
 
     def test_requirements_pin_the_new_edge_tts_line(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -9,6 +9,7 @@ import pandas as pd
 
 import drive_sync
 import main
+import telop
 from analytics_updater import CSV_COLUMNS
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -146,6 +147,90 @@ class MuxCommandTests(unittest.TestCase):
             main.mux_audio_and_subtitles("v.mp4", "a.mp3", "s.srt", "f.mp4", keep_original_audio=True)
         cmd = run.call_args[0][0]
         self.assertNotIn("amix", cmd[cmd.index("-filter_complex") + 1])
+
+
+class TelopIntegrationTests(unittest.TestCase):
+    """The ASS telop replaces the plain SRT burn, and the SRT is still written."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = main.load_config(os.path.join(ROOT, "config.yaml"))
+        self.out = self.tmp.name
+
+    def _words(self):
+        return [
+            {"text": "The", "start": 0.4, "end": 0.7},
+            {"text": "secret", "start": 0.75, "end": 1.2},
+            {"text": "layer", "start": 1.25, "end": 1.7},
+        ]
+
+    def test_the_telop_is_written_next_to_the_voice(self):
+        telop.write_word_timings(os.path.join(self.out, "clip_words.json"), self._words())
+        path = main.write_telop(
+            base_name="clip",
+            output_dir=self.out,
+            script_data=SCRIPT,
+            config=self.config,
+            video_seconds=12.0,
+        )
+        self.assertEqual(path, os.path.join(self.out, "clip.ass"))
+        with open(path, "r", encoding="utf-8") as handle:
+            ass = handle.read()
+        self.assertIn("Style: Telop", ass)
+        self.assertIn("One tiny", ass)                    # the hook (cleaned)
+        self.assertIn("postcard", ass)
+        self.assertIn("CrayonJapan", ass)                 # the fixed title
+        # the closing line wraps into two lines, so check both halves
+        self.assertIn("Follow for more", ass)
+        self.assertIn("oil pastel art!", ass)
+
+    def test_switching_the_telop_off_leaves_the_plain_srt_path(self):
+        config = dict(self.config)
+        config["telop"] = dict(config.get("telop") or {}, enabled=False)
+        self.assertEqual(
+            main.write_telop("clip", self.out, SCRIPT, config, video_seconds=9.0), ""
+        )
+
+    def test_the_second_config_override_names_the_font(self):
+        config = dict(self.config)
+        config["telop"] = dict(config.get("telop") or {}, font="DejaVu Sans")
+        main.write_telop("clip", self.out, SCRIPT, config, video_seconds=9.0)
+        with open(os.path.join(self.out, "clip.ass"), "r", encoding="utf-8") as handle:
+            self.assertIn("Style: Telop,DejaVu Sans,", handle.read())
+
+    def test_the_mux_burns_the_ass_when_it_is_given(self):
+        cmd = main.build_mux_command(
+            "v.mp4", "a.mp3", "s.srt", "final.mp4", ass_path="clip.ass"
+        )
+        fc = cmd[cmd.index("-filter_complex") + 1]
+        self.assertIn("ass='clip.ass'", fc)
+        self.assertNotIn("subtitles=", fc)
+        self.assertIn("apad", fc)
+
+    def test_the_ass_filter_escapes_a_windows_path(self):
+        vf = main.build_ass_filter("C:\\work\\clip.ass")
+        self.assertEqual(vf, "ass='C\\:/work/clip.ass'")
+
+    def test_an_ass_file_is_preferred_over_the_srt(self):
+        ass_path = os.path.join(self.tmp.name, "clip.ass")
+        with open(ass_path, "w", encoding="utf-8") as handle:
+            handle.write("[Events]\n")
+        with mock.patch("subprocess.run") as run:
+            main.mux_audio_and_subtitles("v.mp4", "a.mp3", "s.srt", "f.mp4", ass_path=ass_path)
+        cmd = run.call_args[0][0]
+        self.assertIn("ass=", cmd[cmd.index("-filter_complex") + 1])
+
+    def test_a_missing_ass_falls_back_to_the_srt(self):
+        srt = os.path.join(self.tmp.name, "cues.srt")
+        with open(srt, "w", encoding="utf-8") as handle:
+            handle.write("1\n00:00:01,000 --> 00:00:02,000\nWait\n\n")
+        with mock.patch("subprocess.run") as run:
+            main.mux_audio_and_subtitles(
+                "v.mp4", "a.mp3", srt, "f.mp4", ass_path="/nope/missing.ass"
+            )
+        cmd = run.call_args[0][0]
+        self.assertIn("subtitles=", cmd[cmd.index("-filter_complex") + 1])
 
 
 class PerformanceRowTests(unittest.TestCase):

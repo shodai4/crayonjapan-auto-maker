@@ -19,6 +19,7 @@ import pandas as pd
 import yaml
 
 import drive_sync
+import telop
 from ai_writer import (
     ASMR_STYLE_KEY,
     TRANSLATION_KEYS,
@@ -70,6 +71,9 @@ SUBTITLE_STYLE = (
     "Fontsize=18,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
     "Outline=2,Alignment=2,MarginV=65"
 )
+# The telop document is the real on-screen design (see telop.py); the SRT is
+# still written because it is the caption track and part of the upload pack.
+DEFAULT_CTA_TEXT = telop.DEFAULT_CTA_TEXT
 
 
 def load_config(path: str = CONFIG_PATH) -> dict:
@@ -82,10 +86,20 @@ def should_keep_audio(style_key: str) -> bool:
     return style_key == ASMR_STYLE_KEY
 
 
+def _escaped_filter_path(path: str) -> str:
+    """A file path as an FFmpeg filter argument (Windows drive letters too)."""
+    return path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+
+
 def build_subtitle_filter(srt_path: str) -> str:
     """Subtitles filter with the escaping FFmpeg expects on every platform."""
-    escaped = srt_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+    escaped = _escaped_filter_path(srt_path)
     return f"subtitles='{escaped}':force_style='{SUBTITLE_STYLE}'"
+
+
+def build_ass_filter(ass_path: str) -> str:
+    """Burn the telop ASS document; its styles travel inside the file."""
+    return f"ass='{_escaped_filter_path(ass_path)}'"
 
 
 def build_mux_command(
@@ -95,6 +109,7 @@ def build_mux_command(
     final_path: str,
     mix_original_audio: bool = False,
     with_subtitles: bool = True,
+    ass_path: str = "",
 ) -> List[str]:
     """Burn subtitles and lay the narration over the time-lapse.
 
@@ -103,9 +118,16 @@ def build_mux_command(
     silence so ``-shortest`` ends on the video, never on a short voice track.
     Without `with_subtitles` (no cues came back from the voiceover) the picture
     is simply passed through, so a usable video is still produced.
+
+    `ass_path` switches the burn from the plain SRT cues to the telop document
+    (two-line cards, karaoke highlight, hook, title and closing CTA).
     """
-    subtitles = build_subtitle_filter(srt_path)
-    picture = f"[0:v]{subtitles}[v]" if with_subtitles else "[0:v]null[v]"
+    if ass_path:
+        picture = f"[0:v]{build_ass_filter(ass_path)}[v]"
+    elif with_subtitles:
+        picture = f"[0:v]{build_subtitle_filter(srt_path)}[v]"
+    else:
+        picture = "[0:v]null[v]"
     if mix_original_audio:
         filter_complex = (
             f"{picture};"
@@ -169,18 +191,31 @@ async def synthesize_voice(
     srt_path: str,
     voice: str = TTS_VOICE,
     rate: str = TTS_RATE,
-) -> None:
-    """English narration plus word-level SRT subtitles via edge-tts."""
+    words_path: str = "",
+) -> List[dict]:
+    """English narration, word-level SRT cues and timings for the telop.
+
+    ``words_path`` saves the boundaries as JSON; the ASS captions need the start
+    and end of every spoken word, which the SRT does not carry in a form that
+    survives rounding.
+    """
     import edge_tts
 
     communicate = create_communicate(edge_tts, text, voice=voice, rate=rate)
     submaker = edge_tts.SubMaker()
+    boundaries: List[dict] = []
     with open(audio_path, "wb") as file:
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 file.write(chunk["data"])
             elif chunk["type"] in SUBTITLE_CHUNK_TYPES:
                 feed_word_boundary(submaker, chunk)
+                boundaries.append({
+                    "type": chunk["type"],
+                    "offset": chunk.get("offset"),
+                    "duration": chunk.get("duration"),
+                    "text": chunk.get("text", ""),
+                })
     srt_text = render_srt(submaker)
     if not srt_text.strip():
         print(
@@ -189,6 +224,15 @@ async def synthesize_voice(
         )
     with open(srt_path, "w", encoding="utf-8") as f:
         f.write(srt_text)
+
+    # The boundaries carry no punctuation; the narration still has it, and the
+    # caption needs it to know where a sentence (and so a card) ends.
+    words = telop.attach_punctuation(
+        telop.word_timings_from_boundaries(boundaries), text
+    )
+    if words_path:
+        telop.write_word_timings(words_path, words)
+    return words
 
 
 def create_communicate(edge_tts, text: str, voice: str, rate: str):
@@ -210,25 +254,74 @@ def subtitles_available(srt_path: str) -> bool:
         return False
 
 
+def write_telop(
+    base_name: str,
+    output_dir: str,
+    script_data: dict,
+    config: dict,
+    video_seconds: Optional[float] = None,
+    marked: Sequence[str] = (),
+) -> str:
+    """Lay out the ASS telop for one Short and return its path.
+
+    Returns "" when ``telop.enabled`` is false, so the older plain-SRT look stays
+    one config line away. The word timings come from the voice step; without
+    them the hook, title and closing line are still burned, which is what a
+    voice that answered without boundaries can offer.
+    """
+    settings = config.get("telop") or {}
+    if settings.get("enabled", True) is False:
+        print("      telop disabled in config.yaml; burning the plain SRT cues")
+        return ""
+
+    words = telop.load_word_timings(f"{output_dir}/{base_name}_words.json")
+    series_label = str(settings.get("series_label") or config["brand"].get("name", ""))
+    title = telop.clean_title(str(script_data.get("title", "")), series_label)
+    hook = telop.clean_hook(str(script_data.get("hook_text", "")))
+    cta = telop.clean_caption_text(str(settings.get("cta_text", DEFAULT_CTA_TEXT)))
+    font = str(settings.get("font") or "") or telop.detect_font()
+
+    path = telop.write_telop_ass(
+        f"{output_dir}/{base_name}.ass",
+        words=words,
+        hook_text=hook,
+        title=title,
+        cta_text=cta,
+        video_seconds=video_seconds,
+        font_name=font,
+        marked=marked,
+    )
+    stats = telop.summarise(telop.plan_cards(words, marked=marked))
+    print(
+        f"      {int(stats['cards'])} caption card(s) in {font}, "
+        f"longest line {int(stats['longest_line'])} chars"
+    )
+    return path
+
+
 def mux_audio_and_subtitles(
     video_path: str,
     audio_path: str,
     srt_path: str,
     final_path: str,
     keep_original_audio: bool = False,
+    ass_path: str = "",
 ) -> str:
     """Render the upload-ready file."""
     import subprocess
 
     mix = bool(keep_original_audio) and has_audio_stream(video_path)
     with_subtitles = subtitles_available(srt_path)
-    if not with_subtitles:
+    if ass_path and os.path.exists(ass_path):
+        with_subtitles = True
+    elif not with_subtitles:
         print("      no subtitle cues: rendering the video without burned subtitles")
     subprocess.run(
         build_mux_command(
             video_path, audio_path, srt_path, final_path,
             mix_original_audio=mix,
             with_subtitles=with_subtitles,
+            ass_path=ass_path if os.path.exists(ass_path) else "",
         ),
         check=True,
     )
@@ -336,6 +429,7 @@ def _publish_bundle(
     """
     audio_path = f"{output_dir}/{base_name}.mp3"
     srt_path = f"{output_dir}/{base_name}.srt"
+    words_path = f"{output_dir}/{base_name}_words.json"
     final_video = f"{output_dir}/{base_name}_final.mp4"
     keyframe_dir = f"{output_dir}/{base_name}_frames"
 
@@ -352,7 +446,12 @@ def _publish_bundle(
     )
 
     print(f"[4/6] Generating English voiceover ({style_key})...")
-    asyncio.run(synthesize_voice(script_data["narration"], audio_path, srt_path))
+    # **word** markers are the script's own emphasis: spoken without them,
+    # highlighted on screen instead.
+    narration, marked_words = telop.strip_emphasis_markers(script_data["narration"])
+    asyncio.run(
+        synthesize_voice(narration, audio_path, srt_path, words_path=words_path)
+    )
 
     vertical = raw_vertical
     finale_plan = None
@@ -372,10 +471,23 @@ def _publish_bundle(
             f"{finale_plan['total_seconds']:.1f}s"
         )
 
-    print("[5/6] Burning subtitles and mixing audio...")
+    print("[5/6] Laying out the telop and mixing audio...")
     keep_audio = should_keep_audio(style_key)
+    video_seconds = float((finale_plan or {}).get("total_seconds") or 0.0)
+    if video_seconds <= 0:
+        video_seconds = probe_duration(vertical)
+    telop_path = write_telop(
+        base_name=base_name,
+        output_dir=output_dir,
+        script_data=script_data,
+        config=config,
+        video_seconds=video_seconds,
+        marked=marked_words,
+    )
     mux_audio_and_subtitles(
-        vertical, audio_path, srt_path, final_video, keep_original_audio=keep_audio
+        vertical, audio_path, srt_path, final_video,
+        keep_original_audio=keep_audio,
+        ass_path=telop_path,
     )
 
     print("[6/6] Writing the English metadata bundle...")
@@ -420,6 +532,8 @@ def _publish_bundle(
         "vertical": raw_vertical,
         "audio": audio_path,
         "srt": srt_path,
+        "words": words_path,
+        "telop": telop_path,
         "final_video": final_video,
         "artwork": artwork_path,
         "metadata_text": metadata_paths["text"],

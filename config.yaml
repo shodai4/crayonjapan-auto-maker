@@ -39,3 +39,14 @@ youtube:
   default_privacy: "unlisted"
   category_id: "22"
   default_language: "en"
+
+# On-screen telop (see telop.py). `enabled: false` falls back to the plain SRT
+# cues; nothing else in the render depends on this block.
+telop:
+  enabled: true
+  # Shown small at the top of every Short, in front of the artwork title.
+  series_label: "CrayonJapan"
+  # Closing line, over the silent zoom onto the finished artwork.
+  cta_text: "Follow for more oil pastel art!"
+  # Empty = auto-detect (DejaVu Sans on the runner, Liberation Sans locally).
+  font: ""
