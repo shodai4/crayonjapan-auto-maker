@@ -1,18 +1,22 @@
 name: CrayonJapan auto-edit
 
-# Two ways in:
+# Three ways in:
 #   repository_dispatch  - the Apps Script trigger sees a new file in 01_RAW_VIDEO
 #                          and posts {"event_type": "raw_video_uploaded"}
+#   schedule             - daily check at 13:00 UTC (22:00 JST) so queued GO_
+#                          folders publish automatically once 48h have passed
 #   workflow_dispatch    - a manual run from the Actions tab or `gh workflow run`
 #
-# The run scans 01_RAW_VIDEO, renders every waiting recording with FFmpeg +
-# OpenCV + Gemini, writes the package into 02_READY_TO_POST and moves the raw
-# file to 03_ARCHIVE. No YouTube upload: --no-upload keeps the finished Short
-# waiting for a human to post it.
+# The run checks the 48-hour interval against YouTube. If elapsed, it renders
+# up to 1 waiting recording from 01_RAW_VIDEO, uploads it as a public Short to
+# @CrayonJapan, writes the package into 02_READY_TO_POST, and moves the raw
+# folder to 03_ARCHIVE.
 
 on:
   repository_dispatch:
     types: [raw_video_uploaded]
+  schedule:
+    - cron: "0 13 * * *"
   workflow_dispatch:
     inputs:
       note:
@@ -31,7 +35,7 @@ concurrency:
 
 jobs:
   edit:
-    name: Render the waiting recording
+    name: Render and publish the next waiting recording
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
@@ -42,6 +46,7 @@ jobs:
       DRIVE_ARCHIVE_FOLDER_ID: ${{ secrets.DRIVE_ARCHIVE_FOLDER_ID }}
       GDRIVE_TOKEN_JSON: ${{ secrets.GDRIVE_TOKEN_JSON }}
       GDRIVE_ACCESS_TOKEN: ${{ github.event.client_payload.drive_token }}
+      YOUTUBE_TOKEN_JSON: ${{ secrets.YOUTUBE_TOKEN_JSON }}
     steps:
       - name: Mask the one-time Drive token
         run: |
@@ -78,8 +83,8 @@ jobs:
       - name: Check Drive credentials
         run: python scripts/verify_drive_access.py
 
-      - name: Render every waiting recording
-        run: python main.py --drive-once --no-upload
+      - name: Render and upload next waiting recording (48h gate)
+        run: python main.py --drive-once
 
       - name: Keep the rendered package for inspection
         if: ${{ always() && hashFiles('output/**') != '' }}
