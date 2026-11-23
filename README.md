@@ -66,7 +66,7 @@ the plain SRT cues. Every rule below is covered by `tests/test_telop.py`.
 | what | how |
 | --- | --- |
 | Reading comfort | at most **two lines** per card, **one message** per card, and cards close on a sentence end. Lines break on word boundaries only; a card's trailing `.` / `,` / `;` is dropped (`!` and `?` stay, they carry the tone). A card that would flash by in under 0.85 s is merged into a neighbour. |
-| Placement | the caption band sits `MarginV = 380` from the bottom with 170 px side margins, so it clears the Shorts title/description, the like-comment-share column (140 px) and the top bar. The hook and the closing line live in the upper band (380-560 px) and the fixed title at 180 px, which keeps the middle of the frame - the drawing - clear. |
+| Placement | the caption band sits `MarginV = 380` from the bottom with 170 px side margins, so it clears the Shorts title/description, the like-comment-share column (140 px) and the top bar. The hook (300 px) and the closing line (400 px) live in the upper band and the fixed title at 180 px, which keeps the middle of the frame - the drawing - clear. |
 | Type | DejaVu Sans Bold (auto-detected; Liberation Sans as the fallback) with a black outline and a drop shadow, legible on white paper and on saturated colour. |
 | Emphasis | a keyword or a number is gold and 106 % (gold `&H14C8FF&`); the script can also mark its own words with `**word**`, which are removed before synthesis and highlighted on screen. |
 | Karaoke | one overlay per spoken word, on a layer above the card: that word turns gold, grows to 124 % and gets an underline, then the next word takes over. |
