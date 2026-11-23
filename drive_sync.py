@@ -726,6 +726,7 @@ def sync_once(
     state_path: str = DEFAULT_STATE_PATH,
     min_age_seconds: int = DEFAULT_MIN_AGE_SECONDS,
     go_min_age_seconds: int = DEFAULT_GO_FOLDER_MIN_AGE_SECONDS,
+    max_items: Optional[int] = None,
     keep_local_raw: bool = True,
     now: Optional[datetime] = None,
     downloader: Optional[Callable[[object, str, str], str]] = None,
@@ -747,6 +748,11 @@ def sync_once(
     An item is only marked done after its artifacts are uploaded *and* the
     source has been moved to 03_ARCHIVE, so an interruption repeats at most one
     render instead of silently losing a drawing.
+
+    ``max_items`` caps how many items are rendered in this one scan (the
+    posting rhythm keeps it at one): items are taken in the deterministic order
+    ``list_pending_raw_items`` returns, and everything after the cap stays in
+    01_RAW_VIDEO untouched for the next run.
     """
     download = downloader or (lambda svc, fid, path: download_video(svc, fid, path))
     upload = uploader or (lambda svc, path, folder: upload_file(svc, path, folder))
@@ -755,15 +761,23 @@ def sync_once(
 
     state = load_state(state_path)
     results: List[dict] = []
+    attempted = 0
     try:
         items = list_pending_raw_items(service, folders.raw)
     except DriveSyncError as exc:
         log(f"[drive] could not list {RAW_FOLDER_ENV}: {exc}")
         return results
 
-    for item in items:
+    for index, item in enumerate(items):
         if not item.id or is_processed(state, item.id):
             continue
+        if max_items is not None and attempted >= max_items:
+            waiting = len(items) - index
+            log(
+                f"[drive] stopping after {attempted} item(s) (max {max_items} per "
+                f"run); {waiting} item(s) stay in {RAW_FOLDER_ENV} for the next run"
+            )
+            break
         if not item_is_settled(
             item, now=now,
             min_age_seconds=min_age_seconds,
@@ -788,6 +802,7 @@ def sync_once(
         )
         try:
             log(f"[drive] rendering {item.name} ({len(item.videos)} clip(s))")
+            attempted += 1
             artifacts = pipeline(source) or {}
         except Exception as exc:  # one bad item must not stop the watcher
             log(f"[drive] failed: {item.name}: {exc}")

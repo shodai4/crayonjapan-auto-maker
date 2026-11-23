@@ -12,7 +12,7 @@ import os
 import shutil
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Optional, Sequence
 
 import pandas as pd
@@ -46,7 +46,7 @@ from video_processor import (
     render_project_segment,
     run_command,
 )
-from youtube_uploader import upload_short
+from youtube_uploader import get_latest_upload_time, upload_short
 
 CONFIG_PATH = "config.yaml"
 CSV_PATH = "analytics/performance.csv"
@@ -790,8 +790,131 @@ def process_new_video(input_path: str, config: Optional[dict] = None) -> str:
     return bundle["video_id"]
 
 
+DEFAULT_MIN_INTERVAL_HOURS = 48.0
+DEFAULT_MAX_VIDEOS_PER_RUN = 1
+# ``latest=None`` means "the channel has no upload yet"; only this sentinel
+# means "ask the channel".
+_UNKNOWN = object()
+
+
+def schedule_settings(config: Optional[dict]) -> dict:
+    """The posting-rhythm block of config.yaml, with safe defaults.
+
+    ``enabled`` defaults to false so a config without the block keeps the old
+    "render everything waiting" behaviour; the shipped config turns it on.
+    """
+    raw = (config or {}).get("schedule") or {}
+    try:
+        min_hours = float(raw.get("min_interval_hours", DEFAULT_MIN_INTERVAL_HOURS))
+    except (TypeError, ValueError):
+        min_hours = DEFAULT_MIN_INTERVAL_HOURS
+    try:
+        per_run = int(raw.get("max_videos_per_run", DEFAULT_MAX_VIDEOS_PER_RUN))
+    except (TypeError, ValueError):
+        per_run = DEFAULT_MAX_VIDEOS_PER_RUN
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "min_interval_hours": max(min_hours, 0.0),
+        "max_videos_per_run": max(per_run, 1),
+    }
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """A naive timestamp is read as UTC; an aware one is converted to it."""
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def post_interval_state(
+    config: Optional[dict],
+    now: Optional[datetime] = None,
+    latest=_UNKNOWN,
+    loader=None,
+    log=print,
+) -> dict:
+    """May this run make and publish a Short, judged by the channel itself?
+
+    The newest video on the YouTube channel is the one source of truth for
+    "when did we last post" (``02_READY_TO_POST`` can hold a package from an
+    earlier test run and a Drive file time is only an upload). Returns
+    ``{allowed, reason, hours_elapsed, hours_left, settings}``. When the channel
+    cannot be read the run is held: posting blind could break the interval the
+    artist asked for, while a held run only waits for the next trigger.
+    """
+    settings = schedule_settings(config)
+    state = {
+        "allowed": True,
+        "reason": "schedule disabled",
+        "hours_elapsed": None,
+        "hours_left": None,
+        "settings": settings,
+    }
+    if not settings["enabled"]:
+        return state
+
+    read = loader or get_latest_upload_time
+    try:
+        newest = read() if latest is _UNKNOWN else latest
+    except Exception as exc:  # auth error, quota, network, unreadable timestamp
+        log(
+            f"[schedule] the newest upload on the channel could not be read ({exc}); "
+            "holding this run so nothing is posted without knowing the interval"
+        )
+        return {**state, "allowed": False, "reason": "unknown-latest-upload"}
+
+    if newest is None:
+        log("[schedule] the channel has no upload yet: the first Short may go out now")
+        return {**state, "reason": "no-upload-yet"}
+
+    reference = _as_utc(now or datetime.now(timezone.utc))
+    elapsed = (reference - _as_utc(newest)).total_seconds() / 3600.0
+    left = settings["min_interval_hours"] - elapsed
+    if left > 0:
+        log(
+            f"[schedule] the newest upload is {elapsed:.1f}h old; the interval is "
+            f"{settings['min_interval_hours']:g}h, so {left:.1f}h to go. Nothing is "
+            "rendered or posted this run (the GO_ folders stay in 01_RAW_VIDEO)."
+        )
+        return {
+            **state,
+            "allowed": False,
+            "reason": "too-soon",
+            "hours_elapsed": elapsed,
+            "hours_left": left,
+        }
+
+    log(
+        f"[schedule] the newest upload is {elapsed:.1f}h old: the "
+        f"{settings['min_interval_hours']:g}h interval has passed, so one Short "
+        "goes out this run"
+    )
+    return {**state, "reason": "interval-passed", "hours_elapsed": elapsed}
+
+
 def run_drive_mode(args, config: dict) -> int:
     """Phase 2: Google Drive folder in, upload-ready package out."""
+    schedule = schedule_settings(config)
+    ignore_schedule = getattr(args, "ignore_schedule", False) is True
+    max_items: Optional[int] = None
+
+    if args.drive_once and schedule["enabled"] and not ignore_schedule:
+        # The gate runs before Drive is even touched: a run that may not post
+        # has nothing to render, so it must not download, cut or upload either.
+        gate = post_interval_state(config, log=print)
+        if not gate["allowed"]:
+            if gate["reason"] == "unknown-latest-upload":
+                return 1
+            return 0
+        max_items = schedule["max_videos_per_run"]
+    elif args.drive_once and schedule["enabled"] and ignore_schedule:
+        print("[schedule] --ignore-schedule: the posting interval is not checked this run")
+    if args.drive_watch and schedule["enabled"] and not ignore_schedule:
+        print(
+            "[schedule] the interval gate belongs to --drive-once (the CI path); "
+            "this local watcher renders whatever is waiting"
+        )
+
     try:
         folders = drive_sync.load_drive_folders()
     except drive_sync.MissingFolderIdError as exc:
@@ -837,6 +960,7 @@ def run_drive_mode(args, config: dict) -> int:
         "state_path": args.drive_state,
         "min_age_seconds": args.drive_min_age,
         "go_min_age_seconds": args.drive_go_min_age,
+        "max_items": max_items,
     }
 
     if args.drive_once:
@@ -904,6 +1028,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--drive-state",
         default=drive_sync.DEFAULT_STATE_PATH,
         help="Processed-file log so the same drawing is never rendered twice",
+    )
+    parser.add_argument(
+        "--ignore-schedule",
+        action="store_true",
+        help=(
+            "Post even when the newest upload is younger than "
+            "schedule.min_interval_hours (emergency test runs only)"
+        ),
     )
     parser.add_argument(
         "--no-upload",

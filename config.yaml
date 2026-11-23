@@ -36,9 +36,21 @@ evolution:
       description: "Minimal narration, letting the satisfying oil pastel strokes and rhythm lead the video."
 
 youtube:
-  default_privacy: "unlisted"
+  default_privacy: "public"
   category_id: "22"
   default_language: "en"
+
+# Posting rhythm, applied by --drive-once (the CI path).
+#   enabled: true          -> before anything is downloaded or rendered, read the
+#                             newest upload on the channel; if it is younger than
+#                             min_interval_hours, the run exits 0 and the GO_
+#                             folders wait. Otherwise only max_videos_per_run of
+#                             them (oldest name first) are made and published.
+# `python main.py --drive-once --ignore-schedule` skips the interval check.
+schedule:
+  enabled: true
+  min_interval_hours: 48
+  max_videos_per_run: 1
 
 # On-screen telop (see telop.py). `enabled: false` falls back to the plain SRT
 # cues; nothing else in the render depends on this block.

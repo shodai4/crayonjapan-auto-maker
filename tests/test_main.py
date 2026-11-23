@@ -23,7 +23,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config["video"]["width"], 1080)
         self.assertEqual(config["video"]["height"], 1920)
         self.assertEqual(config["video"]["aspect_ratio"], "9:16")
-        self.assertEqual(config["youtube"]["default_privacy"], "unlisted")
+        self.assertEqual(config["youtube"]["default_privacy"], "public")
+        self.assertTrue(config["schedule"]["enabled"])
+        self.assertEqual(config["schedule"]["min_interval_hours"], 48)
+        self.assertEqual(config["schedule"]["max_videos_per_run"], 1)
         weights = sum(style["weight"] for style in config["evolution"]["styles"].values())
         self.assertAlmostEqual(weights, 1.0, places=6)
 
@@ -641,7 +644,8 @@ class DriveModeTests(unittest.TestCase):
 
     def test_missing_folder_ids_exit_with_a_hint(self):
         args = mock.Mock(no_upload=True, artwork_offset=0.0, drive_state="s.json",
-                         drive_min_age=60, drive_once=True, drive_interval=None)
+                         drive_min_age=60, drive_once=True, drive_interval=None,
+                         drive_watch=False, ignore_schedule=True)
         with mock.patch.object(drive_sync, "load_drive_folders", side_effect=drive_sync.MissingFolderIdError("DRIVE_RAW_FOLDER_ID is not set")), \
                 mock.patch.object(drive_sync, "build_drive_service") as build_service:
             self.assertEqual(main.run_drive_mode(args, self.config), 2)
@@ -649,7 +653,8 @@ class DriveModeTests(unittest.TestCase):
 
     def test_drive_once_passes_the_pipeline_and_reports(self):
         args = mock.Mock(no_upload=True, artwork_offset=1.5, drive_state="s.json",
-                         drive_min_age=30, drive_once=True, drive_interval=None)
+                         drive_min_age=30, drive_once=True, drive_interval=None,
+                         drive_watch=False, ignore_schedule=True)
         folders = drive_sync.DriveFolders("raw", "ready", "archive")
         source, writes = self._source()
         with mock.patch.object(drive_sync, "load_drive_folders", return_value=folders), \
@@ -671,7 +676,8 @@ class DriveModeTests(unittest.TestCase):
 
     def test_a_project_source_goes_to_the_project_pipeline(self):
         args = mock.Mock(no_upload=True, artwork_offset=0.0, drive_state="s.json",
-                         drive_min_age=30, drive_once=True, drive_interval=None)
+                         drive_min_age=30, drive_once=True, drive_interval=None,
+                         drive_watch=False, ignore_schedule=True)
         folders = drive_sync.DriveFolders("raw", "ready", "archive")
         source, writes = self._source(kind="project")
         with mock.patch.object(drive_sync, "load_drive_folders", return_value=folders), \
@@ -685,6 +691,210 @@ class DriveModeTests(unittest.TestCase):
             source, self.config, upload=False, artwork_offset_seconds=0.0
         )
         self.assertEqual(writes, [])
+
+
+class ScheduleSettingsTests(unittest.TestCase):
+    def test_the_shipped_config_posts_one_short_every_48_hours(self):
+        settings = main.schedule_settings(main.load_config(os.path.join(ROOT, "config.yaml")))
+        self.assertTrue(settings["enabled"])
+        self.assertEqual(settings["min_interval_hours"], 48.0)
+        self.assertEqual(settings["max_videos_per_run"], 1)
+
+    def test_a_config_without_the_block_keeps_rendering_everything(self):
+        self.assertEqual(
+            main.schedule_settings({}),
+            {"enabled": False, "min_interval_hours": 48.0, "max_videos_per_run": 1},
+        )
+
+    def test_broken_numbers_fall_back_instead_of_crashing(self):
+        settings = main.schedule_settings(
+            {"schedule": {"enabled": True, "min_interval_hours": "soon", "max_videos_per_run": "one"}}
+        )
+        self.assertEqual(settings["min_interval_hours"], 48.0)
+        self.assertEqual(settings["max_videos_per_run"], 1)
+
+    def test_a_zero_or_negative_cap_still_makes_one_video(self):
+        for value in (0, -3):
+            self.assertEqual(
+                main.schedule_settings({"schedule": {"max_videos_per_run": value}})[
+                    "max_videos_per_run"
+                ],
+                1,
+            )
+
+    def test_the_numbers_may_arrive_as_text(self):
+        settings = main.schedule_settings(
+            {"schedule": {"enabled": True, "min_interval_hours": "36", "max_videos_per_run": "2"}}
+        )
+        self.assertEqual(settings["min_interval_hours"], 36.0)
+        self.assertEqual(settings["max_videos_per_run"], 2)
+
+
+class PostIntervalTests(unittest.TestCase):
+    NOW = datetime(2026, 11, 23, 3, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.config = main.load_config(os.path.join(ROOT, "config.yaml"))
+        self.logs = []
+
+    def _state(self, latest=main._UNKNOWN, now=None, config=None, loader=None):
+        return main.post_interval_state(
+            config or self.config,
+            now=now or self.NOW,
+            latest=latest,
+            loader=loader,
+            log=self.logs.append,
+        )
+
+    def test_47_hours_after_the_last_post_is_too_soon(self):
+        state = self._state(self.NOW - timedelta(hours=47))
+        self.assertFalse(state["allowed"])
+        self.assertEqual(state["reason"], "too-soon")
+        self.assertAlmostEqual(state["hours_elapsed"], 47.0)
+        self.assertAlmostEqual(state["hours_left"], 1.0)
+        self.assertTrue(any("Nothing is rendered or posted" in line for line in self.logs))
+
+    def test_the_first_hour_is_too_soon(self):
+        state = self._state(self.NOW - timedelta(minutes=30))
+        self.assertFalse(state["allowed"])
+        self.assertAlmostEqual(state["hours_left"], 47.5)
+
+    def test_exactly_48_hours_lets_one_short_go(self):
+        state = self._state(self.NOW - timedelta(hours=48))
+        self.assertTrue(state["allowed"])
+        self.assertEqual(state["reason"], "interval-passed")
+
+    def test_a_long_gap_lets_one_short_go(self):
+        state = self._state(self.NOW - timedelta(days=4, hours=2))
+        self.assertTrue(state["allowed"])
+        self.assertAlmostEqual(state["hours_elapsed"], 98.0)
+
+    def test_a_channel_with_no_upload_lets_the_first_short_go(self):
+        state = self._state(None)
+        self.assertTrue(state["allowed"])
+        self.assertEqual(state["reason"], "no-upload-yet")
+
+    def test_the_channel_reader_is_used_when_no_time_is_handed_in(self):
+        state = self._state(main._UNKNOWN, loader=lambda: self.NOW - timedelta(hours=10))
+        self.assertFalse(state["allowed"])
+        self.assertAlmostEqual(state["hours_left"], 38.0)
+
+    def test_an_unreadable_channel_holds_the_run(self):
+        def boom():
+            raise RuntimeError("401 invalid_credentials")
+
+        state = self._state(main._UNKNOWN, loader=boom)
+        self.assertFalse(state["allowed"])
+        self.assertEqual(state["reason"], "unknown-latest-upload")
+        self.assertTrue(any("401 invalid_credentials" in line for line in self.logs))
+
+    def test_a_disabled_schedule_never_holds_the_run(self):
+        config = dict(self.config)
+        config["schedule"] = {"enabled": False, "min_interval_hours": 48}
+        state = self._state(self.NOW - timedelta(minutes=5), config=config)
+        self.assertTrue(state["allowed"])
+        self.assertEqual(state["reason"], "schedule disabled")
+
+    def test_a_naive_clock_is_read_as_utc(self):
+        state = self._state((self.NOW - timedelta(hours=12)).replace(tzinfo=None))
+        self.assertFalse(state["allowed"])
+        self.assertAlmostEqual(state["hours_left"], 36.0)
+
+    def test_the_interval_can_be_measured_from_an_aware_jst_clock(self):
+        jst = timezone(timedelta(hours=9))
+        now_jst = self.NOW.astimezone(jst)
+        state = self._state(self.NOW - timedelta(hours=50), now=now_jst)
+        self.assertTrue(state["allowed"])
+        self.assertAlmostEqual(state["hours_elapsed"], 50.0)
+
+
+class DriveOnceScheduleTests(unittest.TestCase):
+    def setUp(self):
+        self.config = main.load_config(os.path.join(ROOT, "config.yaml"))
+        self.folders = drive_sync.DriveFolders("raw", "ready", "archive")
+
+    def _args(self, **overrides):
+        values = dict(
+            no_upload=True, artwork_offset=0.0, drive_state="s.json",
+            drive_min_age=60, drive_go_min_age=5, drive_once=True,
+            drive_interval=None, drive_watch=False, ignore_schedule=False,
+        )
+        values.update(overrides)
+        return mock.Mock(**values)
+
+    def _drive(self, args, gate=None, sync_results=None):
+        gate = gate if gate is not None else {
+            "allowed": True,
+            "reason": "interval-passed",
+            "hours_elapsed": 50.0,
+            "hours_left": None,
+            "settings": main.schedule_settings(self.config),
+        }
+        with mock.patch.object(main, "post_interval_state", return_value=gate) as gate_mock, \
+                mock.patch.object(drive_sync, "load_drive_folders", return_value=self.folders) as folders, \
+                mock.patch.object(drive_sync, "build_drive_service", return_value=object()), \
+                mock.patch.object(drive_sync, "watch", return_value=[]) as watch, \
+                mock.patch.object(
+                    drive_sync, "sync_once", return_value=sync_results or [{"status": "done"}]
+                ) as sync:
+            code = main.run_drive_mode(args, self.config)
+        return code, gate_mock, folders, sync, watch
+
+    def test_too_soon_exits_cleanly_without_touching_drive(self):
+        code, gate, folders, sync, _ = self._drive(
+            self._args(),
+            gate={"allowed": False, "reason": "too-soon", "hours_left": 1.0},
+        )
+        self.assertEqual(code, 0)
+        gate.assert_called_once()
+        folders.assert_not_called()
+        sync.assert_not_called()
+
+    def test_an_unknown_latest_upload_fails_the_run_instead_of_posting(self):
+        code, gate, folders, sync, _ = self._drive(
+            self._args(),
+            gate={"allowed": False, "reason": "unknown-latest-upload"},
+        )
+        self.assertEqual(code, 1)
+        folders.assert_not_called()
+        sync.assert_not_called()
+
+    def test_the_interval_lets_one_video_through_per_run(self):
+        code, _, _, sync, _ = self._drive(self._args())
+        self.assertEqual(code, 0)
+        self.assertEqual(sync.call_args.kwargs["max_items"], 1)
+
+    def test_ignore_schedule_skips_the_gate_and_the_cap(self):
+        code, gate, _, sync, _ = self._drive(self._args(ignore_schedule=True))
+        self.assertEqual(code, 0)
+        gate.assert_not_called()
+        self.assertIsNone(sync.call_args.kwargs["max_items"])
+
+    def test_a_disabled_schedule_is_not_even_asked(self):
+        config = dict(self.config)
+        config["schedule"] = {"enabled": False}
+        self.config = config
+        code, gate, _, sync, _ = self._drive(self._args())
+        self.assertEqual(code, 0)
+        gate.assert_not_called()
+        self.assertIsNone(sync.call_args.kwargs["max_items"])
+
+    def test_the_watcher_is_not_capped(self):
+        code, gate, _, sync, watch = self._drive(self._args(drive_once=False, drive_watch=True))
+        self.assertEqual(code, 0)
+        gate.assert_not_called()
+        sync.assert_not_called()
+        watch.assert_called_once()
+        self.assertIsNone(watch.call_args.kwargs["max_items"])
+
+    def test_the_ignore_schedule_flag_reaches_drive_mode(self):
+        with mock.patch.object(main, "run_drive_mode", return_value=0) as drive, \
+                mock.patch.object(main, "load_config", return_value=self.config), \
+                mock.patch("dotenv.load_dotenv"):
+            main.main(["--drive-once", "--ignore-schedule"])
+        args = drive.call_args.args[0]
+        self.assertTrue(args.drive_once)
+        self.assertTrue(args.ignore_schedule)
 
 
 if __name__ == "__main__":

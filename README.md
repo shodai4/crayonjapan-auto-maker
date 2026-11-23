@@ -39,7 +39,8 @@ viewers actually watch.
    shop block every time (`Original artwork available at: <shop url>` and
    `1点ものの原画はこちらで販売中です：<shop url>`, in front of the hashtags), so the link to the
    BASE shop where the original is sold cannot go missing from a Short; then the Short is
-   uploaded (unlisted by default) and one row is appended to `analytics/performance.csv`.
+   uploaded (`public` by default, see `config.yaml`) and one row is appended to
+   `analytics/performance.csv`.
    A plain-text upload pack and an `art_metadata.json` are written next to the video.
 8. **Learning loop** – `analytics_updater.py` refreshes views / likes / comments from the
    YouTube Data API and the average view percentage from the YouTube Analytics API.
@@ -47,7 +48,8 @@ viewers actually watch.
    so the other styles keep getting a chance.
 9. **Google Drive hub (phase 2)** – `drive_sync.py` watches a Drive folder, renders each
    waiting artwork (a `GO_` project folder or a loose recording) and drops the finished
-   package into a second folder, then moves the source into an archive folder. See
+   package into a second folder, then moves the source into an archive folder. A run only
+   makes **one** Short and only when the last one is at least **48 h** old. See
    *Google Drive hub* below.
 
 ## Requirements
@@ -96,6 +98,7 @@ pip install -r requirements.txt
    DRIVE_RAW_FOLDER_ID=...       # only needed for --drive-once / --drive-watch
    DRIVE_READY_FOLDER_ID=...
    DRIVE_ARCHIVE_FOLDER_ID=...
+   # in CI only: the content of token.json as one JSON string (YOUTUBE_TOKEN_JSON)
    ```
 
 2. Download the OAuth client JSON from Google Cloud Console and save it as
@@ -115,6 +118,7 @@ python main.py --input clip.mp4      # process one file and exit (handy for test
 python main.py --drive-once          # scan the Drive raw folder once, then exit
 python main.py --drive-watch         # keep scanning the Drive raw folder
 python main.py --drive-once --no-upload   # render + metadata only, no YouTube upload
+python main.py --drive-once --ignore-schedule   # post even inside the 48 h window (test runs)
 python analytics_updater.py          # refresh views / likes / comments / avg view %
 ```
 
@@ -179,8 +183,20 @@ before (one recording, artwork from its last frame).
 
 ### One scan cycle
 
-1. lists `01_RAW_VIDEO` and picks up every `GO_` folder plus any loose video that is not
-   already processed;
+With `schedule.enabled: true` in `config.yaml` a `--drive-once` run is a **posting slot**, not
+a queue drain: it first reads the newest video on the channel and only then touches Drive.
+
+0. **interval gate** – `channels.list(part="contentDetails", mine=True)` gives the uploads
+   playlist, `playlistItems.list(maxResults=1)` its newest entry, and that
+   `snippet.publishedAt` is the last posting moment. Younger than `min_interval_hours` (48 h):
+   the run logs how long is left and exits 0 without downloading, rendering or uploading
+   anything. The channel is the only source used: a local file time or an old
+   `02_READY_TO_POST` package from a test run would say the wrong thing. If the channel cannot
+   be read (expired token, quota, network) the run is held and exits 1, because posting
+   without knowing the interval could break it. No video on the channel at all: the first
+   Short may go out right away.
+1. lists `01_RAW_VIDEO` and picks up `GO_` folders plus any loose video that is not already
+   processed, oldest name first;
 2. skips a loose video modified in the last 60 s (`--drive-min-age`) so a still-uploading file
    is never downloaded half-finished; a `GO_` folder only waits a few seconds after its rename,
    because the rename itself is the "done" signal;
@@ -195,17 +211,27 @@ before (one recording, artwork from its last frame).
    `drive_state.json`, so an interrupted run repeats at most one artwork instead of
    re-rendering everything.
 
-`--drive-interval` (or `DRIVE_WATCH_INTERVAL_SECONDS`) sets the scan interval; the default is
-60 s. `--no-upload` leaves the YouTube upload to you: the package simply waits in
-`02_READY_TO_POST` until you check it on your phone. Without it the Short is uploaded unlisted
-(`config.yaml`), so nothing goes public by itself.
+The slot is worth **`max_videos_per_run` (1)** artwork: only the oldest waiting item is rendered
+and published, and everything else stays in `01_RAW_VIDEO` for the next slot. So the artist can
+keep dropping `GO_` folders all day and the channel still gets one Short every 48 h, in the
+order the drawings were made.
+
+`--drive-interval` (or `DRIVE_WATCH_INTERVAL_SECONDS`) sets the scan interval of
+`--drive-watch`; the default is 60 s. The interval gate belongs to `--drive-once` (the CI path);
+the local watcher is for testing and renders whatever is waiting. `--no-upload` leaves the
+YouTube upload out: the package simply waits in `02_READY_TO_POST` for you to check it on your
+phone (the 48 h gate still applies, so use `--ignore-schedule` for a test render inside the
+window). Without `--no-upload` the Short is uploaded with `youtube.default_privacy` from
+`config.yaml`, which is `public`: the run publishes by itself.
 
 ## Hand-off mode: Apps Script + GitHub Actions
 
 No always-on PC. `gas/Code_drive_watch.gs` is pasted into the Apps Script project that already
 runs the message-board relay; its 1-minute trigger watches `01_RAW_VIDEO` and posts a
 `repository_dispatch` (`raw_video_uploaded`) to this repository. `.github/workflows/auto-edit.yml`
-then runs the same `--drive-once --no-upload` pipeline on a free `ubuntu-latest` runner:
+then runs the same `--drive-once` pipeline on a free `ubuntu-latest` runner (the posting
+interval and the one-Short-per-run cap come from `config.yaml`, so nothing has to be passed on
+the command line):
 
 ```
 phone → 01_RAW_VIDEO (GO_ folder) → Apps Script (1 min) → repository_dispatch
@@ -218,8 +244,11 @@ Apps Script script properties: `RAW_FOLDER_ID`, `GITHUB_REPO` (`owner/repo`) and
 a `repository_dispatch` from a token that can write code — and no other permission).
 
 Repository secrets: `GEMINI_API_KEY`, `DRIVE_RAW_FOLDER_ID`, `DRIVE_READY_FOLDER_ID`,
-`DRIVE_ARCHIVE_FOLDER_ID`, plus one Drive credential:
+`DRIVE_ARCHIVE_FOLDER_ID`, `YOUTUBE_TOKEN_JSON`, plus one Drive credential:
 
+- `YOUTUBE_TOKEN_JSON` – the content of `token.json` pasted as one JSON string. The runner has
+  no `token.json`, so this is how the interval check reads the channel and how the upload
+  authenticates; an expired token is refreshed from the `refresh_token` inside it.
 - `GDRIVE_TOKEN_JSON` – the content of `drive_token.json`; long-lived, lets a scheduled or manual
   run work on its own.
 - or nothing at all: each dispatch carries `GDRIVE_ACCESS_TOKEN`, a Drive access token minted by
@@ -329,5 +358,7 @@ tests/                   unittest suite
 - The mix uses `amix=...:normalize=0`, which needs FFmpeg 4.4 or newer.
 - A freshly uploaded Short has no Analytics rows for a while; until then its
   `avg_view_percentage` stays at its previous (or 0) value and the update is only logged.
-- `default_privacy` is `unlisted` in `config.yaml`; set it to `public` when you are ready for
-  the Short to go live immediately.
+- `default_privacy` is `public` in `config.yaml`, so a run that passes the 48 h gate publishes
+  the Short immediately; set it back to `unlisted` if you want to look at it first. Nothing is
+  published by a run that is inside the interval, and `--ignore-schedule` is the only way to
+  post early.

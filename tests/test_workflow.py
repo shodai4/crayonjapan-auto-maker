@@ -52,7 +52,10 @@ class AutoEditWorkflowTests(unittest.TestCase):
         runs = [str(step.get("run", "")) for step in self.document["jobs"]["edit"]["steps"]]
         joined = "\n".join(runs)
         self.assertIn("unittest discover -s tests -t .", joined)
-        self.assertIn("python main.py --drive-once --no-upload", joined)
+        # `--no-upload` may or may not be there: the workflow is edited in the
+        # browser separate from this code, and with the posting schedule the
+        # run is meant to publish.
+        self.assertIn("python main.py --drive-once", joined)
         self.assertLess(
             joined.index("unittest discover"),
             joined.index("python main.py --drive-once"),

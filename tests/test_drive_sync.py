@@ -593,6 +593,44 @@ class SyncOnceTests(unittest.TestCase):
                 log=self.logs.append,
             )
         self.assertEqual(results[0]["status"], "publish_failed")
+
+    def test_max_items_renders_one_and_leaves_the_rest_in_the_raw_folder(self):
+        items = [
+            project_item("folder1", "GO_20261121_sushi"),
+            project_item("folder2", "GO_20261122_waffle"),
+            project_item("folder3", "GO_20261123_pokemon"),
+        ]
+        results, _, _, mover = self._run(items=items, max_items=1)
+
+        self.assertEqual([result["file_id"] for result in results], ["folder1"])
+        self.assertEqual([source.item_id for source in self.sources], ["folder1"])
+        mover.assert_called_once_with(mock.ANY, "folder1", FOLDERS.archive, FOLDERS.raw)
+        self.assertTrue(any("2 item(s) stay" in line for line in self.logs))
+        state = ds.load_state(self.state_path)
+        self.assertTrue(ds.is_processed(state, "folder1"))
+        self.assertFalse(ds.is_processed(state, "folder2"))
+        self.assertFalse(ds.is_processed(state, "folder3"))
+
+    def test_a_skipped_item_does_not_use_up_the_one_video_cap(self):
+        items = [
+            project_item("folder0", "GO_20261120_just_renamed", age_seconds=1),
+            project_item("folder1", "GO_20261121_sushi"),
+        ]
+        results, _, _, mover = self._run(items=items, max_items=1)
+
+        self.assertEqual([result["file_id"] for result in results], ["folder1"])
+        mover.assert_called_once_with(mock.ANY, "folder1", FOLDERS.archive, FOLDERS.raw)
+
+    def test_without_a_cap_every_waiting_item_is_rendered(self):
+        items = [
+            project_item("folder1", "GO_20261121_sushi"),
+            project_item("folder2", "GO_20261122_waffle"),
+        ]
+        results, _, _, mover = self._run(items=items)
+
+        self.assertEqual([result["file_id"] for result in results], ["folder1", "folder2"])
+        self.assertEqual(mover.call_count, 2)
+        self.assertFalse(any("stopping after" in line for line in self.logs))
         self.assertEqual(len(results[0]["uploaded"]), 4)
         self.assertFalse(ds.is_processed(ds.load_state(self.state_path), "file1"))
 
