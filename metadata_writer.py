@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -25,6 +26,70 @@ ART_METADATA_SUFFIX = "_art_metadata.json"
 # Shown inside the pack when Gemini sent no Japanese for a field, so a missing
 # translation is visible instead of silently blank.
 TRANSLATION_MISSING = "（日本語訳なし）"
+
+# The shop line is not left to the model. Every description ends with the same
+# two-language call to action, before the hashtags, so the link to the BASE
+# shop - where the one-of-a-kind original is sold - cannot go missing from a
+# Short and reads the same on every upload.
+SHOP_CTA_EN = "Original artwork available at:\n{url}"
+SHOP_CTA_JA = "1点ものの原画はこちらで販売中です：\n{url}"
+# A line holding the shop link is a shop line (and is replaced by the block
+# above) when what is left of it after the URL is this short.
+SHOP_LINE_MAX_REMAINDER = 45
+_URL = re.compile(r"https?://\S+")
+
+
+def _url_needle(url: str) -> str:
+    """The URL without its scheme or trailing slash, for a forgiving lookup."""
+    return re.sub(r"^https?://", "", str(url or "").strip()).rstrip("/")
+
+
+def _line_has_url(line: str, url: str) -> bool:
+    needle = _url_needle(url)
+    return bool(needle) and needle.lower() in re.sub(r"https?://", "", line).lower()
+
+
+def _split_hashtags(text: str):
+    """The description body and the trailing hashtag block."""
+    lines = text.splitlines()
+    index = len(lines)
+    while index > 0 and lines[index - 1].lstrip().startswith("#"):
+        index -= 1
+    return "\n".join(lines[:index]).strip(), "\n".join(lines[index:]).strip()
+
+
+def _drop_shop_only_lines(text: str, url: str) -> str:
+    """Remove a line that only said "shop: <url>" - the block says it better."""
+    kept: List[str] = []
+    for line in text.splitlines():
+        if _line_has_url(line, url):
+            remainder = _URL.sub("", line).strip(" :：-–—|•·\t")
+            if len(remainder) <= SHOP_LINE_MAX_REMAINDER:
+                continue
+        kept.append(line)
+    return "\n".join(kept).strip()
+
+
+def ensure_shop_cta(description: object, shop_url: object) -> str:
+    """The description with the BASE shop link and the original-sale line.
+
+    Applied to the Gemini reply before the pack and the upload are built, so
+    both carry the same call to action. Idempotent: a description that already
+    holds the block is returned untouched.
+    """
+    text = str(description or "").strip()
+    url = str(shop_url or "").strip()
+    if not url:
+        return text
+    english = SHOP_CTA_EN.format(url=url)
+    japanese = SHOP_CTA_JA.format(url=url)
+    if english in text and japanese in text:
+        return text
+
+    body, hashtags = _split_hashtags(text)
+    body = _drop_shop_only_lines(body, url)
+    block = f"{english}\n\n{japanese}"
+    return "\n\n".join(part for part in (body, block, hashtags) if part)
 
 
 def _clean(value: object) -> str:
@@ -62,7 +127,7 @@ def build_art_metadata(
         "artwork_id": _clean(base_name),
         "artwork_title": _clean(script_data.get("title")),
         "hook_text": _clean(script_data.get("hook_text")),
-        "description_en": _clean(script_data.get("description")),
+        "description_en": ensure_shop_cta(script_data.get("description"), shop_url),
         "narration_en": _clean(script_data.get("narration")),
         # Japanese translations, for the artist's check before posting.
         "artwork_title_ja": _clean(script_data.get("title_ja")),

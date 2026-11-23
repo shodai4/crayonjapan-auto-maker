@@ -58,8 +58,25 @@ def style_rows(ass_text):
 
 
 def visible_text(ass_line):
-    """The words a viewer sees on one dialogue line (tags removed)."""
-    return re.sub(r"\{[^}]*\}", "", ass_line.replace("\\N", " ")).strip()
+    """The words a viewer sees on one dialogue line (tags and spacing removed)."""
+    return re.sub(r"\{[^}]*\}", "", ass_line.replace("\\N", " ")).replace("\\h", "").strip()
+
+
+def runs(ass_line):
+    """(tags, text) for every run of one dialogue line."""
+    return re.findall(r"\{([^{}]*)\}([^{}]*)", ass_line)
+
+
+def shown_words(ass_line):
+    """The runs a viewer can see: the highlighted word and the plain ones.
+
+    The karaoke overlay hides every other word with ``\alpha&HFF&``, so what is
+    left is the word being spoken (the hard spaces around it are dropped).
+    """
+    return [
+        text for tags, text in runs(ass_line)
+        if "\\alpha&HFF&" not in tags and text.strip() and text.strip() != "\\h"
+    ]
 
 
 class CardTests(unittest.TestCase):
@@ -251,7 +268,8 @@ class MotionTests(unittest.TestCase):
     def test_an_overlay_shows_one_word_and_hides_the_rest(self):
         overlays = [row for row in self.rows if row["layer"] == 1]
         first = overlays[0]
-        self.assertIn("\\fscx124", first["text"])
+        self.assertIn(f"\\fscx{telop.KARAOKE_SCALE}", first["text"])
+        self.assertNotIn("\\fscx124", first["text"])
         self.assertEqual(first["text"].count("\\alpha&HFF&"), len(visible_text(first["text"]).split()) - 1)
         self.assertEqual(visible_text(first["text"]).split()[0], "The")
 
@@ -408,6 +426,223 @@ class TimingTests(unittest.TestCase):
 
     def test_an_unreadable_timings_file_is_simply_empty(self):
         self.assertEqual(telop.load_word_timings("/nope/missing.json"), [])
+
+
+class HookFitTests(unittest.TestCase):
+    """Fix 1: the hook is the promise of the Short, so it is never cut."""
+
+    HOOK = "Thick textures make childhood memories pop"
+
+    def ass(self, hook_text=HOOK, video_seconds=8.0):
+        return telop.build_telop_ass([], hook_text=hook_text, video_seconds=video_seconds)
+
+    def hook_row(self, ass_text):
+        return next(row for row in dialogues(ass_text) if row["style"] == "Hook")
+
+    def hook_size(self, row):
+        match = re.search(r"\\fs(\d+)", row["text"])
+        return telop.HOOK_FONT_SIZE if match is None else int(match.group(1))
+
+    def hook_lines(self, row):
+        return [visible_text(part) for part in row["text"].split("\\N")]
+
+    def test_the_hook_keeps_its_whole_sentence(self):
+        row = self.hook_row(self.ass())
+        self.assertNotIn("...", visible_text(row["text"]))
+        self.assertEqual(visible_text(row["text"]).split(), self.HOOK.split())
+
+    def test_a_hook_that_does_not_fit_shrinks_instead_of_losing_its_ending(self):
+        row = self.hook_row(self.ass())
+        size = self.hook_size(row)
+        self.assertLess(size, telop.HOOK_FONT_SIZE)
+        self.assertGreaterEqual(size, telop.HOOK_MIN_FONT_SIZE)
+
+    def test_a_hook_that_fits_still_uses_the_big_size(self):
+        row = self.hook_row(self.ass("One warm layer"))
+        self.assertEqual(self.hook_size(row), telop.HOOK_FONT_SIZE)
+        self.assertNotIn("\\N", row["text"])
+
+    def test_the_hook_prefers_two_lines_over_three(self):
+        lines = self.hook_lines(self.hook_row(self.ass()))
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(" ".join(lines).split(), self.HOOK.split())
+
+    def test_a_long_hook_may_use_three_lines_but_no_more(self):
+        long_hook = "Thick textures make childhood memories pop in every single line of this"
+        row = self.hook_row(self.ass(long_hook))
+        lines = self.hook_lines(row)
+        self.assertLessEqual(len(lines), telop.HOOK_MAX_LINES)
+        self.assertEqual(" ".join(lines).split(), long_hook.split())
+
+    def test_every_hook_line_fits_the_frame_at_its_pop(self):
+        for hook_text in (self.HOOK, "One warm layer", "Thick textures make childhood memories pop in every single line"):
+            row = self.hook_row(self.ass(hook_text))
+            layout = telop.hook_layout(telop.DEFAULT_FONT, self.hook_size(row))
+            for line in self.hook_lines(row):
+                popped = layout.width(line) * telop.HOOK_POP_SCALE
+                self.assertLessEqual(popped, telop.FRAME_WIDTH, line)
+                self.assertLessEqual(layout.width(line), telop.FRAME_WIDTH - 2 * telop.HOOK_SIDE_MARGIN + 1, line)
+
+    def test_the_hook_still_pops_in(self):
+        row = self.hook_row(self.ass())
+        self.assertIn("\\fscx45", row["text"])
+        self.assertIn("\\t(0,150", row["text"])
+
+
+class AccentedTitleTests(unittest.TestCase):
+    """Fix 2: only emoji and decoration are stripped, letters keep their accents."""
+
+    def test_the_title_keeps_the_accent_of_pokemon(self):
+        title = telop.clean_title(
+            "Turning a Pokémon Card into Thick Oil Pastel Art 🔥 #Shorts", "CrayonJapan"
+        )
+        self.assertIn("Pokémon", title)
+        self.assertNotIn("Pokmon", title)
+
+    def test_the_accent_survives_a_long_title_cut(self):
+        title = telop.clean_title(
+            "Pokémon Card Art with Thick Oil Pastels and a Warm Sky 🌸", "CrayonJapan"
+        )
+        self.assertIn("Pokémon", title)
+
+    def test_accents_and_typographic_marks_are_kept(self):
+        self.assertEqual(
+            telop._strip_emoji("Crème brûlée – naïve Zoë"), "Crème brûlée – naïve Zoë"
+        )
+
+    def test_emoji_and_decorative_symbols_are_still_dropped(self):
+        self.assertEqual(telop._strip_emoji("Warm 🌸 layer ✨🔥 ✦ → ♪"), "Warm layer")
+
+    def test_a_script_the_face_cannot_draw_is_dropped_with_the_emoji(self):
+        self.assertEqual(telop._strip_emoji("Blue ブルー sky"), "Blue sky")
+
+    def test_the_word_at_the_cut_is_not_dropped_when_it_is_whole(self):
+        title = telop.clean_title("Turning a Pokémon Card into Thick Oil Pastel Art", "CrayonJapan")
+        self.assertTrue(title.endswith("Pokémon..."), title)
+
+    def test_a_long_title_is_still_cut_on_a_word_boundary(self):
+        title = telop.clean_title(
+            "A wonderfully long title about creamy butter-yellow sakura petals",
+            "CrayonJapan",
+            max_chars=30,
+        )
+        self.assertLessEqual(len(title), 33)
+        self.assertTrue(title.endswith("..."))
+        self.assertNotIn("  ", title)
+
+
+class KaraokeSpacingTests(unittest.TestCase):
+    """Fix 3: the grown word keeps clear of the words on either side of it."""
+
+    NARRATION = "I sweep a creamy blue across the sky"
+
+    def setUp(self):
+        self.ass = telop.build_telop_ass(timed(self.NARRATION), video_seconds=8.0)
+
+    def overlay_showing(self, word):
+        for row in dialogues(self.ass):
+            if row["layer"] == 1 and shown_words(row["text"]) == [word]:
+                return row
+        self.fail(f"no overlay showed {word!r}")
+
+    def test_the_highlight_grows_by_a_size_the_gap_can_hold(self):
+        self.assertLessEqual(telop.KARAOKE_SCALE, 115)
+        space = telop.text_width(" ", telop.SUB_FONT_SIZE)
+        gap = space + telop.text_width(" ", telop.WORD_GAP_FONT_SIZE)
+        for word in ("blue", "creamy", "childhood"):
+            plain = telop.text_width(word, telop.SUB_FONT_SIZE)
+            growth_each_side = plain * (telop.KARAOKE_SCALE - 100) / 100.0 / 2
+            # the gap has to swallow the growth and both outlines
+            self.assertLess(growth_each_side + 2 * telop.SUB_OUTLINE, gap, word)
+
+    def test_every_word_gap_carries_the_extra_room(self):
+        row = self.overlay_showing("blue")
+        pad = "{\\r\\fs" + str(telop.WORD_GAP_FONT_SIZE) + "}\\h"
+        for card in telop.plan_cards(timed(self.NARRATION)):
+            self.assertEqual(
+                telop._card_text(card).count(pad),
+                sum(len(line) - 1 for line in card["lines"]),
+            )
+        self.assertIn(pad, row["text"])
+
+    def test_the_extra_room_is_smaller_than_the_caption_type(self):
+        self.assertLess(telop.WORD_GAP_FONT_SIZE, telop.SUB_FONT_SIZE)
+
+    def test_a_line_is_measured_with_the_room_it_is_drawn_with(self):
+        layout = telop.subtitle_layout()
+        self.assertGreater(layout.gap_px, 0)
+        self.assertGreater(layout.rendered_width("a b c"), layout.width("a b c"))
+        for card in telop.plan_cards(timed(self.NARRATION)):
+            for line in card["lines"]:
+                text = " ".join(card["words"][index]["text"] for index in line)
+                self.assertLessEqual(layout.rendered_width(text), layout.max_px, text)
+
+    def test_the_words_around_the_highlight_are_still_hidden(self):
+        row = self.overlay_showing("blue")
+        self.assertEqual(len(shown_words(row["text"])), 1)
+        self.assertIn("\\alpha&HFF&", row["text"])
+
+    def test_the_overlay_text_is_the_card_text_with_one_word_shown(self):
+        cards = telop.plan_cards(timed(self.NARRATION))
+        row = self.overlay_showing("blue")
+        expected = next(
+            [word["text"] for word in card["words"]]
+            for card in cards
+            if any(word["text"] == "blue" for word in card["words"])
+        )
+        self.assertEqual(visible_text(row["text"]).split(), expected)
+
+
+class ClosingLineTests(unittest.TestCase):
+    """Fix 4: the closing line is readable and off the top of the drawing."""
+
+    LATE = "a closing line that runs right up to the very last frame"
+
+    def rows(self, ass_text):
+        return [row for row in dialogues(ass_text) if row["style"] == "Cta"]
+
+    def late_ass(self):
+        words = timed(self.LATE, start=0.4)
+        return telop.build_telop_ass(
+            words, cta_text="Follow for more!", video_seconds=words[-1]["end"] + 1.0
+        ), words
+
+    def test_the_closing_line_keeps_its_reading_time_when_the_voice_runs_late(self):
+        ass, words = self.late_ass()
+        cta = self.rows(ass)[0]
+        self.assertGreaterEqual(cta["end"] - cta["start"], telop.CTA_MIN_SECONDS - 0.01)
+        self.assertAlmostEqual(cta["end"], words[-1]["end"] + 1.0 - telop.CTA_TAIL_SECONDS, places=2)
+
+    def test_the_reading_time_is_between_two_and_three_seconds(self):
+        self.assertGreaterEqual(telop.CTA_MIN_SECONDS, 2.0)
+        self.assertLessEqual(telop.CTA_MIN_SECONDS, 2.5)
+
+    def test_the_closing_line_sits_low_in_the_frame(self):
+        self.assertGreaterEqual(telop.CTA_MARGIN_V, telop.BOTTOM_SAFE)
+        self.assertLess(telop.CTA_MARGIN_V + 2 * telop.CTA_FONT_SIZE, telop.FRAME_HEIGHT // 2)
+
+    def test_the_closing_line_takes_the_caption_band_once_the_captions_have_left(self):
+        words = timed("a short line", start=0.5)
+        ass = telop.build_telop_ass(words, cta_text="Follow for more!", video_seconds=12.0)
+        cta = self.rows(ass)[0]
+        cards = telop.plan_cards(words)
+        self.assertGreaterEqual(cta["start"], cards[-1]["end"] - 0.01)
+        self.assertNotIn("\\pos(", cta["text"])
+
+    def test_the_closing_line_stacks_above_captions_still_on_screen(self):
+        ass, _ = self.late_ass()
+        cta = self.rows(ass)[0]
+        cards = telop.plan_cards(timed(self.LATE, start=0.4))
+        self.assertLess(cta["start"], cards[-1]["end"])
+        x, y = telop.FRAME_WIDTH // 2, telop.FRAME_HEIGHT - telop.CTA_STACKED_MARGIN_V
+        self.assertIn(f"\\pos({x},{y})", cta["text"])
+
+    def test_the_stacked_line_clears_two_caption_lines(self):
+        captions_top = telop.BOTTOM_SAFE + 2 * telop.SUB_FONT_SIZE
+        self.assertGreaterEqual(telop.CTA_STACKED_MARGIN_V, captions_top)
+
+    def test_the_closing_line_never_sits_where_the_hook_was(self):
+        self.assertGreater(telop.CTA_MARGIN_V, telop.HOOK_MARGIN_V)
 
 
 if __name__ == "__main__":

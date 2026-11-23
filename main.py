@@ -27,7 +27,7 @@ from ai_writer import (
     generate_making_script,
 )
 from analytics_updater import CSV_COLUMNS
-from metadata_writer import JST, write_metadata_files
+from metadata_writer import JST, ensure_shop_cta, write_metadata_files
 from video_processor import (
     DEFAULT_ARTWORK_OFFSET,
     ZOOM_OUTRO_SECONDS,
@@ -443,6 +443,11 @@ def _publish_bundle(
         frames = [artwork_path] + frames
     script_data = generate_making_script(
         frames, style_key, config, reference_scan=reference_scan
+    )
+    # The shop link and the "original artwork" line are put in here, not left to
+    # the model: the pack and the upload both read this same description.
+    script_data["description"] = ensure_shop_cta(
+        script_data.get("description"), config["brand"].get("shop_url", "")
     )
 
     print(f"[4/6] Generating English voiceover ({style_key})...")

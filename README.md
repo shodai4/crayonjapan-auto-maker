@@ -35,9 +35,12 @@ viewers actually watch.
    the caption track. The narration is measured after it is synthesised: if it runs
    longer than the planned cut, the closing zoom grows (3-8 s) so `-shortest` never cuts the
    last line, and the whole Short stays under the 58 s guard.
-7. **Upload + record** – the Short is uploaded (unlisted by default) and one row is appended
-   to `analytics/performance.csv`. A plain-text upload pack and an `art_metadata.json` are
-   written next to the video.
+7. **Shop call to action + upload** – the description is closed with the same two-language
+   shop block every time (`Original artwork available at: <shop url>` and
+   `1点ものの原画はこちらで販売中です：<shop url>`, in front of the hashtags), so the link to the
+   BASE shop where the original is sold cannot go missing from a Short; then the Short is
+   uploaded (unlisted by default) and one row is appended to `analytics/performance.csv`.
+   A plain-text upload pack and an `art_metadata.json` are written next to the video.
 8. **Learning loop** – `analytics_updater.py` refreshes views / likes / comments from the
    YouTube Data API and the average view percentage from the YouTube Analytics API.
    `choose_best_style()` then reuses the best-performing style, with a 25 % exploration rate
@@ -66,13 +69,13 @@ the plain SRT cues. Every rule below is covered by `tests/test_telop.py`.
 | what | how |
 | --- | --- |
 | Reading comfort | at most **two lines** per card, **one message** per card, and cards close on a sentence end. Lines break on word boundaries only; a card's trailing `.` / `,` / `;` is dropped (`!` and `?` stay, they carry the tone). A card that would flash by in under 0.85 s is merged into a neighbour. |
-| Placement | the caption band sits `MarginV = 380` from the bottom with 170 px side margins, so it clears the Shorts title/description, the like-comment-share column (140 px) and the top bar. The hook (300 px) and the closing line (400 px) live in the upper band and the fixed title at 180 px, which keeps the middle of the frame - the drawing - clear. |
+| Placement | the caption band sits `MarginV = 380` from the bottom with 170 px side margins, so it clears the Shorts title/description, the like-comment-share column (140 px) and the top bar. The hook lives in the upper band (300 px) and the fixed title at 180 px; the closing line takes the caption band once the captions have left, so the top edge of the drawing the zoom outro shows stays clear. |
 | Type | DejaVu Sans Bold (auto-detected; Liberation Sans as the fallback) with a black outline and a drop shadow, legible on white paper and on saturated colour. |
 | Emphasis | a keyword or a number is gold and 106 % (gold `&H14C8FF&`); the script can also mark its own words with `**word**`, which are removed before synthesis and highlighted on screen. |
-| Karaoke | one overlay per spoken word, on a layer above the card: that word turns gold, grows to 124 % and gets an underline, then the next word takes over. |
-| Hook | `hook_text` pops in (45 % -> 112 % -> 100 %) over the first 3 s. |
-| Fixed title | `CrayonJapan / <title>` (hashtags and emoji removed, cut on a word boundary) at 40 px, 60 % transparent, for the whole Short. |
-| Closing line | `telop.cta_text` from `config.yaml` over the outro (`Follow for more oil pastel art!`), popping in and holding until the last frame. |
+| Karaoke | one overlay per spoken word, on a layer above the card: that word turns gold, grows to 112 % (settling to 106 %) and gets an underline. Every word gap is drawn as a space plus a hard space, in the card and the overlay alike, because one space is not enough room for the grown word: at 124 % its outline ran into its neighbour (`creamyblue`). |
+| Hook | `hook_text` pops in (45 % -> 112 % -> 100 %) over the first 3 s, and always shows its whole sentence: when it does not fit at 96 px the font steps down 2 px at a time (never below 58 px) into two lines, or three when it needs them. It is never cut with an ellipsis. |
+| Fixed title | `CrayonJapan / <title>` (hashtags and emoji removed, accented letters like `é` kept, cut on a word boundary) at 40 px, 60 % transparent, for the whole Short. |
+| Closing line | `telop.cta_text` from `config.yaml` over the outro (`Follow for more oil pastel art!`), in the caption band for at least 2.4 s; when the narration runs so late that the captions are still on screen it stacks just above them instead of drawing gold over white. |
 
 `telop.enabled: false` in `config.yaml` puts the plain SRT burn back; `telop.font` pins a font
 family instead of the auto-detect. The SRT is written either way and stays in the upload pack.

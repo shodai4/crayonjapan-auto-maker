@@ -354,6 +354,20 @@ class ProcessVideoBundleTests(unittest.TestCase):
         self.assertIn(SCRIPT["title_ja"], text)
         self.assertIn(SCRIPT["hook_ja"], text)
 
+    def test_the_upload_description_carries_the_shop_call_to_action(self):
+        _, _, _, _, upload_short, _ = self._run(upload=True)
+        description = upload_short.call_args.args[1]["description"]
+        self.assertIn("Original artwork available at:", description)
+        self.assertIn("https://crayonjapan.base.shop/", description)
+        self.assertIn("1点ものの原画はこちらで販売中です", description)
+
+    def test_the_pack_description_carries_the_shop_call_to_action(self):
+        bundle, _, _, _, _, _ = self._run()
+        with open(bundle["metadata_text"], "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("Original artwork available at:", text)
+        self.assertIn("1点ものの原画はこちらで販売中です", text)
+
     def test_no_upload_skips_youtube_and_the_csv_row(self):
         bundle, _, _, _, upload_short, row = self._run(upload=False)
         upload_short.assert_not_called()

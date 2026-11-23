@@ -167,5 +167,79 @@ class WriteMetadataFilesTests(unittest.TestCase):
         self.assertTrue(os.path.exists(paths["json"]))
 
 
+class ShopCallToActionTests(unittest.TestCase):
+    """The BASE shop link and the original-for-sale line are guaranteed."""
+
+    URL = "https://crayonjapan.base.shop/"
+
+    def test_the_description_always_ends_with_the_shop_call_to_action(self):
+        text = mw.ensure_shop_cta("Just the story of one warm layer.", self.URL)
+        self.assertIn("Original artwork available at:", text)
+        self.assertIn(self.URL, text)
+        self.assertIn("1点ものの原画はこちらで販売中です", text)
+        self.assertTrue(text.startswith("Just the story"))
+
+    def test_a_shop_line_from_the_model_is_replaced_not_doubled(self):
+        gemini = (
+            "A one-of-a-kind original postcard made of creamy pastel.\n\n"
+            "Shop this original 1-of-1 postcard: https://crayonjapan.base.shop/\n\n"
+            "#SakuraCrayPas #OilPastelArt"
+        )
+        text = mw.ensure_shop_cta(gemini, self.URL)
+        self.assertNotIn("Shop this original 1-of-1 postcard", text)
+        # the English block and the Japanese block: one link each, no third one
+        self.assertEqual(text.count(self.URL), 2)
+        self.assertIn("Original artwork available at:", text)
+
+    def test_the_hashtags_stay_at_the_end(self):
+        gemini = "A warm story.\n\n#SakuraCrayPas #CrayPasSpecialist #OilPastelArt"
+        lines = mw.ensure_shop_cta(gemini, self.URL).splitlines()
+        self.assertTrue(lines[-1].startswith("#SakuraCrayPas"))
+        self.assertIn("1点ものの原画はこちらで販売中です", "\n".join(lines))
+
+    def test_a_story_sentence_that_mentions_the_shop_is_kept(self):
+        gemini = (
+            "Read the story at https://crayonjapan.base.shop/ where this original "
+            "postcard is waiting for its next home."
+        )
+        text = mw.ensure_shop_cta(gemini, self.URL)
+        self.assertIn("where this original postcard is waiting", text)
+        self.assertIn("Original artwork available at:", text)
+
+    def test_the_call_to_action_is_not_added_twice(self):
+        once = mw.ensure_shop_cta("A warm story.", self.URL)
+        self.assertEqual(mw.ensure_shop_cta(once, self.URL), once)
+
+    def test_a_url_without_scheme_or_slash_is_recognised(self):
+        gemini = "A warm story.\n\nShop: crayonjapan.base.shop\n\n#Shorts"
+        text = mw.ensure_shop_cta(gemini, self.URL)
+        self.assertNotIn("Shop: crayonjapan.base.shop", text)
+        self.assertEqual(text.count(self.URL), 2)
+
+    def test_without_a_shop_url_the_description_is_untouched(self):
+        self.assertEqual(mw.ensure_shop_cta("A warm story.", ""), "A warm story.")
+        self.assertEqual(mw.ensure_shop_cta("", self.URL), "\n\n".join(
+            [mw.SHOP_CTA_EN.format(url=self.URL), mw.SHOP_CTA_JA.format(url=self.URL)]
+        ))
+
+    def test_the_pack_and_the_json_both_carry_the_call_to_action(self):
+        metadata = build()
+        self.assertIn(self.URL, metadata["description_en"])
+        self.assertIn("Original artwork available at:", metadata["description_en"])
+        pack = mw.format_metadata_text(metadata)
+        self.assertIn("Original artwork available at:", pack)
+        self.assertIn("1点ものの原画はこちらで販売中です", pack)
+
+    def test_the_description_reaches_the_upload_body_unchanged(self):
+        import youtube_uploader
+
+        metadata = build()
+        body = youtube_uploader.build_upload_body(
+            {"title": "t", "description": metadata["description_en"], "tags": []}
+        )
+        self.assertIn(self.URL, body["snippet"]["description"])
+        self.assertIn("Original artwork available at:", body["snippet"]["description"])
+
+
 if __name__ == "__main__":
     unittest.main()

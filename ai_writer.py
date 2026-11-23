@@ -201,7 +201,7 @@ Generate a JSON response with the following keys:
 1. "title": Catchy English YouTube Shorts title (under 65 chars, include #Shorts).
 2. "hook_text": Short punchy on-screen hook text for the first 2.5 seconds (max 7 words).
 3. "narration": Natural, engaging English voiceover script of {NARRATION_MIN_WORDS}-{NARRATION_MAX_WORDS} words (~40-45 seconds, this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Open on the curiosity-gap hook, keep the sensory words coming, mention {material} naturally, and close so the ending leads back to the opening or lands as a punchline, with the warm call-to-action in the final line. Do not leave a silent stretch longer than a breath anywhere in the Short.
-4. "description": YouTube description including artwork story, material ({material}), shop link ({shop_url}), and hashtags (#SakuraCrayPas #CrayPasSpecialist #OilPastelArt #JapaneseArtSupplies #OriginalPostcard #CrayonJapan).
+4. "description": YouTube description with the artwork story, the material ({material}) and the hashtags (#SakuraCrayPas #CrayPasSpecialist #OilPastelArt #JapaneseArtSupplies #OriginalPostcard #CrayonJapan). The pipeline adds the shop call to action ({shop_url}) to this field itself, so write the story and the hashtags - do not write the shop link or a "shop this piece" line.
 5. "tags": List of 10 relevant English tags.
 6. "title_ja": The same title in natural Japanese, keeping "#Shorts" and any emoji.
 7. "hook_ja": The same on-screen hook in natural Japanese, short enough to read in 2.5 seconds.

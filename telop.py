@@ -27,6 +27,7 @@ import math
 import os
 import re
 import subprocess
+import unicodedata
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Canvas of every Short the pipeline renders (config.yaml video.width/height).
@@ -60,13 +61,24 @@ SUB_MAX_LINES = 2
 SUB_OUTLINE = 6
 SUB_SHADOW = 3
 
-# Hook: bigger, two lines of its own, directly under the top bar.
+# Hook: bigger, two lines of its own, directly under the top bar. The size is
+# the *first* rung of a ladder, not a fixed one: the hook is the promise of the
+# Short, so its sentence is never cut with an ellipsis. When the whole line does
+# not fit at 96 px the size steps down (by 2 px a rung) until it does, and only
+# a hook that still needs a fourth line goes below HOOK_MIN_FONT_SIZE.
 HOOK_FONT_SIZE = 96
-HOOK_MAX_CHARS = 16
+HOOK_MIN_FONT_SIZE = 58
+HOOK_FONT_STEP = 2
+HOOK_HARD_MIN_FONT_SIZE = 40
+HOOK_MAX_LINES = 3
 HOOK_OUTLINE = 9
 HOOK_SHADOW = 5
 HOOK_MARGIN_V = TOP_SAFE + 140
+HOOK_SIDE_MARGIN = 90
 HOOK_SECONDS = 3.0
+# The pop-in overshoots to 112 %, so a hook line is laid out at that width and
+# the burst still stays inside the side margins.
+HOOK_POP_SCALE = 1.12
 
 # Fixed title: deliberately small and slightly transparent - it is a label, not
 # a message. 40 px keeps a 34-character title inside the frame.
@@ -76,14 +88,23 @@ TITLE_MARGIN_V = TOP_SAFE + 20
 TITLE_OUTLINE = 4
 TITLE_SHADOW = 2
 
-# Closing follow line: shown over the silent zoom outro, in the same upper band
-# as the hook (the two never share a moment), so the drawing stays visible.
+# Closing follow line: it takes the caption band once the captions have left,
+# which keeps it off the top edge of the drawing the zoom outro is showing. When
+# the narration runs so late that the captions are still on screen, the line
+# stacks just above them instead of drawing gold over white.
 CTA_FONT_SIZE = 64
 CTA_MAX_CHARS = 16
-CTA_MARGIN_V = TOP_SAFE + 240
+CTA_MARGIN_V = BOTTOM_SAFE
+# Two caption lines plus a little air above them: the stacked line never draws
+# into the caption that is still on screen.
+CTA_STACKED_MARGIN_V = BOTTOM_SAFE + 220
 CTA_OUTLINE = 7
 CTA_SHADOW = 4
 CTA_SECONDS = 3.6
+# Readable even when the voice runs right up to the end (the picture only gets
+# NARRATION_TAIL_SECONDS after the last word).
+CTA_MIN_SECONDS = 2.4
+CTA_TAIL_SECONDS = 0.15
 DEFAULT_CTA_TEXT = "Follow for more oil pastel art!"
 
 # Colours are ASS &HBBGGRR; gold RGB(255, 200, 20).
@@ -187,9 +208,45 @@ def _ends_sentence(text: str) -> bool:
     return bool(stripped) and stripped[-1] in SENTENCE_END
 
 
+# Typographic marks a Latin sans draws that are not letters, digits or ASCII.
+_DRAWABLE_MARKS = frozenset("—–‐‑…‘’‚“”„·•™©®°±×÷")
+# Scripts the drawn face (DejaVu Sans Bold) carries. Everything outside them
+# would land as a tofu box, so it is treated like the emoji it usually is.
+_DRAWABLE_SCRIPTS = ("LATIN", "GREEK", "CYRILLIC")
+
+
+def _is_drawable(character: str) -> bool:
+    """True when the drawn font can show this character.
+
+    Emoji and decorative symbols are dropped, but accented Latin letters
+    (``é`` in ``Pokémon``) and the combining accent of a decomposed ``e`` +
+    ``́`` are letters like any other and stay: a title must never come out as
+    ``Pokmon``.
+    """
+    code = ord(character)
+    if code < 32 or code == 127:
+        return False
+    if 32 <= code < 127:
+        return True
+    if character in _DRAWABLE_MARKS:
+        return True
+    category = unicodedata.category(character)
+    if category == "Zs":
+        return True
+    name = unicodedata.name(character, "")
+    if not name:
+        return False
+    if category[0] in "LMN":
+        if any(script in name for script in _DRAWABLE_SCRIPTS):
+            return True
+        # A mark that puts the accent on a letter we just kept.
+        return category == "Mn" and "ACCENT" in name
+    return False
+
+
 def _strip_emoji(text: str) -> str:
-    """Keep only characters a Latin sans font can draw (no tofu boxes)."""
-    kept = "".join(ch for ch in text if 32 <= ord(ch) < 127)
+    """Keep what the font can draw, drop emoji and decorative symbols."""
+    kept = "".join(ch for ch in text if _is_drawable(ch))
     return re.sub(r"\s+", " ", kept).strip()
 
 
@@ -209,7 +266,9 @@ def clean_title(title: str, series_label: str = "", max_chars: int = TITLE_MAX_C
         text = series
     if len(text) > max_chars:
         cut = text[: max(max_chars - 3, 1)]
-        if " " in cut:
+        # Only a word the cut ran through is dropped: when the cut lands on a
+        # word boundary the word itself is kept ("Pokémon" stays "Pokémon").
+        if " " in cut and not cut.endswith(" ") and text[len(cut)] != " ":
             cut = cut.rsplit(" ", 1)[0]
         text = f"{cut.rstrip(' ,-|/')}..."
     return text
@@ -414,17 +473,32 @@ def text_width(text: str, size: int, family: str = DEFAULT_FONT) -> float:
 class LineLayout:
     """How much text one style may put on one line."""
 
-    def __init__(self, size: int, max_px: int, max_chars: int, family: str = DEFAULT_FONT):
+    def __init__(
+        self,
+        size: int,
+        max_px: int,
+        max_chars: int,
+        family: str = DEFAULT_FONT,
+        gap_px: float = 0.0,
+    ):
         self.size = int(size)
         self.max_px = int(max_px)
         self.max_chars = int(max_chars)
         self.family = family
+        # Extra room the render adds at every word gap (the hard space the
+        # karaoke grows into), so a line is measured the way it is drawn.
+        self.gap_px = float(gap_px)
 
     def width(self, text: str) -> float:
         return text_width(text, self.size, self.family)
 
+    def rendered_width(self, text: str) -> float:
+        """The drawn width, including the extra room at each word gap."""
+        gaps = max(len((text or "").split()) - 1, 0)
+        return self.width(text) + self.gap_px * gaps
+
     def fits(self, text: str) -> bool:
-        return len(text) <= self.max_chars and self.width(text) <= self.max_px
+        return len(text) <= self.max_chars and self.rendered_width(text) <= self.max_px
 
     def wrap(self, text: str, max_lines: Optional[int] = None) -> List[str]:
         """Greedy word wrap; a word is never split (technique 21)."""
@@ -456,13 +530,99 @@ class LineLayout:
             trimmed = trimmed.rsplit(" ", 1)[0] if " " in trimmed else trimmed[:-1]
         return f"{trimmed.rstrip(' ,-|/')}..." if trimmed else ""
 
+    def wrap_balanced(self, text: str) -> List[str]:
+        """The fewest lines that hold ``text``, keeping the widest one narrow.
+
+        A greedy wrap can need one line more than necessary - "Thick textures /
+        make childhood / memories pop" - which would push the hook one size
+        down the ladder for nothing. This tries every break instead, first
+        minimising the number of lines and then how wide the widest one is.
+        """
+        words = (text or "").split()
+        if not words:
+            return []
+        count = len(words)
+        # best[i] = (lines from word i to the end, widest line among them).
+        best: List[Tuple[int, float]] = [(0, 0.0)] * (count + 1)
+        next_break = [count] * (count + 1)
+        for index in range(count - 1, -1, -1):
+            chosen = (len(words) + 1, float("inf"))
+            for stop in range(index + 1, count + 1):
+                line = " ".join(words[index:stop])
+                # A single word is never split, so it is allowed to overflow.
+                if stop > index + 1 and not self.fits(line):
+                    break
+                following = best[stop]
+                candidate = (following[0] + 1, max(following[1], self.width(line)))
+                if candidate[0] < chosen[0] or (
+                    candidate[0] == chosen[0] and candidate[1] < chosen[1]
+                ):
+                    chosen = candidate
+                    next_break[index] = stop
+            best[index] = chosen
+        lines: List[str] = []
+        index = 0
+        while index < count:
+            stop = max(next_break[index], index + 1)
+            lines.append(" ".join(words[index:stop]))
+            index = stop
+        return lines
+
 
 def subtitle_layout(family: str = DEFAULT_FONT) -> LineLayout:
-    return LineLayout(SUB_FONT_SIZE, FRAME_WIDTH - 2 * SIDE_MARGIN, SUB_MAX_CHARS, family)
+    return LineLayout(
+        SUB_FONT_SIZE,
+        FRAME_WIDTH - 2 * SIDE_MARGIN,
+        SUB_MAX_CHARS,
+        family,
+        gap_px=text_width(" ", WORD_GAP_FONT_SIZE, family),
+    )
 
 
-def hook_layout(family: str = DEFAULT_FONT) -> LineLayout:
-    return LineLayout(HOOK_FONT_SIZE, FRAME_WIDTH - 2 * 90, HOOK_MAX_CHARS, family)
+def hook_layout(family: str = DEFAULT_FONT, size: int = HOOK_FONT_SIZE) -> LineLayout:
+    """One rung of the hook ladder: no character cap, the width is the limit.
+
+    The line may use the full width between the side margins (900 px); its
+    112 % pop-in leans into the margin, never past the frame edge.
+    """
+    return LineLayout(
+        size,
+        int((FRAME_WIDTH - 2 * HOOK_SIDE_MARGIN)),
+        FRAME_WIDTH,
+        family,
+    )
+
+
+def fit_hook(
+    hook_text: str, family: str = DEFAULT_FONT
+) -> Tuple[List[str], int]:
+    """The hook's lines and font size: the whole sentence, never an ellipsis.
+
+    The ladder starts at 96 px and steps down two pixels at a time. Two lines
+    are preferred; a hook that needs three takes three rather than lose its
+    ending, and only a hook that still needs a fourth at 58 px goes smaller.
+    """
+    text = re.sub(r"\s+", " ", (hook_text or "")).strip()
+    if not text:
+        return [], HOOK_FONT_SIZE
+
+    three_lines: Optional[Tuple[List[str], int]] = None
+    for size in range(HOOK_FONT_SIZE, HOOK_MIN_FONT_SIZE - 1, -HOOK_FONT_STEP):
+        lines = hook_layout(family, size).wrap_balanced(text)
+        if len(lines) <= 2:
+            return lines, size
+        if three_lines is None and len(lines) <= HOOK_MAX_LINES:
+            three_lines = (lines, size)
+    if three_lines is not None:
+        return three_lines
+
+    size = HOOK_MIN_FONT_SIZE
+    while size > HOOK_HARD_MIN_FONT_SIZE:
+        size -= HOOK_FONT_STEP
+        lines = hook_layout(family, size).wrap_balanced(text)
+        if len(lines) <= HOOK_MAX_LINES:
+            return lines, size
+    return hook_layout(family, size).wrap_balanced(text), size
 
 
 def title_layout(family: str = DEFAULT_FONT) -> LineLayout:
@@ -672,16 +832,32 @@ def _hidden_run(text: str) -> str:
     return _run(text, "\\alpha&HFF&")
 
 
+# The word being spoken grows only 12 %, because the gap between two words is
+# one space (~25 px at 72 px) and a bigger blow-up runs its outline into the
+# neighbour ("creamyblue"). Every gap is therefore widened by a hard space on
+# top of the space itself - in the card and in the karaoke overlay alike, so the
+# two layers keep identical geometry and the grown word still has room.
+KARAOKE_SCALE = 112
+KARAOKE_SETTLE_SCALE = 106
+WORD_GAP_FONT_SIZE = 48
+
+
 def _karaoke_run(text: str) -> str:
-    """The word being spoken: brighter, larger, and marked underneath.
+    """The word being spoken: brighter, a little larger, and marked underneath.
 
     The emphasis colour is already gold, so the current word is told apart by
     size and the underline that follows it, not by a second colour.
     """
     return _run(
         text,
-        f"\\c{ACCENT_COLOUR}\\fscx124\\fscy124\\u1\\t(0,120,\\fscx110\\fscy110)",
+        f"\\c{ACCENT_COLOUR}\\fscx{KARAOKE_SCALE}\\fscy{KARAOKE_SCALE}\\u1"
+        f"\\t(0,120,\\fscx{KARAOKE_SETTLE_SCALE}\\fscy{KARAOKE_SETTLE_SCALE})",
     )
+
+
+def _word_gap() -> str:
+    """A space plus a hard space: the room the highlighted word grows into."""
+    return " " + _run("\\h", f"\\fs{WORD_GAP_FONT_SIZE}")
 
 
 def _card_text(card: dict, highlight: Optional[int] = None) -> str:
@@ -697,7 +873,7 @@ def _card_text(card: dict, highlight: Optional[int] = None) -> str:
                 runs.append(_karaoke_run(word["text"]))
             else:
                 runs.append(_hidden_run(word["text"]))
-        lines.append(" ".join(runs))
+        lines.append(_word_gap().join(runs))
     return "\\N".join(lines)
 
 
@@ -743,7 +919,7 @@ def build_style_block(font: str = DEFAULT_FONT) -> List[str]:
         ),
         _style_line(
             "Cta", font, CTA_FONT_SIZE, ACCENT_COLOUR,
-            CTA_OUTLINE, CTA_SHADOW, 8, CTA_MARGIN_V, 90, 90,
+            CTA_OUTLINE, CTA_SHADOW, 2, CTA_MARGIN_V, 90, 90,
         ),
         "",
     ]
@@ -756,18 +932,22 @@ def _dialogue(layer: int, start: float, end: float, style: str, text: str) -> st
     )
 
 
-def _hook_event(hook_text: str, seconds: float, layout: LineLayout) -> List[str]:
-    """The hook pops in and settles, then leaves before the body starts."""
-    if not hook_text:
-        return []
-    lines = layout.wrap(hook_text, max_lines=2)
+def _hook_event(hook_text: str, seconds: float, family: str = DEFAULT_FONT) -> List[str]:
+    """The hook pops in and settles, then leaves before the body starts.
+
+    The size comes from ``fit_hook``: the whole sentence is shown, at the largest
+    rung of the ladder that holds it, so it is never cut off with an ellipsis.
+    """
+    lines, size = fit_hook(hook_text, family)
     if not lines:
         return []
     text = "\\N".join(lines)
+    size_tag = f"\\fs{int(size)}" if int(size) != HOOK_FONT_SIZE else ""
     return [
         _dialogue(
             2, 0.25, max(seconds, 0.8), "Hook",
-            "{\\fscx45\\fscy45\\t(0,150,\\fscx112\\fscy112)\\t(150,280,\\fscx100\\fscy100)"
+            "{\\fscx45\\fscy45" + size_tag +
+            "\\t(0,150,\\fscx112\\fscy112)\\t(150,280,\\fscx100\\fscy100)"
             "\\fad(40,240)}" + text,
         )
     ]
@@ -787,17 +967,27 @@ def _title_event(title: str, end: Optional[float], layout: LineLayout) -> List[s
     ]
 
 
-def _cta_event(cta_text: str, start: float, end: float, layout: LineLayout) -> List[str]:
+def _cta_event(
+    cta_text: str,
+    start: float,
+    end: float,
+    layout: LineLayout,
+    margin_v: int = CTA_MARGIN_V,
+) -> List[str]:
+    """The closing line; ``margin_v`` lifts it above captions still on screen."""
     if not cta_text or end <= start:
         return []
     lines = layout.wrap(cta_text, max_lines=2)
     if not lines:
         return []
+    lift = ""
+    if int(margin_v) != CTA_MARGIN_V:
+        lift = f"\\an2\\pos({FRAME_WIDTH // 2},{int(FRAME_HEIGHT - margin_v)})"
     return [
         _dialogue(
             3, start, end, "Cta",
-            "{\\fscx88\\fscy88\\t(0,180,\\fscx105\\fscy105)\\t(180,300,\\fscx100\\fscy100)"
-            "\\fad(150,250)}" + "\\N".join(lines),
+            "{" + lift + "\\fscx88\\fscy88\\t(0,180,\\fscx105\\fscy105)"
+            "\\t(180,300,\\fscx100\\fscy100)\\fad(150,250)}" + "\\N".join(lines),
         )
     ]
 
@@ -844,18 +1034,22 @@ def build_telop_ass(
             )
 
     events += _hook_event(
-        hook_text, min(hook_duration, max(total - 0.5, 0.8)), hook_layout(family)
+        hook_text, min(hook_duration, max(total - 0.5, 0.8)), family
     )
     events += _title_event(title, max(total - 0.3, 2.0), title_layout(family))
 
-    # The closing line lands in the outro: when the voice runs long it waits for
-    # the last words, and it always keeps a moment on screen.
+    # The closing line lands in the outro: it takes the caption band once the
+    # captions have left, and always gets CTA_MIN_SECONDS of screen time - when
+    # the voice runs right up to the end it starts earlier and stacks just above
+    # the caption still on screen instead of drawing gold over white.
     total = max(total, 1.0)
-    cta_end = max(total - 0.15, 1.0)
-    cta_start = max(total - cta_duration, last_spoken - 0.4, 0.6)
-    if cta_start > cta_end - 1.2:
-        cta_start = max(cta_end - 1.2, 0.2)
-    events += _cta_event(cta_text, cta_start, cta_end, cta_layout(family))
+    cta_end = max(total - CTA_TAIL_SECONDS, 1.0)
+    cta_start = max(total - cta_duration, 0.6)
+    cta_start = min(cta_start, cta_end - CTA_MIN_SECONDS)
+    cta_start = max(min(cta_start, cta_end - 0.2), 0.2)
+    captions_clear = max((card["end"] for card in cards), default=0.0)
+    cta_margin = CTA_MARGIN_V if cta_start >= captions_clear - 0.05 else CTA_STACKED_MARGIN_V
+    events += _cta_event(cta_text, cta_start, cta_end, cta_layout(family), cta_margin)
 
     header = [
         "[Script Info]",
