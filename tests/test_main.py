@@ -1143,6 +1143,17 @@ class LearningLoopTests(unittest.TestCase):
         self.assertTrue(any("drive" in line for line in logs))
         self.assertTrue(any("quota" in line for line in logs))
 
+    def test_a_reflection_that_raises_falls_back_to_the_defaults(self):
+        logs = []
+        with mock.patch.object(improvement, "decide_params", side_effect=RuntimeError("boom")):
+            params, review = main.learning_prepare(
+                self.config, object(), self.folders, csv_path=self.csv, log=logs.append
+            )
+        self.assertEqual(review["status"], "gemini-failed")
+        self.assertIn("boom", review["error"])
+        self.assertEqual(params["target_duration_sec"], 28.0)
+        self.assertTrue(any("boom" in line for line in logs))
+
     def test_a_disabled_improvement_block_uses_the_config_defaults(self):
         config = dict(self.config)
         config["improvement"] = dict(config["improvement"], enabled=False)

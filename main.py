@@ -1169,7 +1169,12 @@ def learning_prepare(
     except Exception as exc:  # noqa: BLE001 - YouTube being unavailable is not fatal
         log(f"[pdca] could not collect the numbers this run: {exc}")
 
-    params, review = improvement.decide_params(csv_path, config, log=log)
+    try:
+        params, review = improvement.decide_params(csv_path, config, log=log)
+    except Exception as exc:  # noqa: BLE001 - the render is the point of the run
+        log(f"[pdca] the reflection could not run ({exc}); using the config defaults")
+        params = improvement.config_params(config)
+        review = {"status": "gemini-failed", "error": str(exc)}
     improvement.set_active_params(params)
     log(f"[pdca] this run: {improvement.describe_params(params)}")
     return params, review
@@ -1186,9 +1191,13 @@ def learning_finish(
 ) -> None:
     """Record what this run made and put the history back in Drive."""
     params = dict(params or improvement.active_params())
-    state = improvement.load_state()
-    improvement.record_run(state, params, review, results)
-    improvement.save_state(state)
+    try:
+        state = improvement.load_state()
+        improvement.record_run(state, params, review, results)
+        improvement.save_state(state)
+    except Exception as exc:  # noqa: BLE001 - the Shorts are already out
+        log(f"[pdca] could not record this run locally: {exc}")
+        return
     done = [result for result in results if str(result.get("status")) == "done"]
     if not done:
         log("[pdca] nothing was published this run; the history was left as it was")
