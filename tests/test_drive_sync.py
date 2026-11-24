@@ -252,6 +252,64 @@ class UploadAndMoveTests(unittest.TestCase):
         self.assertNotIn("removeParents", kwargs)
 
 
+class StateFileTests(unittest.TestCase):
+    """The PDCA state files live in Drive and are rewritten in place."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "performance.csv")
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write("video_id\n")
+
+    def test_a_child_is_found_by_its_exact_name(self):
+        service = service_for_children({
+            "state-folder": [
+                {"id": "other", "name": "performance.csv.bak"},
+                {"id": "wanted", "name": "performance.csv"},
+            ]
+        })
+        found = ds.find_child_by_name(service, "state-folder", "performance.csv")
+        self.assertEqual(found["id"], "wanted")
+
+    def test_a_missing_child_is_none(self):
+        service = service_for_children({"state-folder": [{"id": "x", "name": "a.csv"}]})
+        self.assertIsNone(ds.find_child_by_name(service, "state-folder", "performance.csv"))
+
+    def test_an_existing_file_is_updated_not_duplicated(self):
+        service = service_for_children({"state-folder": [{"id": "f1", "name": "performance.csv"}]})
+        service.files.return_value.update.return_value.execute.return_value = {"id": "f1"}
+
+        saved = ds.upload_or_replace(
+            service, self.path, "state-folder",
+            name="performance.csv", media_factory=lambda p: ("media", p),
+        )
+
+        self.assertEqual(saved["id"], "f1")
+        service.files.return_value.create.assert_not_called()
+        kwargs = service.files.return_value.update.call_args.kwargs
+        self.assertEqual(kwargs["fileId"], "f1")
+        self.assertEqual(kwargs["media_body"], ("media", self.path))
+
+    def test_without_an_existing_file_it_is_created(self):
+        service = service_for_children({"state-folder": []})
+        service.files.return_value.create.return_value.execute.return_value = {"id": "new"}
+
+        saved = ds.upload_or_replace(
+            service, self.path, "state-folder",
+            name="performance.csv", media_factory=lambda p: ("media", p),
+        )
+
+        self.assertEqual(saved["id"], "new")
+        service.files.return_value.update.assert_not_called()
+        kwargs = service.files.return_value.create.call_args.kwargs
+        self.assertEqual(kwargs["body"]["name"], "performance.csv")
+
+    def test_updating_a_missing_local_file_raises(self):
+        with self.assertRaises(ds.DriveSyncError):
+            ds.update_file_content(mock.MagicMock(), "f1", os.path.join(self.tmp.name, "gone"))
+
+
 class ReadyPackageFolderTests(unittest.TestCase):
     def test_an_existing_folder_of_that_name_is_reused(self):
         service = service_for_children({

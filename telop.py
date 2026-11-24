@@ -52,6 +52,25 @@ SIDE_MARGIN = 170
 FONT_CANDIDATES = ("DejaVu Sans", "Liberation Sans", "Noto Sans", "FreeSans")
 DEFAULT_FONT = "DejaVu Sans"
 
+# Japanese on-screen text (the 89 %-Japanese audience) needs a face with kana
+# and kanji, which DejaVu has not. The runner cannot be told to install one (the
+# workflow file is out of bounds), so the bold Noto Sans CJK JP face travels with
+# the repository and is handed to libass through `fontsdir=`. It is subset to the
+# JIS X 0208 character set to keep the checkout small (see assets/fonts/).
+JP_FONT_FAMILY = "Noto Sans CJK JP"
+JP_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
+JP_FONT_FILE = os.path.join(JP_FONT_DIR, "NotoSansJP-Bold.otf")
+
+
+def japanese_font_available() -> bool:
+    """True when the bundled kana/kanji face is on disk."""
+    return os.path.isfile(JP_FONT_FILE)
+
+
+def japanese_fonts_dir() -> str:
+    """The `fontsdir=` argument for the ASS filter ('' when not bundled)."""
+    return JP_FONT_DIR if japanese_font_available() else ""
+
 # Caption geometry. Lines are measured with the drawn font and also capped at
 # 16 characters, which keeps a 72 px DejaVu Sans Bold line inside the 740 px
 # left between the side margins.
@@ -79,6 +98,25 @@ HOOK_SECONDS = 3.0
 # The pop-in overshoots to 112 %, so a hook line is laid out at that width and
 # the burst still stays inside the side margins.
 HOOK_POP_SCALE = 1.12
+# A bilingual hook shows the translation under the promise in a smaller size:
+# readable on a phone, but never competing with the line that stops the swipe.
+HOOK_SECONDARY_SCALE = 0.62
+HOOK_SECONDARY_MIN_SIZE = 40
+# A hook that carries a translation starts one rung lower: two Japanese lines at
+# 96 px plus the English line would reach down over the artwork.
+HOOK_BILINGUAL_FONT_SIZE = 80
+
+# The closing question ("次は何を描いてほしい？ / What should I draw next?").
+# It sits above the follow line in the outro, where the comment button and the
+# replay are both one thumb away.
+ASK_FONT_SIZE = 56
+ASK_SECONDARY_SCALE = 0.72
+ASK_MAX_CHARS = 34
+ASK_LIFT = 300
+ASK_OUTLINE = 6
+ASK_SHADOW = 3
+DEFAULT_ASK_EN = "What should I draw next?"
+DEFAULT_ASK_JA = "次は何を描いてほしい？"
 
 # Fixed title: deliberately small and slightly transparent - it is a label, not
 # a message. 40 px keeps a 34-character title inside the frame.
@@ -215,13 +253,32 @@ _DRAWABLE_MARKS = frozenset("—–‐‑…‘’‚“”„·•™©®°±×
 _DRAWABLE_SCRIPTS = ("LATIN", "GREEK", "CYRILLIC")
 
 
+def _is_cjk(character: str) -> bool:
+    """True for kana, kanji and the punctuation/full-width forms they use."""
+    code = ord(character)
+    return (
+        0x3000 <= code <= 0x30FF      # CJK punctuation, hiragana, katakana
+        or 0x31F0 <= code <= 0x31FF   # katakana phonetic extensions
+        or 0x3400 <= code <= 0x4DBF   # CJK extension A
+        or 0x4E00 <= code <= 0x9FFF   # CJK unified ideographs
+        or 0xFF00 <= code <= 0xFFEF   # full-width / half-width forms
+        or code in (0x2015, 0x2018, 0x2019, 0x201C, 0x201D, 0x2026, 0x301C)
+    )
+
+
+def contains_cjk(text: str) -> bool:
+    """True when a line needs the bundled Japanese face."""
+    return any(_is_cjk(ch) for ch in (text or ""))
+
+
 def _is_drawable(character: str) -> bool:
     """True when the drawn font can show this character.
 
     Emoji and decorative symbols are dropped, but accented Latin letters
     (``é`` in ``Pokémon``) and the combining accent of a decomposed ``e`` +
     ``́`` are letters like any other and stay: a title must never come out as
-    ``Pokmon``.
+    ``Pokmon``. Kana and kanji stay too, as long as the bundled Japanese face
+    is there to draw them.
     """
     code = ord(character)
     if code < 32 or code == 127:
@@ -230,6 +287,8 @@ def _is_drawable(character: str) -> bool:
         return True
     if character in _DRAWABLE_MARKS:
         return True
+    if _is_cjk(character):
+        return japanese_font_available()
     category = unicodedata.category(character)
     if category == "Zs":
         return True
@@ -430,9 +489,17 @@ _FONTS: Dict[Tuple[str, int], object] = {}
 
 
 def font_path_for(family: str) -> str:
-    """The bold file fontconfig resolves for ``family`` ('' when unknown)."""
+    """The bold file fontconfig resolves for ``family`` ('' when unknown).
+
+    The bundled Japanese face is measured from its own file: it is not installed
+    in the system fontconfig, so ``fc-match`` would answer with a fallback and
+    every Japanese line would be measured at the wrong width.
+    """
     if family in _FONT_FILES:
         return _FONT_FILES[family]
+    if family == JP_FONT_FAMILY and japanese_font_available():
+        _FONT_FILES[family] = JP_FONT_FILE
+        return JP_FONT_FILE
     path = ""
     try:
         result = subprocess.run(
@@ -499,6 +566,39 @@ class LineLayout:
 
     def fits(self, text: str) -> bool:
         return len(text) <= self.max_chars and self.rendered_width(text) <= self.max_px
+
+    def wrap_cjk(self, text: str, max_lines: Optional[int] = None) -> List[str]:
+        """Character wrap for Japanese, which has no spaces to break on.
+
+        A Latin line only breaks between words (technique 21), but a Japanese
+        sentence is one unbroken word to a whitespace wrap: it would overflow
+        the frame. Kana and kanji allow a break almost anywhere, so the line is
+        filled character by character instead.
+        """
+        lines: List[str] = []
+        current = ""
+        # Closing brackets and the marks that may not open a line are carried
+        # with the character before them, so a line never starts with 。 or 、.
+        no_leading = "、。，．・：；？！ー）」』】〕｝”,.!?:;"
+        for character in (text or ""):
+            candidate = current + character
+            if current and not self.fits(candidate) and character not in no_leading:
+                lines.append(current)
+                current = character
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        if max_lines is not None and len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = self.fit_line(lines[-1]) or lines[-1]
+        return lines
+
+    def wrap_auto(self, text: str, max_lines: Optional[int] = None) -> List[str]:
+        """The wrap a text needs: character-wise for Japanese, words otherwise."""
+        if contains_cjk(text):
+            return self.wrap_cjk(text, max_lines)
+        return self.wrap(text, max_lines)
 
     def wrap(self, text: str, max_lines: Optional[int] = None) -> List[str]:
         """Greedy word wrap; a word is never split (technique 21)."""
@@ -569,6 +669,20 @@ class LineLayout:
         return lines
 
 
+def layout_for_text(
+    layout: LineLayout,
+    text: str,
+    jp_family: str = JP_FONT_FAMILY,
+) -> LineLayout:
+    """The same layout, measured in the face that will actually draw ``text``."""
+    if contains_cjk(text) and jp_family and japanese_font_available():
+        if layout.family != jp_family:
+            return LineLayout(
+                layout.size, layout.max_px, layout.max_chars, jp_family, layout.gap_px
+            )
+    return layout
+
+
 def subtitle_layout(family: str = DEFAULT_FONT) -> LineLayout:
     return LineLayout(
         SUB_FONT_SIZE,
@@ -594,21 +708,29 @@ def hook_layout(family: str = DEFAULT_FONT, size: int = HOOK_FONT_SIZE) -> LineL
 
 
 def fit_hook(
-    hook_text: str, family: str = DEFAULT_FONT
+    hook_text: str,
+    family: str = DEFAULT_FONT,
+    max_size: int = HOOK_FONT_SIZE,
 ) -> Tuple[List[str], int]:
     """The hook's lines and font size: the whole sentence, never an ellipsis.
 
     The ladder starts at 96 px and steps down two pixels at a time. Two lines
     are preferred; a hook that needs three takes three rather than lose its
     ending, and only a hook that still needs a fourth at 58 px goes smaller.
+    ``max_size`` starts the ladder lower for a bilingual hook.
     """
     text = re.sub(r"\s+", " ", (hook_text or "")).strip()
     if not text:
         return [], HOOK_FONT_SIZE
+    try:
+        start = int(max_size)
+    except (TypeError, ValueError):
+        start = HOOK_FONT_SIZE
+    start = min(max(start, HOOK_MIN_FONT_SIZE), HOOK_FONT_SIZE)
 
     three_lines: Optional[Tuple[List[str], int]] = None
-    for size in range(HOOK_FONT_SIZE, HOOK_MIN_FONT_SIZE - 1, -HOOK_FONT_STEP):
-        lines = hook_layout(family, size).wrap_balanced(text)
+    for size in range(start, HOOK_MIN_FONT_SIZE - 1, -HOOK_FONT_STEP):
+        lines = _hook_lines(text, family, size)
         if len(lines) <= 2:
             return lines, size
         if three_lines is None and len(lines) <= HOOK_MAX_LINES:
@@ -619,10 +741,62 @@ def fit_hook(
     size = HOOK_MIN_FONT_SIZE
     while size > HOOK_HARD_MIN_FONT_SIZE:
         size -= HOOK_FONT_STEP
-        lines = hook_layout(family, size).wrap_balanced(text)
+        lines = _hook_lines(text, family, size)
         if len(lines) <= HOOK_MAX_LINES:
             return lines, size
-    return hook_layout(family, size).wrap_balanced(text), size
+    return _hook_lines(text, family, size), size
+
+
+def _hook_lines(text: str, family: str, size: int) -> List[str]:
+    """Hook lines at one rung: balanced for a sentence, character-split for JP."""
+    layout = hook_layout(family, size)
+    measured = layout_for_text(layout, text)
+    if contains_cjk(text):
+        return measured.wrap_cjk(text)
+    return measured.wrap_balanced(text)
+
+
+def fit_hook_pair(
+    primary: str,
+    secondary: str,
+    family: str = DEFAULT_FONT,
+) -> Tuple[List[Tuple[str, int, str]], int]:
+    """A two-language hook: the primary line(s) big, the other one under them.
+
+    Returns ``[(line, font_size, font_family), ...]`` and the primary size, so
+    the caller can draw the Japanese line at the size the English one was
+    checked against and the translation small beneath it.
+    """
+    text = re.sub(r"\s+", " ", (primary or "")).strip()
+    extra = re.sub(r"\s+", " ", (secondary or "")).strip()
+    if not text:
+        return ([], HOOK_FONT_SIZE) if not extra else fit_hook_pair(extra, "", family)
+
+    lines, size = fit_hook(text, family, max_size=HOOK_BILINGUAL_FONT_SIZE if extra else HOOK_FONT_SIZE)
+    primary_family = JP_FONT_FAMILY if contains_cjk(text) else family
+    block: List[Tuple[str, int, str]] = [(line, size, primary_family) for line in lines]
+    if not extra:
+        return block, size
+
+    small = max(int(round(size * HOOK_SECONDARY_SCALE)), HOOK_SECONDARY_MIN_SIZE)
+    small_family = JP_FONT_FAMILY if contains_cjk(extra) else family
+    small_lines = []
+    # The translation steps down in size before it is ever cut: it is the same
+    # promise, and an ellipsis in it would read as the short version of a hook.
+    while small >= HOOK_SECONDARY_MIN_SIZE - 8:
+        small_layout = hook_layout(small_family, small)
+        small_lines = layout_for_text(small_layout, extra).wrap_auto(extra, max_lines=2)
+        if len(small_lines) <= 2 and all(
+            layout_for_text(small_layout, line).fits(line) for line in small_lines
+        ):
+            break
+        small -= 4
+    # Never let the translation push the promise off the frame: three primary
+    # lines already use the hook's budget, so the small block gets one line.
+    if len(block) >= 3:
+        small_lines = small_lines[:1]
+    block += [(line, small, small_family) for line in small_lines]
+    return block, size
 
 
 def title_layout(family: str = DEFAULT_FONT) -> LineLayout:
@@ -638,12 +812,41 @@ def cta_layout(family: str = DEFAULT_FONT) -> LineLayout:
 # ---------------------------------------------------------------------------
 
 def _card_lines(texts: Sequence[str], layout: LineLayout) -> List[str]:
-    return layout.wrap(" ".join(texts))
+    text = " ".join(texts)
+    return layout_for_text(layout, text).wrap_auto(text)
 
 
 def _card_fits(texts: Sequence[str], layout: LineLayout, max_lines: int) -> bool:
     lines = _card_lines(texts, layout)
     return len(lines) <= max_lines and all(layout.fits(line) for line in lines)
+
+
+def _split_oversized_word(word: dict, layout: LineLayout) -> List[dict]:
+    """A word that cannot fit on one line, cut into chunks that can.
+
+    Japanese narration can arrive as one long chunk (a sentence boundary read as
+    a word); without this the card would be a single line running off the frame.
+    The word's own spoken span is shared between the chunks, so the karaoke still
+    follows the voice.
+    """
+    text = clean_word(word.get("text"))
+    if not text or layout.fits(text):
+        return [dict(word)]
+    measured = layout_for_text(layout, text)
+    chunks = measured.wrap_cjk(text) if contains_cjk(text) else measured.wrap(text)
+    if len(chunks) <= 1:
+        return [dict(word)]
+    start = float(word.get("start", 0.0))
+    end = max(float(word.get("end", start)), start + 0.05)
+    span = (end - start) / len(chunks)
+    return [
+        {
+            "text": chunk,
+            "start": round(start + index * span, 3),
+            "end": round(start + (index + 1) * span, 3),
+        }
+        for index, chunk in enumerate(chunks)
+    ]
 
 
 def build_cards(
@@ -666,22 +869,23 @@ def build_cards(
     current: List[dict] = []
 
     for word in words:
-        text = clean_word(word["text"])
-        if not text:
-            continue
-        candidate = current + [{"text": text, "start": word["start"], "end": word["end"]}]
-        if _card_fits([item["text"] for item in candidate], layout, max_lines):
-            current = candidate
-            if _ends_sentence(text) and len(current) >= 3:
-                cards.append(current)
-                current = []
-        else:
-            if current:
-                cards.append(current)
-            current = [{"text": text, "start": word["start"], "end": word["end"]}]
-            if _ends_sentence(text) and len(current) >= 3:
-                cards.append(current)
-                current = []
+        for piece in _split_oversized_word(word, layout):
+            text = clean_word(piece["text"])
+            if not text:
+                continue
+            candidate = current + [{"text": text, "start": piece["start"], "end": piece["end"]}]
+            if _card_fits([item["text"] for item in candidate], layout, max_lines):
+                current = candidate
+                if _ends_sentence(text) and len(current) >= 3:
+                    cards.append(current)
+                    current = []
+            else:
+                if current:
+                    cards.append(current)
+                current = [{"text": text, "start": piece["start"], "end": piece["end"]}]
+                if _ends_sentence(text) and len(current) >= 3:
+                    cards.append(current)
+                    current = []
     if current:
         cards.append(current)
 
@@ -814,9 +1018,23 @@ def parse_timestamp(text: str) -> float:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
+def _font_tag(text: str, family: str = DEFAULT_FONT) -> str:
+    """Switch to the Japanese face for a run that holds kana or kanji.
+
+    The style's font is the Latin one; a Japanese word inside the same card
+    would otherwise fall back to a face that may not carry it. ``\fn`` is
+    per-run, so both scripts share one line of geometry.
+    """
+    if family == JP_FONT_FAMILY:
+        return f"\\fn{JP_FONT_FAMILY}"
+    return f"\\fn{JP_FONT_FAMILY}" if contains_cjk(text) else ""
+
+
 def _run(text: str, tags: str = "") -> str:
     """One ASS text run; ``\r`` resets the tags of the run before it."""
-    return f"{{\\r{tags}}}{text}" if tags else f"{{\\r}}{text}"
+    font = _font_tag(text)
+    combined = f"{font}{tags}"
+    return f"{{\\r{combined}}}{text}" if combined else f"{{\\r}}{text}"
 
 
 def _plain_run(text: str) -> str:
@@ -921,6 +1139,10 @@ def build_style_block(font: str = DEFAULT_FONT) -> List[str]:
             "Cta", font, CTA_FONT_SIZE, ACCENT_COLOUR,
             CTA_OUTLINE, CTA_SHADOW, 2, CTA_MARGIN_V, 90, 90,
         ),
+        _style_line(
+            "Ask", font, ASK_FONT_SIZE, WHITE_COLOUR,
+            ASK_OUTLINE, ASK_SHADOW, 2, CTA_MARGIN_V + ASK_LIFT, 90, 90,
+        ),
         "",
     ]
 
@@ -932,37 +1154,63 @@ def _dialogue(layer: int, start: float, end: float, style: str, text: str) -> st
     )
 
 
-def _hook_event(hook_text: str, seconds: float, family: str = DEFAULT_FONT) -> List[str]:
+def _hook_event(
+    hook_text: str,
+    seconds: float,
+    family: str = DEFAULT_FONT,
+    hook_secondary: str = "",
+) -> List[str]:
     """The hook pops in and settles, then leaves before the body starts.
 
     The size comes from ``fit_hook``: the whole sentence is shown, at the largest
     rung of the ladder that holds it, so it is never cut off with an ellipsis.
+    With a translation (`hook_secondary`) both languages share the one pop, the
+    primary line big and the other small underneath it.
     """
-    lines, size = fit_hook(hook_text, family)
-    if not lines:
+    block, size = fit_hook_pair(hook_text, hook_secondary, family)
+    if not block:
         return []
-    text = "\\N".join(lines)
-    size_tag = f"\\fs{int(size)}" if int(size) != HOOK_FONT_SIZE else ""
+    text = _bilingual_block(block, family)
+    spin = "\\fscx45\\fscy45\\t(0,150,\\fscx112\\fscy112)\\t(150,280,\\fscx100\\fscy100)"
+    # A two-language hook is anchored explicitly, a little higher than the
+    # single-line style margin, so its extra line stays off the artwork.
+    anchor = ""
+    if hook_secondary:
+        anchor = f"\\an8\\pos({FRAME_WIDTH // 2},{TOP_SAFE + 45})"
     return [
         _dialogue(
             2, 0.25, max(seconds, 0.8), "Hook",
-            "{\\fscx45\\fscy45" + size_tag +
-            "\\t(0,150,\\fscx112\\fscy112)\\t(150,280,\\fscx100\\fscy100)"
-            "\\fad(40,240)}" + text,
+            "{" + anchor + spin + "\\fad(40,240)}" + text,
         )
     ]
 
 
-def _title_event(title: str, end: Optional[float], layout: LineLayout) -> List[str]:
-    if not title:
+def _title_event(
+    title: str,
+    end: Optional[float],
+    layout: LineLayout,
+    title_secondary: str = "",
+    family: str = DEFAULT_FONT,
+    start: float = 0.6,
+) -> List[str]:
+    """The quiet label line. It waits for the hook when the hook is two lines."""
+    if not title and not title_secondary:
         return []
-    fitted = layout.fit_line(title)
-    if not fitted:
+    lines: List[str] = []
+    fitted = layout_for_text(layout, title).fit_line(title) if title else ""
+    if fitted:
+        face = JP_FONT_FAMILY if contains_cjk(fitted) else family
+        lines.append(f"{{\\fn{face}}}{fitted}")
+    extra = layout_for_text(layout, title_secondary).fit_line(title_secondary) if title_secondary else ""
+    if extra:
+        face = JP_FONT_FAMILY if contains_cjk(extra) else family
+        lines.append(f"{{\\fn{face}\\fs{int(layout.size * 0.85)}}}{extra}")
+    if not lines:
         return []
     return [
         _dialogue(
-            2, 0.6, end or 30.0, "Title",
-            "{\\fad(450,400)}" + fitted,
+            2, max(float(start), 0.0), end or 30.0, "Title",
+            "{\\fad(450,400)}" + "\\N".join(lines),
         )
     ]
 
@@ -973,13 +1221,25 @@ def _cta_event(
     end: float,
     layout: LineLayout,
     margin_v: int = CTA_MARGIN_V,
+    cta_secondary: str = "",
 ) -> List[str]:
     """The closing line; ``margin_v`` lifts it above captions still on screen."""
     if not cta_text or end <= start:
         return []
-    lines = layout.wrap(cta_text, max_lines=2)
+    lines = layout_for_text(layout, cta_text).wrap_auto(cta_text, max_lines=2)
     if not lines:
         return []
+    text = "\\N".join(lines)
+    extra = str(cta_secondary or "").strip()
+    if extra:
+        small = LineLayout(
+            max(int(layout.size * 0.72), 24), layout.max_px, 40,
+            JP_FONT_FAMILY if contains_cjk(extra) else DEFAULT_FONT,
+        )
+        small_lines = small.wrap_auto(extra, max_lines=1)
+        if small_lines:
+            face = JP_FONT_FAMILY if contains_cjk(extra) else DEFAULT_FONT
+            text += f"\\N{{\\fn{face}\\fs{small.size}}}" + small_lines[0]
     lift = ""
     if int(margin_v) != CTA_MARGIN_V:
         lift = f"\\an2\\pos({FRAME_WIDTH // 2},{int(FRAME_HEIGHT - margin_v)})"
@@ -987,16 +1247,75 @@ def _cta_event(
         _dialogue(
             3, start, end, "Cta",
             "{" + lift + "\\fscx88\\fscy88\\t(0,180,\\fscx105\\fscy105)"
-            "\\t(180,300,\\fscx100\\fscy100)\\fad(150,250)}" + "\\N".join(lines),
+            "\\t(180,300,\\fscx100\\fscy100)\\fad(150,250)}" + text,
         )
     ]
+
+
+def _ask_event(
+    ask_primary: str,
+    ask_secondary: str,
+    start: float,
+    end: float,
+    margin_v: int = CTA_MARGIN_V + ASK_LIFT,
+) -> List[str]:
+    """The comment question above the follow line, in one or two languages."""
+    if end <= start:
+        return []
+    lines: List[str] = []
+    for text, size in ((ask_primary, ASK_FONT_SIZE), (ask_secondary, int(round(ASK_FONT_SIZE * ASK_SECONDARY_SCALE)))):
+        cleaned = clean_caption_text(text or "")
+        if not cleaned:
+            continue
+        family = JP_FONT_FAMILY if contains_cjk(cleaned) else DEFAULT_FONT
+        layout = LineLayout(size, FRAME_WIDTH - 2 * 110, ASK_MAX_CHARS, family)
+        wrapped = layout.wrap_auto(cleaned, max_lines=2)
+        if wrapped:
+            lines.append(
+                f"{{\\fn{family}\\fs{size}}}" + "\\N".join(wrapped)
+            )
+    if not lines:
+        return []
+    pos = f"\\an2\\pos({FRAME_WIDTH // 2},{int(FRAME_HEIGHT - margin_v)})"
+    text = "\\N".join(lines)
+    return [
+        _dialogue(
+            3, start, end, "Ask",
+            "{" + pos + "\\fad(150,250)}" + text,
+        )
+    ]
+
+
+def _bilingual_block(
+    block: Sequence[Tuple[str, int, str]],
+    base_family: str = DEFAULT_FONT,
+) -> str:
+    """Lines as ASS text, each at its own size and face (no `\\r` reset)."""
+    parts = []
+    japanese_face = False
+    for line, size, family in block:
+        if family == JP_FONT_FAMILY:
+            tags = f"\\fn{JP_FONT_FAMILY}\\fs{int(size)}"
+            japanese_face = True
+        elif japanese_face:
+            # Switch back for the English line under a Japanese one.
+            tags = f"\\fn{base_family}\\fs{int(size)}"
+        else:
+            tags = f"\\fs{int(size)}"
+        parts.append(f"{{{tags}}}{line}")
+    return "\\N".join(parts)
 
 
 def build_telop_ass(
     words: Sequence[dict] = (),
     hook_text: str = "",
+    hook_text_secondary: str = "",
     title: str = "",
+    title_secondary: str = "",
     cta_text: str = DEFAULT_CTA_TEXT,
+    cta_secondary: str = "",
+    ask_text: str = "",
+    ask_text_secondary: str = "",
     video_seconds: Optional[float] = None,
     font_name: Optional[str] = None,
     hook_duration: float = HOOK_SECONDS,
@@ -1006,8 +1325,14 @@ def build_telop_ass(
     marked: Iterable[str] = (),
     width: int = FRAME_WIDTH,
     height: int = FRAME_HEIGHT,
+    karaoke: bool = True,
 ) -> str:
-    """The whole ASS document: hook, cards, karaoke words, title and CTA."""
+    """The whole ASS document: hook, cards, karaoke words, title and CTA.
+
+    ``karaoke=False`` leaves the word-by-word highlight out: a Japanese
+    narration is captioned one sentence cue at a time, and highlighting the
+    single cue would turn the whole line gold for its whole duration.
+    """
     family = font_name or DEFAULT_FONT
     layout = layout or subtitle_layout(family)
     cards = plan_cards(words, layout, max_lines, marked)
@@ -1023,7 +1348,7 @@ def build_telop_ass(
         )
     # One overlay per spoken word: the same lines with only that word visible,
     # in gold and a touch larger, so the highlight follows the voice.
-    for card in cards:
+    for card in (cards if karaoke else []):
         for index, word in enumerate(card["words"]):
             start = word["start"]
             end = min(word["end"], card["end"])
@@ -1033,10 +1358,18 @@ def build_telop_ass(
                 _dialogue(1, start, end, "Telop", _card_text(card, highlight=index))
             )
 
+    hook_end = min(hook_duration, max(total - 0.5, 0.8))
     events += _hook_event(
-        hook_text, min(hook_duration, max(total - 0.5, 0.8)), family
+        hook_text, hook_end, family,
+        hook_secondary=hook_text_secondary,
     )
-    events += _title_event(title, max(total - 0.3, 2.0), title_layout(family))
+    # A two-line title under a two-line hook would sit on it; the label can wait
+    # the two seconds the hook owns.
+    title_start = hook_end + 0.2 if hook_text_secondary else 0.6
+    events += _title_event(
+        title, max(total - 0.3, 2.0), title_layout(family),
+        title_secondary=title_secondary, family=family, start=title_start,
+    )
 
     # The closing line lands in the outro: it takes the caption band once the
     # captions have left, and always gets CTA_MIN_SECONDS of screen time - when
@@ -1049,7 +1382,16 @@ def build_telop_ass(
     cta_start = max(min(cta_start, cta_end - 0.2), 0.2)
     captions_clear = max((card["end"] for card in cards), default=0.0)
     cta_margin = CTA_MARGIN_V if cta_start >= captions_clear - 0.05 else CTA_STACKED_MARGIN_V
-    events += _cta_event(cta_text, cta_start, cta_end, cta_layout(family), cta_margin)
+    events += _cta_event(
+        cta_text, cta_start, cta_end, cta_layout(family), cta_margin,
+        cta_secondary=cta_secondary,
+    )
+    # The comment question rides above the follow line for the same stretch, so
+    # the last thing on screen asks for the next idea (the comment column is
+    # what turns a view into a loop).
+    events += _ask_event(
+        ask_text, ask_text_secondary, cta_start, cta_end, cta_margin + ASK_LIFT
+    )
 
     header = [
         "[Script Info]",
@@ -1105,6 +1447,94 @@ def write_telop_ass(path: str, **options) -> str:
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(text)
     return path
+
+
+# ---------------------------------------------------------------------------
+# Japanese narration without word boundaries
+# ---------------------------------------------------------------------------
+# edge-tts reports WordBoundary events for the Japanese voices far less
+# reliably than for the English ones (a Japanese voice often answers with one
+# boundary per sentence, or none at all). The captions still have to follow the
+# voice, so a Japanese narration is split into short sentence cues and spread
+# over the measured length of the audio track.
+_JA_SENTENCE_END = "。！？!?…"
+_JA_CLAUSE_END = "、，,"
+
+
+def split_japanese_sentences(text: str, max_chars: int = SUB_MAX_CHARS) -> List[str]:
+    """A Japanese narration as camera-ready short lines.
+
+    Sentences end at 。！？; a sentence longer than ``max_chars`` is cut at a
+    、 first and then by length, so no cue ever needs more than two lines.
+    """
+    body = re.sub(r"\s+", "", str(text or ""))
+    if not body:
+        return []
+    sentences: List[str] = []
+    current = ""
+    for character in body:
+        current += character
+        if character in _JA_SENTENCE_END:
+            sentences.append(current)
+            current = ""
+    if current:
+        sentences.append(current)
+
+    cues: List[str] = []
+    for sentence in sentences:
+        sentence = sentence.strip()
+        while len(sentence) > max_chars:
+            cut = max_chars
+            for index in range(max_chars - 1, max(max_chars // 2, 4), -1):
+                if sentence[index - 1] in _JA_CLAUSE_END:
+                    cut = index
+                    break
+            cues.append(sentence[:cut])
+            sentence = sentence[cut:]
+        if sentence:
+            cues.append(sentence)
+    # A break that fell right before a full stop left a cue holding only "。":
+    # it belongs to the line above, not on screen by itself.
+    merged: List[str] = []
+    for cue in cues:
+        if merged and all(ch in _JA_SENTENCE_END + _JA_CLAUSE_END for ch in cue):
+            merged[-1] = merged[-1] + cue
+        else:
+            merged.append(cue)
+    return [cue for cue in merged if cue]
+
+
+def spread_cues(
+    cues: Sequence[str],
+    duration: Optional[float],
+    start: float = 0.35,
+    tail: float = 0.25,
+) -> List[dict]:
+    """Timed words for cards when the voice gave no word boundaries.
+
+    Every cue gets a share of the spoken length proportional to its character
+    count, so the captions stay in step with the voice without claiming a
+    precision the source does not have.
+    """
+    items = [clean_word(cue) for cue in cues if clean_word(cue)]
+    if not items:
+        return []
+    try:
+        total = float(duration or 0.0)
+    except (TypeError, ValueError):
+        total = 0.0
+    if not math.isfinite(total) or total <= 0:
+        total = 0.9 * len(items) + start + tail
+    usable = max(total - start - tail, 0.6)
+    weights = [len(item) + 2 for item in items]
+    unit = usable / float(sum(weights) or 1)
+    words: List[dict] = []
+    cursor = start
+    for item, weight in zip(items, weights):
+        span = max(unit * weight, 0.45)
+        words.append({"text": item, "start": round(cursor, 3), "end": round(cursor + span, 3)})
+        cursor += span
+    return words
 
 
 def summarise(cards: Sequence[dict]) -> Dict[str, float]:

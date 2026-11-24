@@ -276,6 +276,70 @@ def create_folder(service, name: str, parent_id: str) -> dict:
     return service.files().create(body=body, fields="id,name,webViewLink").execute()
 
 
+def find_child_by_name(
+    service,
+    folder_id: str,
+    name: str,
+    fields: str = FILE_FIELDS,
+) -> Optional[dict]:
+    """The file called ``name`` directly inside ``folder_id``, or None."""
+    query = (
+        f"'{folder_id}' in parents and trashed = false "
+        f"and name = '{_quote_query_value(name)}'"
+    )
+    for info in _list_all(service, query, fields=fields):
+        if str(info.get("name", "")) == str(name):
+            return info
+    return None
+
+
+def update_file_content(
+    service,
+    file_id: str,
+    local_path: str,
+    mime_type: Optional[str] = None,
+    media_factory: Optional[Callable[[str], object]] = None,
+) -> dict:
+    """Replace the bytes of an existing Drive file (its id and link stay)."""
+    if not os.path.exists(local_path):
+        raise DriveSyncError(f"Cannot upload missing file: {local_path}")
+    factory = media_factory or _drive_media_upload
+    body = {"mimeType": mime_type or guess_mime_type(local_path)}
+    return (
+        service.files()
+        .update(
+            fileId=file_id,
+            body=body,
+            media_body=factory(local_path),
+            fields="id,name,size,modifiedTime",
+        )
+        .execute()
+    )
+
+
+def upload_or_replace(
+    service,
+    local_path: str,
+    folder_id: str,
+    name: Optional[str] = None,
+    media_factory: Optional[Callable[[str], object]] = None,
+    finder: Optional[Callable[[object, str, str], Optional[dict]]] = None,
+) -> dict:
+    """Keep one file of this name in the folder: update it, or create it.
+
+    The PDCA state files are rewritten on every run; replacing them in place
+    keeps a single file in Drive instead of a pile of versions.
+    """
+    target = str(name or os.path.basename(local_path))
+    lookup = finder or find_child_by_name
+    existing = lookup(service, folder_id, target)
+    if existing and existing.get("id"):
+        return update_file_content(
+            service, str(existing["id"]), local_path, media_factory=media_factory
+        )
+    return upload_file(service, local_path, folder_id, name=target, media_factory=media_factory)
+
+
 def ensure_subfolder(
     service,
     parent_id: str,

@@ -33,6 +33,31 @@ CROP_FILTER = "crop=ih*9/16:ih,scale=1080:1920,setsar=1"
 HOOK_TAIL_SECONDS = 4.0
 MIN_MAIN_DURATION = 10.0
 
+# The opening of the Short, chosen per run (see improvement.py).
+#   finish_flash_to_blank - a flash of the finished artwork, then the last
+#                           seconds at natural speed, then the blank paper at
+#                           the start of the time-lapse: "this is where it ends"
+#                           before "this is where it begins";
+#   finish_preview        - the previous look (the tail, no flash);
+#   text_only             - no footage from the tail at all: the time-lapse
+#                           starts on the blank paper and only the hook text
+#                           carries the promise.
+HOOK_STYLE_FLASH = "finish_flash_to_blank"
+HOOK_STYLE_PREVIEW = "finish_preview"
+HOOK_STYLE_TEXT_ONLY = "text_only"
+HOOK_STYLES = (HOOK_STYLE_FLASH, HOOK_STYLE_PREVIEW, HOOK_STYLE_TEXT_ONLY)
+FLASH_SECONDS = 0.4
+FLASH_FADE_SECONDS = 0.12
+# The shortest piece of tail that still reads as "the finished piece" once the
+# flash has taken its share of the hook.
+MIN_HOOK_TAIL_SECONDS = 0.6
+# The brief's hard ceiling: the promise has the first three seconds, no more.
+HOOK_SECONDS_MAX = 3.0
+# How much faster than the target the body may be played (the reflection loop's
+# tempo parameter), kept inside what a viewer can still follow.
+TEMPO_MIN = 0.6
+TEMPO_MAX = 2.5
+
 # The finished artwork is pulled from the very end of the recording, where the
 # paper holds the completed drawing. It is kept uncropped (the 9:16 crop would
 # cut the postcard in half) so it can be used for the shop listing as well.
@@ -372,6 +397,7 @@ def build_hook_command(
     hook_start: float,
     hook_duration: float,
     keep_audio: bool = False,
+    volume_db: float = 0.0,
 ) -> List[str]:
     """Command for the natural-speed finish preview at the start of the Short."""
     cmd = [
@@ -381,7 +407,16 @@ def build_hook_command(
         "-i", input_path,
         "-vf", CROP_FILTER,
     ]
-    cmd += AUDIO_CODEC_ARGS if keep_audio else ["-an"]
+    if keep_audio:
+        try:
+            boost = float(volume_db)
+        except (TypeError, ValueError):
+            boost = 0.0
+        if math.isfinite(boost) and abs(boost) > 0.01:
+            cmd += ["-af", f"volume={boost:.1f}dB"]
+        cmd += AUDIO_CODEC_ARGS
+    else:
+        cmd += ["-an"]
     cmd += VIDEO_CODEC_ARGS
     cmd.append(output_path)
     return cmd
@@ -435,11 +470,17 @@ def build_fit_filter(
     width: int = PROJECT_WIDTH,
     height: int = PROJECT_HEIGHT,
     fps: int = PROJECT_FPS,
+    pad_color: str = "",
 ) -> str:
-    """Letterbox a clip onto the shared 1080x1920 30 fps canvas (no cropping)."""
+    """Letterbox a clip onto the shared 1080x1920 30 fps canvas (no cropping).
+
+    ``pad_color`` keeps the untouched bars looking like paper when the input is
+    a scanned sheet rather than a camera frame.
+    """
+    color = f":color={pad_color}" if pad_color else ""
     return (
         f"scale={int(width)}:{int(height)}:force_original_aspect_ratio=decrease,"
-        f"pad={int(width)}:{int(height)}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={int(fps)}"
+        f"pad={int(width)}:{int(height)}:(ow-iw)/2:(oh-ih)/2{color},setsar=1,fps={int(fps)}"
     )
 
 
@@ -448,6 +489,7 @@ def compute_project_plan(
     target_duration: float = 38.0,
     hook_duration: float = 2.5,
     fallback_duration: float = DEFAULT_CLIP_DURATION_SECONDS,
+    tempo: float = 1.0,
 ) -> Dict[str, object]:
     """Split one Short across the clips of a project, proportionally.
 
@@ -456,6 +498,10 @@ def compute_project_plan(
     add up to the requested main duration. A duration of ``0``/``None`` (Drive
     had no metadata for that file) is replaced by the average of the known
     clips and flagged in ``estimated``.
+
+    ``tempo`` above 1 plays the drawing faster than the target implies, so the
+    Short lands shorter than ``target_duration`` and more of it is movement: the
+    reflection loop raises it when viewers leave during the body.
     """
     if not durations:
         raise ValueError("a project needs at least one video clip")
@@ -478,7 +524,14 @@ def compute_project_plan(
     last_duration = resolved[-1]
     hook_length = min(plan["hook_duration"], last_duration)
     hook_start = max(last_duration - HOOK_TAIL_SECONDS, 0.0)
-    pts = plan["pts_multiplier"]
+    try:
+        speed_up = float(tempo)
+    except (TypeError, ValueError):
+        speed_up = 1.0
+    if not math.isfinite(speed_up) or speed_up <= 0:
+        speed_up = 1.0
+    speed_up = min(max(speed_up, TEMPO_MIN), TEMPO_MAX)
+    pts = plan["pts_multiplier"] / speed_up
 
     return {
         "clip_count": len(resolved),
@@ -488,9 +541,10 @@ def compute_project_plan(
         # The hook comes from the tail of the last clip, at natural speed.
         "hook_start": hook_start,
         "hook_duration": hook_length,
-        "main_duration": plan["main_duration"],
-        "speed_factor": plan["speed_factor"],
+        "main_duration": plan["main_duration"] / speed_up,
+        "speed_factor": plan["speed_factor"] * speed_up,
         "pts_multiplier": pts,
+        "tempo": speed_up,
         "segment_durations": [duration * pts for duration in resolved],
     }
 
@@ -564,12 +618,16 @@ def build_segment_audio_command(
     seek: Optional[float] = None,
     length: Optional[float] = None,
     silence_seconds: Optional[float] = None,
+    volume_db: float = 0.0,
 ) -> List[str]:
     """Sound only (``-vn``), sped up with the bounded atempo chain.
 
     Never pads: a clip without sound gets a silent bed of a fixed length
     instead, so every joined segment carries the same streams, the concat
     demuxer accepts them, and nothing in the graph is endless.
+
+    ``volume_db`` lifts the original drawing sound of the opening hook: the
+    pastel-on-paper noise is the strongest reason to stay past the first second.
     """
     if has_audio:
         cmd = ["ffmpeg", "-y", *_seek_input_args(seek, length), "-i", input_path]
@@ -587,8 +645,17 @@ def build_segment_audio_command(
         speed = float(speed_factor)
     except (TypeError, ValueError):
         speed = 1.0
+    filters: List[str] = []
     if math.isfinite(speed) and speed > 0 and abs(speed - 1.0) > 1e-9:
-        cmd += ["-af", build_atempo_filter(speed)]
+        filters.append(build_atempo_filter(speed))
+    try:
+        boost = float(volume_db)
+    except (TypeError, ValueError):
+        boost = 0.0
+    if has_audio and math.isfinite(boost) and abs(boost) > 0.01:
+        filters.append(f"volume={boost:.1f}dB")
+    if filters:
+        cmd += ["-af", ",".join(filters)]
     cmd += ["-vn", "-map", source_map, *SEGMENT_AUDIO_CODEC_ARGS, output_path]
     return cmd
 
@@ -610,6 +677,117 @@ def build_segment_join_command(
         "-shortest",
         output_path,
     ]
+
+
+def build_still_segment_command(
+    image_path: str,
+    output_path: str,
+    seconds: float,
+    width: int = PROJECT_WIDTH,
+    height: int = PROJECT_HEIGHT,
+    fps: int = PROJECT_FPS,
+    fade: float = FLASH_FADE_SECONDS,
+    pad_color: str = "white",
+    with_audio: bool = True,
+) -> List[str]:
+    """A still held on screen as a segment of the Short (the opening flash).
+
+    The scanned artwork is fitted and padded on white rather than cropped, so
+    the flash really shows the finished postcard, edges included. The fade-in
+    keeps it from appearing as a hard jump cut.
+    """
+    try:
+        length = max(float(seconds or 0.0), 0.05)
+    except (TypeError, ValueError):
+        length = FLASH_SECONDS
+    vf = build_fit_filter(width, height, fps, pad_color=pad_color)
+    try:
+        fade_seconds = min(max(float(fade or 0.0), 0.0), length / 2.0)
+    except (TypeError, ValueError):
+        fade_seconds = 0.0
+    if fade_seconds > 0:
+        vf += f",fade=t=in:st=0:d={fade_seconds:.3f}"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-t", f"{length:.3f}", "-i", image_path,
+    ]
+    if with_audio:
+        cmd += [
+            "-f", "lavfi", "-t", f"{length:.3f}",
+            "-i", f"anullsrc=r={PROJECT_AUDIO_RATE}:cl=stereo",
+            "-vf", vf, "-map", "0:v:0", "-map", "1:a:0",
+            *SEGMENT_VIDEO_CODEC_ARGS, *SEGMENT_AUDIO_CODEC_ARGS,
+            "-shortest", output_path,
+        ]
+    else:
+        cmd += ["-vf", vf, "-an", *SEGMENT_VIDEO_CODEC_ARGS, output_path]
+    return cmd
+
+
+def render_still_segment(
+    image_path: str,
+    output_path: str,
+    seconds: float,
+    with_audio: bool = True,
+    runner: Runner = run_command,
+    **options,
+) -> str:
+    """Render one still as a segment that concatenates with the moving ones."""
+    directory = os.path.dirname(output_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    runner(
+        build_still_segment_command(
+            image_path, output_path, seconds, with_audio=with_audio, **options
+        )
+    )
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"Could not render the opening still: {output_path}")
+    return output_path
+
+
+def compute_hook_plan(
+    hook_style: str = HOOK_STYLE_PREVIEW,
+    hook_duration: float = 2.5,
+    flash_seconds: float = FLASH_SECONDS,
+) -> Dict[str, object]:
+    """Split the opening into its flash and its natural-speed tail.
+
+    ``text_only`` gives the opening away to the time-lapse itself (the hook is
+    then only on-screen text), so every second it does not use goes to the body.
+    The tail is never squeezed below ``MIN_HOOK_TAIL_SECONDS``: a flash with no
+    footage behind it would say "the finished piece" and then jump straight to
+    speeded-up work with nothing in between.
+    """
+    style = str(hook_style or HOOK_STYLE_PREVIEW)
+    if style not in HOOK_STYLES:
+        style = HOOK_STYLE_PREVIEW
+    if style == HOOK_STYLE_TEXT_ONLY:
+        return {"style": style, "flash": 0.0, "tail": 0.0, "total": 0.0}
+    try:
+        total = float(hook_duration)
+    except (TypeError, ValueError):
+        total = 2.5
+    if not math.isfinite(total) or total <= 0:
+        total = 2.5
+    total = min(total, HOOK_SECONDS_MAX)
+
+    flash = 0.0
+    if style == HOOK_STYLE_FLASH and total > MIN_HOOK_TAIL_SECONDS:
+        try:
+            wanted = float(flash_seconds)
+        except (TypeError, ValueError):
+            wanted = FLASH_SECONDS
+        if math.isfinite(wanted) and wanted > 0:
+            flash = min(wanted, total - MIN_HOOK_TAIL_SECONDS)
+    tail = max(total - flash, 0.0)
+    return {
+        "style": style,
+        "flash": round(flash, 3),
+        "tail": round(tail, 3),
+        "total": round(flash + tail, 3),
+    }
 
 
 def _silence_length(
@@ -643,6 +821,7 @@ def render_project_segment(
     seek: Optional[float] = None,
     length: Optional[float] = None,
     duration: Optional[float] = None,
+    volume_db: float = 0.0,
 ) -> str:
     """Render one short segment of a project.
 
@@ -673,6 +852,7 @@ def render_project_segment(
             seek=seek,
             length=length,
             silence_seconds=_silence_length(duration, length, temp_video),
+            volume_db=volume_db,
         ))
         runner(build_segment_join_command(temp_video, temp_audio, output_path))
     finally:
@@ -1023,6 +1203,23 @@ def prepare_scanned_artwork(
     return output_path
 
 
+def _concat_for_runner(pieces: Sequence[str], output_path: str, runner: Runner) -> None:
+    """Join pieces with the concat demuxer, leaving the check to the caller.
+
+    Unlike :func:`concat_segments` this does not require the output to exist
+    afterwards (a test runner records the command only), which keeps the
+    single-recording flow testable without touching FFmpeg.
+    """
+    list_path = f"{os.path.splitext(output_path)[0]}_list.txt"
+    with open(list_path, "w", encoding="utf-8") as handle:
+        handle.write(build_segments_concat_list_content(pieces))
+    try:
+        runner(build_concat_command(list_path, output_path))
+    finally:
+        if os.path.exists(list_path):
+            os.remove(list_path)
+
+
 def build_vertical_timelapse(
     input_path: str,
     output_path: str,
@@ -1030,43 +1227,120 @@ def build_vertical_timelapse(
     hook_duration: float = 2.5,
     keep_audio: bool = False,
     runner: Runner = run_command,
+    hook_style: str = HOOK_STYLE_PREVIEW,
+    flash_image: str = "",
+    flash_seconds: float = FLASH_SECONDS,
+    volume_db: float = 0.0,
+    body_volume_db: float = 0.0,
 ) -> str:
     """Render the 9:16 time-lapse. Original audio is kept only on request.
 
     `keep_audio` is honoured only when the source really has an audio track, so
     the two concat segments always carry the same streams.
+
+    With `hook_style="finish_flash_to_blank"` and a still of the finished piece,
+    the opening becomes a flash of the artwork followed by the tail of the
+    drawing; those pieces are rendered on the shared segment canvas (the whole
+    frame fitted, not cropped) so they join cleanly with any `-c copy` concat.
     """
+    hook = compute_hook_plan(hook_style, hook_duration, flash_seconds)
+    if hook["style"] == HOOK_STYLE_FLASH and flash_image and os.path.exists(flash_image):
+        return _build_styled_timelapse(
+            input_path, output_path, hook,
+            target_duration=target_duration,
+            keep_audio=keep_audio,
+            flash_image=flash_image,
+            volume_db=volume_db,
+            body_volume_db=body_volume_db,
+            runner=runner,
+        )
+
     plan = compute_timelapse_plan(
         probe_duration(input_path),
         target_duration=target_duration,
-        hook_duration=hook_duration,
+        hook_duration=hook["total"],
     )
     keep_audio = bool(keep_audio) and has_audio_stream(input_path)
 
     temp_hook = f"{os.path.splitext(output_path)[0]}_hook.mp4"
     temp_main = f"{os.path.splitext(output_path)[0]}_main.mp4"
-    concat_list = f"{os.path.splitext(output_path)[0]}_list.txt"
-
-    runner(
-        build_hook_command(
-            input_path, temp_hook,
-            plan["hook_start"], plan["hook_duration"], keep_audio=keep_audio,
+    pieces: List[str] = []
+    try:
+        if hook["tail"] > 0:
+            runner(
+                build_hook_command(
+                    input_path, temp_hook,
+                    plan["hook_start"], hook["tail"],
+                    keep_audio=keep_audio, volume_db=volume_db,
+                )
+            )
+            pieces.append(temp_hook)
+        runner(
+            build_main_command(
+                input_path, temp_main,
+                plan["pts_multiplier"], plan["speed_factor"], keep_audio=keep_audio,
+            )
         )
+        pieces.append(temp_main)
+        _concat_for_runner(pieces, output_path, runner)
+    finally:
+        for path in pieces:
+            if os.path.exists(path):
+                os.remove(path)
+    return output_path
+
+
+def _build_styled_timelapse(
+    input_path: str,
+    output_path: str,
+    hook: Dict[str, object],
+    target_duration: float,
+    keep_audio: bool,
+    flash_image: str,
+    volume_db: float,
+    body_volume_db: float,
+    runner: Runner,
+) -> str:
+    """Flash -> tail -> speeded body, all on the segment canvas."""
+    source_seconds = probe_duration(input_path)
+    has_audio = has_audio_stream(input_path)
+    keep_audio = bool(keep_audio) and has_audio
+    plan = compute_timelapse_plan(
+        source_seconds,
+        target_duration=max(float(target_duration) - float(hook["total"]), MIN_MAIN_DURATION),
+        hook_duration=0.0,
     )
-    runner(
-        build_main_command(
-            input_path, temp_main,
-            plan["pts_multiplier"], plan["speed_factor"], keep_audio=keep_audio,
+    stem = os.path.splitext(output_path)[0]
+    flash_path = f"{stem}_flash.mp4"
+    hook_path = f"{stem}_hook.mp4"
+    main_path = f"{stem}_main.mp4"
+    pieces: List[str] = []
+    try:
+        render_still_segment(
+            flash_image, flash_path, hook["flash"],
+            with_audio=keep_audio, runner=runner,
         )
-    )
-
-    with open(concat_list, "w", encoding="utf-8") as f:
-        f.write(build_concat_list_content(temp_hook, temp_main))
-
-    runner(build_concat_command(concat_list, output_path))
-
-    for path in (temp_hook, temp_main, concat_list):
-        if os.path.exists(path):
-            os.remove(path)
-
+        pieces.append(flash_path)
+        if hook["tail"] > 0:
+            start = min(plan["hook_start"], max(source_seconds - hook["tail"], 0.0))
+            render_project_segment(
+                input_path, hook_path,
+                keep_audio=keep_audio, has_audio=has_audio, runner=runner,
+                seek=start, length=hook["tail"], duration=hook["tail"],
+                volume_db=volume_db,
+            )
+            pieces.append(hook_path)
+        render_project_segment(
+            input_path, main_path,
+            pts_multiplier=plan["pts_multiplier"],
+            keep_audio=keep_audio, has_audio=has_audio, runner=runner,
+            duration=plan["main_duration"],
+            volume_db=body_volume_db,
+        )
+        pieces.append(main_path)
+        _concat_for_runner(pieces, output_path, runner)
+    finally:
+        for path in pieces:
+            if os.path.exists(path):
+                os.remove(path)
     return output_path

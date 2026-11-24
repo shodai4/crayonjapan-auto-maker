@@ -511,3 +511,66 @@ class ClientApiVersionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ParameterisedPromptTests(unittest.TestCase):
+    """Requirement 2 and 4: the voice is budgeted and the language is chosen."""
+
+    def params(self, **overrides):
+        import improvement
+
+        base = improvement.validate_params()
+        base.update(overrides)
+        return base
+
+    def test_the_short_length_and_the_word_budget_travel_with_the_prompt(self):
+        prompt = ai_writer.build_script_prompt(
+            "style_B_story", CONFIG, params=self.params(target_duration_sec=24, narration_ratio=0.6)
+        )
+        self.assertIn("about 24 seconds long", prompt)
+        # 24 s * 0.6 = 14.4 s of voice: a 34-44 word range, stated in the prompt
+        self.assertIn("34-44 words", prompt)
+
+    def test_the_short_voice_asks_for_a_brief_timeline(self):
+        prompt = ai_writer.build_script_prompt(
+            "style_B_story", CONFIG, params=self.params(target_duration_sec=28, narration_ratio=0.6)
+        )
+        self.assertIn("stop talking", prompt)
+        self.assertNotIn("3-35 s", prompt)
+
+    def test_a_japanese_short_asks_for_the_japanese_hook_first(self):
+        prompt = ai_writer.build_script_prompt(
+            "style_B_story", CONFIG, params=self.params(language_mode="ja")
+        )
+        self.assertIn("Japanese only", prompt)
+        self.assertIn("hook_ja", prompt)
+
+    def test_a_bilingual_short_explains_the_two_lines(self):
+        prompt = ai_writer.build_script_prompt(
+            "style_B_story", CONFIG, params=self.params(language_mode="bilingual")
+        )
+        self.assertIn("Japanese with the English line under it", prompt)
+
+    def test_an_english_short_keeps_the_english_promise(self):
+        prompt = ai_writer.build_script_prompt(
+            "style_B_story", CONFIG, params=self.params(language_mode="en")
+        )
+        self.assertIn("English only", prompt)
+
+    def test_the_voice_can_be_switched_off(self):
+        prompt = ai_writer.build_script_prompt(
+            "style_B_story", CONFIG, params=self.params(tts_mode="none")
+        )
+        self.assertIn("voice is off", prompt)
+
+    def test_japanese_tags_are_asked_for(self):
+        prompt = ai_writer.build_script_prompt(
+            "style_B_story", CONFIG, params=self.params()
+        )
+        self.assertIn("Japanese ones", prompt)
+
+    def test_without_parameters_the_old_prompt_is_unchanged(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
+        self.assertIn("100-120 words", prompt)
+        self.assertIn("3-35 s", prompt)
+        self.assertNotIn("Japanese only", prompt)

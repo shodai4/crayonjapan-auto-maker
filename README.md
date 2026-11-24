@@ -2,16 +2,21 @@
 
 Automated making-of video pipeline for **CrayonJapan** (<https://crayonjapan.base.shop/>).
 Converts raw hand-drawn **Sakura Cray-Pas Specialist** process videos into 9:16 vertical
-English YouTube Shorts, and adapts the narrative style based on how much of each Short
-viewers actually watch.
+YouTube Shorts, and re-tunes the way they are made from how much of each Short people
+actually watch.
 
 ## What it does
 
-1. **Finish-preview hook** – the last few seconds of the drawing (the finished postcard) are
-   cut at natural speed into the first 2.5 s.
-2. **Vertical time-lapse** – the whole recording is sped up and fitted to 1080x1920 (9:16).
-   A project of several recordings is rendered clip by clip: each raw clip becomes its own
-   short 9:16 segment proportional to its length, and only those small segments are joined.
+1. **Opening hook (0-3 s)** – by default a 0.4 s flash of the *finished* artwork, then the
+   last seconds of the drawing at natural speed, then the blank page the time-lapse starts
+   from: "this is where it ends" before "this is where it begins". The drawing sound under
+   the hook is boosted (+6 dB) because that paper-and-pastel noise is the strongest reason to
+   stay. `hook_style` switches it to the previous finish preview or to text only.
+2. **Vertical time-lapse, 20-32 s by default (28 s)** – the whole recording is sped up and
+   fitted to 1080x1920 (9:16). A project of several recordings is rendered clip by clip: each
+   raw clip becomes its own short 9:16 segment proportional to its length, and only those
+   small segments are joined. `tempo` plays the body faster than the target implies when the
+   reflection asks for it.
 3. **Slow finish + closing zoom (finale)** – the tail of the last clip is replayed at 0.75x
    so the finished piece is actually looked at, then the scanned artwork is pushed in slowly
    (Ken Burns, 1.0 → 1.3 over ~4 s, 1080x1920 30 fps). The scan is first fitted into the frame
@@ -23,18 +28,22 @@ viewers actually watch.
    without a scan, the completed illustration is pulled from the last frame of the last clip.
 5. **Gemini script** – four keyframes (plus the scanned artwork when there is one) are sent to
    `gemini-3-flash-preview`, which returns the title, on-screen hook text, English narration,
-   description and tags as JSON. The narration is written to run the whole Short (100-120
-   words, ~40-45 s: hook in the first 3 s, continuous process description up to 35 s, then the
-   call to action) instead of leaving the second half silent, and it is grounded in the
-   artist's own channel in `config.yaml` (`brand.artist_notes`). The client is pinned to
-   **`v1beta`** (the `gemini-3` models are not served on `v1`, which answers `404 NOT_FOUND`),
-   and if a model is retired, out of free-tier quota or overloaded the next one in
-   `FALLBACK_MODELS` is tried instead.
-6. **Voice + telop** – `edge-tts` (en-US-JennyNeural) narrates, and the word timings it
-   reports become the on-screen telop (see *Telop* below); the SRT cues are still written for
-   the caption track. The narration is measured after it is synthesised: if it runs
-   longer than the planned cut, the closing zoom grows (3-8 s) so `-shortest` never cuts the
-   last line, and the whole Short stays under the 58 s guard.
+   description and tags as JSON, plus the Japanese title / hook / narration for the check and
+   the on-screen Japanese. The voice is budgeted from the target length (about 62 % of the
+   Short: 40-54 words at 28 s) instead of running the whole way through, so the drawing sound
+   keeps a share of it; the prompt is grounded in the artist's own channel in `config.yaml`
+   (`brand.artist_notes`). The client is pinned to **`v1beta`** (the `gemini-3` models are not
+   served on `v1`, which answers `404 NOT_FOUND`), and if a model is retired, out of free-tier
+   quota or overloaded the next one in `FALLBACK_MODELS` is tried instead.
+6. **Voice + telop** – `edge-tts` narrates: en-US-JennyNeural normally, ja-JP-NanamiNeural
+   when the run's `language_mode` is `ja`. The word timings it reports become the on-screen
+   telop (see *Telop* below); the SRT cues are still written for the caption track. When a
+   Japanese voice answers with no usable word boundaries the captions are cut into short
+   sentence cues and spread over the measured voice. The narration is measured after it is
+   synthesised: if it runs longer than the planned cut, the closing zoom grows (3-8 s) so
+   `-shortest` never cuts the last line, and the whole Short stays under the 58 s guard.
+   The voice can also be switched off (`tts_mode: none`): then a silent track keeps the mux
+   valid and the drawing sound carries the Short.
 7. **Shop call to action + upload** – the description is closed with the same two-language
    shop block every time (`Original artwork available at: <shop url>` and
    `1点ものの原画はこちらで販売中です：<shop url>`, in front of the hashtags), so the link to the
@@ -44,10 +53,11 @@ viewers actually watch.
    A plain-text upload pack and an `art_metadata.json` are written next to the video. The pack
    also carries a paste-ready **TikTok / Instagram Reels / Pinterest** caption block, built
    locally from the same script (see *Overseas captions* below).
-8. **Learning loop** – `analytics_updater.py` refreshes views / likes / comments from the
-   YouTube Data API and the average view percentage from the YouTube Analytics API.
-   `choose_best_style()` then reuses the best-performing style, with a 25 % exploration rate
-   so the other styles keep getting a chance.
+8. **Learning loop (PDCA)** – after the 48 h gate, a run restores the history from Drive,
+   collects the numbers of the Shorts that are at least a day old, asks Gemini what to change
+   for the next one, renders with those parameters, and saves the history back to Drive. See
+   *Learning loop* below. `choose_best_style()` still picks the narrative style from the same
+   data, with a 25 % exploration rate so the other styles keep getting a chance.
 9. **Google Drive hub (phase 2)** – `drive_sync.py` watches a Drive folder, renders each
    waiting artwork (a `GO_` project folder or a loose recording) and drops the finished
    package into a second folder, then moves the source into an archive folder. A run only
@@ -60,6 +70,10 @@ viewers actually watch.
 - FFmpeg 5+ with `libx264`, the `subtitles` and `ass` (libass) filters, and `ffprobe` on `PATH`
 - A bold sans font the caption can rely on: `fonts-dejavu-core` is installed by the workflow
   (DejaVu Sans Bold); Liberation Sans is used when that is the face present
+- **No Japanese font to install**: `assets/fonts/NotoSansJP-Bold.otf` (a bold Noto Sans CJK JP
+  subset to the JIS X 0208 character set, ~4 MB, SIL OFL - see `assets/fonts/README.md`) ships
+  with the repository and is handed to libass through `fontsdir=`, because the workflow may
+  not be edited to install one. Kana and kanji render on the runner because of it.
 - A Gemini API key (Google AI Studio)
 - A Google Cloud OAuth client (type: *Desktop app*) with **YouTube Data API v3** and
   **YouTube Analytics API** enabled for the channel the videos are uploaded to (`@CrayonJapan`)
@@ -79,7 +93,10 @@ the plain SRT cues. Every rule below is covered by `tests/test_telop.py`.
 | Karaoke | one overlay per spoken word, on a layer above the card: that word turns gold, grows to 112 % (settling to 106 %) and gets an underline. Every word gap is drawn as a space plus a hard space, in the card and the overlay alike, because one space is not enough room for the grown word: at 124 % its outline ran into its neighbour (`creamyblue`). |
 | Hook | `hook_text` pops in (45 % -> 112 % -> 100 %) over the first 3 s, and always shows its whole sentence: when it does not fit at 96 px the font steps down 2 px at a time (never below 58 px) into two lines, or three when it needs them. It is never cut with an ellipsis. |
 | Fixed title | `CrayonJapan / <title>` (hashtags and emoji removed, accented letters like `é` kept, cut on a word boundary) at 40 px, 60 % transparent, for the whole Short. |
-| Closing line | `telop.cta_text` from `config.yaml` over the outro (`Follow for more oil pastel art!`), in the caption band for at least 2.4 s; when the narration runs so late that the captions are still on screen it stacks just above them instead of drawing gold over white. |
+| Closing line | `cta_text` (and `cta_text_ja`) from `config.yaml` over the outro (`Follow for more oil pastel art!` / `フォローしてね！`), in the caption band for at least 2.4 s; when the narration runs so late that the captions are still on screen it stacks just above them instead of drawing gold over white. |
+| Question | `cta_question_ja` / `cta_question_en` (`次は何を描いてほしい？` / `What should I draw next?`) rides 300 px above the closing line for the same stretch, asking for the next motif in the comment column. |
+| Japanese | kana and kanji are drawn with the bundled **Noto Sans CJK JP** (`\fn` per run, `fontsdir=` on the `ass` filter), measured with the same file so a Japanese line wraps by character, never mid-frame. A line never starts with `。` `、`. |
+| Bilingual | `language_mode: bilingual` puts the Japanese hook large with the English line under it at 62 % and anchors the block under the top bar; the title follows with the Japanese title and the English one under it, starting after the hook so the two never overlap. |
 
 `telop.enabled: false` in `config.yaml` puts the plain SRT burn back; `telop.font` pins a font
 family instead of the auto-detect. The SRT is written either way and stays in the upload pack.
@@ -313,6 +330,48 @@ narration with `amix`. Because FFmpeg's `atempo` only accepts 0.5–2.0 per stag
 time-lapse speed is applied as a chain (e.g. 10x becomes `atempo=2,atempo=2,atempo=2,atempo=1.25`).
 If the source has no audio stream, the render simply stays muted instead of failing.
 
+## Learning loop (PDCA)
+
+Every run measures, reflects, re-renders and remembers. The order matters and is the same one
+the Actions job runs:
+
+```
+restore (Drive) -> collect (YouTube) -> reflect (Gemini) -> render/publish -> save (Drive)
+```
+
+| step | what happens | code |
+| --- | --- | --- |
+| Restore | `performance.csv` and `improvement_state.json` are pulled from Drive over the local copy. The repository's CSV is only the starting point when Drive holds none. | `pdca_state.py` |
+| Collect | The Shorts at least 24 h old (plus any row never measured, at most 8, newest first) are refreshed: views, likes, comments and the uploaded length from the Data API, average view percentage **and average view duration** in one Analytics request. `updated_at` stops the same row being asked twice within 6 h. | `analytics_updater.py` |
+| Reflect | The recent rows (retention, seconds watched vs length, hook style, language, comments) and the current parameters go to Gemini, which answers with a diagnosis, the one thing the next Short tests, and the parameters to change. Out-of-range numbers are clamped, unknown keys dropped. | `improvement.py` |
+| Render | The chosen parameters drive the hook, the length, the tempo, the audio balance, the voice, the on-screen language and the closing question. | `main.py` |
+| Save | The parameters, the reflection and one history entry per run go into `improvement_state.json`, and both state files are written back to Drive (replacing the previous copy). | `pdca_state.py` |
+
+The parameters and their allowed ranges:
+
+| parameter | default | range | what it changes |
+| --- | --- | --- | --- |
+| `target_duration_sec` | 28 | 20-32 | the finished Short |
+| `hook_style` | `finish_flash_to_blank` | `finish_preview`, `text_only` | the opening |
+| `hook_duration_sec` / `hook_flash_seconds` | 2.4 / 0.4 | 1.2-3.0 / 0-0.9 | flash + tail split |
+| `hook_audio_boost_db` | 6 | 0-12 | how loud the drawing sound is in the opening |
+| `finish_hold_seconds` | 2.5 | 1-5 | the slow look at the finished piece |
+| `drawing_audio_volume` | 0.35 | 0-1 | drawing sound under the voice (0 = voice only) |
+| `narration_ratio` | 0.62 | 0.3-0.95 | share of the Short the voice fills |
+| `tempo` | 1.0 | 0.8-2.0 | body speed beyond the target |
+| `language_mode` | `bilingual` | `ja`, `en` | on-screen language (and the voice) |
+| `tts_mode` | `short` | `full`, `none` | how much (or whether) a voice is used |
+| `cta_text` / `cta_text_ja` | Follow line | - | the closing line |
+| `cta_question_en` / `cta_question_ja` | What should I draw next? / 次は何を描いてほしい？ | - | the comment question |
+
+Without enough data (fewer than `improvement.min_rows` measured Shorts), when Gemini fails,
+or when its answer cannot be parsed, the run ships the defaults in `config.yaml`
+(`improvement.defaults`) and logs why - the render never depends on the reflection.
+`--ignore-pdca` renders with those defaults and skips collection, for a comparable manual run.
+
+The state files live in `DRIVE_STATE_FOLDER_ID` when it is set, otherwise in the archive folder
+(`03_ARCHIVE`), which nothing else reads; the workflow needs no change for it.
+
 ## Tests
 
 ```bash
@@ -338,21 +397,42 @@ plus a scanned PNG), run:
 python3 scripts/verify_project_pipeline.py --ffmpeg "$(command -v ffmpeg)"
 ```
 
+To look at the current layout with your own eyes, render one sample from a local recording.
+FFmpeg and edge-tts are the real ones; Gemini and YouTube are replaced by a canned script and a
+fixed parameter set, so nothing is uploaded and no quota is spent:
+
+```bash
+python3 -m scripts.render_preview --input preview/sample.mp4 --language bilingual
+python3 -m scripts.render_preview --input preview/sample.mp4 --language ja --hook-style text_only
+```
+
+The frames worth checking are 0.4 s (the flash), 1.5 s (the hook), the middle of the body, and
+the last 2 s (the question and the follow line):
+
+```bash
+ffmpeg -ss 0.4 -i output_preview/*/*_final.mp4 -frames:v 1 -update 1 frame.png
+```
+
 ## Repository layout
 
 ```
-config.yaml              brand, video, style-evolution and upload settings
-main.py                  pipeline entry point, local watcher and Drive modes
-video_processor.py       9:16 time-lapse, hook cut, ASMR audio retention, artwork still
+config.yaml              brand, video, improvement (PDCA) and upload settings
+main.py                  pipeline entry point, local watcher, Drive mode and the learning steps
+improvement.py           parameter defaults / validation, the reflection prompt and the state
+pdca_state.py            performance.csv + improvement_state.json in Drive
+video_processor.py       9:16 time-lapse, opening flash/hook, ASMR audio retention, artwork still
 ai_writer.py             style selection + Gemini script generation
-metadata_writer.py       English upload pack (.txt) + art metadata (.json), incl. the overseas SNS captions
-drive_sync.py            Google Drive hub: list / download / upload / archive
+metadata_writer.py       upload pack (.txt) + art metadata (.json), incl. the overseas SNS captions
+drive_sync.py            Google Drive hub: list / download / upload / archive / state files
 scripts/verify_drive_access.py  CI pre-flight check for the Drive credential
+scripts/render_preview.py       local sample render for the visual check (no Gemini, no upload)
+assets/fonts/            bundled Noto Sans CJK JP (JIS X 0208 subset) + its OFL licence
 .github/workflows/auto-edit.yml  Actions job: dispatch → render → Drive
 gas/Code_drive_watch.gs  Apps Script half: 1-minute folder watch → repository_dispatch
 youtube_uploader.py      OAuth, Data API upload, Analytics API client
-analytics_updater.py     performance.csv refresh
-analytics/performance.csv one row per uploaded Short
+analytics_updater.py     performance.csv refresh (views, length, retention, seconds watched)
+analytics/performance.csv one row per uploaded Short, with the parameters it was made with
+analytics/improvement_state.json  last parameters, reflection and history (git-ignored)
 tests/                   unittest suite
 ```
 
@@ -375,6 +455,13 @@ tests/                   unittest suite
 
 ## Notes and limitations
 
+- The YouTube Analytics API lags: a fresh upload can answer with no row for a day or more,
+  which is why a row is only collected once it is 24 h old and why a row with no numbers yet is
+  retried on later runs. The Shorts-specific "viewed vs swiped away" figure is not exposed by
+  the API; the loop reads `averageViewPercentage` and `averageViewDuration` instead.
+- The Analytics scope (`yt-analytics.readonly`) only works when the **YouTube Analytics API** is
+  enabled in the same Google Cloud project as the OAuth client, and for the channel the token
+  belongs to (`channel==MINE`).
 - Artworks are processed one at a time; the watcher keeps running if a single one fails.
 - Drive mode needs an item that is fully uploaded. A loose file touched in the last 60 s is
   skipped until a later scan; a `GO_` folder only waits about 15 s after the rename.

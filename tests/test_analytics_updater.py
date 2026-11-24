@@ -189,7 +189,9 @@ class UpdatePerformanceTests(unittest.TestCase):
         self.assertEqual(queries["video==v1"]["startDate"], "2026-11-01")
         self.assertEqual(queries["video==v1"]["endDate"], "2026-11-20")
         self.assertEqual(queries["video==v1"]["ids"], "channel==MINE")
-        self.assertEqual(queries["video==v1"]["metrics"], "averageViewPercentage")
+        # One request asks for both numbers the loop learns from.
+        self.assertIn("averageViewPercentage", queries["video==v1"]["metrics"])
+        self.assertIn("averageViewDuration", queries["video==v1"]["metrics"])
 
     def test_future_date_is_clamped_to_today(self):
         rows = self._rows()
@@ -249,3 +251,202 @@ class FetchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MetricTests(unittest.TestCase):
+    """Requirement 5: the loop needs seconds watched and the Short's length."""
+
+    def test_iso_duration_is_read(self):
+        self.assertAlmostEqual(au.parse_iso_duration("PT46S"), 46.0)
+        self.assertAlmostEqual(au.parse_iso_duration("PT1M3S"), 63.0)
+        self.assertAlmostEqual(au.parse_iso_duration("PT1H2M3.5S"), 3723.5)
+        self.assertIsNone(au.parse_iso_duration("46"))
+        self.assertIsNone(au.parse_iso_duration(None))
+
+    def test_metric_values_are_named_by_the_column_headers(self):
+        response = {
+            "columnHeaders": [
+                {"name": "averageViewPercentage"},
+                {"name": "averageViewDuration"},
+            ],
+            "rows": [[26.9, 12.4]],
+        }
+        values = au.extract_metric_values(response)
+        self.assertAlmostEqual(values["averageViewPercentage"], 26.9)
+        self.assertAlmostEqual(values["averageViewDuration"], 12.4)
+
+    def test_a_reply_without_headers_falls_back_to_the_percentage(self):
+        response = {"rows": [["2026-11-01", "2026-11-20", 61.4]]}
+        self.assertEqual(au.extract_metric_values(response), {})
+        self.assertAlmostEqual(au.extract_average_view_percentage(response), 61.4)
+
+    def test_both_metrics_are_asked_for_in_one_request(self):
+        class Recorder:
+            def __init__(self):
+                self.queries = []
+
+            def reports(self):
+                outer = self
+
+                class Reports:
+                    def query(self, **kwargs):
+                        outer.queries.append(kwargs)
+
+                        class R:
+                            def execute(self_inner):
+                                return {
+                                    "columnHeaders": [
+                                        {"name": "averageViewPercentage"},
+                                        {"name": "averageViewDuration"},
+                                    ],
+                                    "rows": [[30.0, 9.0]],
+                                }
+
+                        return R()
+
+                return Reports()
+
+        analytics = Recorder()
+        values = au.fetch_view_metrics(analytics, "v1", "2026-11-01", "2026-11-20")
+        self.assertEqual(len(analytics.queries), 1)
+        self.assertIn("averageViewPercentage", analytics.queries[0]["metrics"])
+        self.assertIn("averageViewDuration", analytics.queries[0]["metrics"])
+        self.assertAlmostEqual(values["averageViewDuration"], 9.0)
+
+    def test_video_details_carry_the_length(self):
+        class Videos:
+            def __init__(self):
+                self.parts = []
+
+            def list(self, part=None, id=None):
+                self.parts.append(part)
+                return FakeRequest({
+                    "items": [
+                        {
+                            "id": "v1",
+                            "statistics": {"viewCount": "10"},
+                            "contentDetails": {"duration": "PT28S"},
+                        }
+                    ]
+                })
+
+        class YouTube:
+            def __init__(self):
+                self._videos = Videos()
+
+            def videos(self):
+                return self._videos
+
+        youtube = YouTube()
+        details = au.fetch_video_details(youtube, ["v1"])
+        self.assertIn("contentDetails", youtube._videos.parts[0])
+        self.assertAlmostEqual(details["v1"]["duration_sec"], 28.0)
+        self.assertEqual(details["v1"]["statistics"]["viewCount"], "10")
+
+
+class RefreshSelectionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.csv = os.path.join(self.tmp.name, "performance.csv")
+
+    def frame(self):
+        rows = [
+            {"video_id": "old", "date": "2026-11-01", "views": 1000, "avg_view_percentage": 50.0,
+             "updated_at": "2026-11-20T00:00:00+00:00"},
+            {"video_id": "fresh", "date": "2026-11-19", "views": 5, "avg_view_percentage": 0.0,
+             "updated_at": ""},
+            {"video_id": "never", "date": "2026-11-10", "views": 0, "avg_view_percentage": 0.0,
+             "updated_at": ""},
+        ]
+        return au._ensure_columns(pd.DataFrame(rows))
+
+    def test_without_limits_every_row_is_refreshed(self):
+        df = self.frame()
+        self.assertEqual(au.rows_to_refresh(df, today=TODAY), list(df.index))
+
+    def test_a_freshly_measured_row_is_left_alone(self):
+        df = self.frame()
+        now = dt.datetime(2026, 11, 20, 3, tzinfo=dt.timezone.utc)
+        picked = au.rows_to_refresh(df, today=TODAY, min_age_hours=24, refresh_hours=6, now=now)
+        self.assertNotIn(0, picked)  # measured two hours ago
+        self.assertIn(1, picked)     # never measured
+        self.assertIn(2, picked)
+
+    def test_a_short_younger_than_the_age_limit_is_skipped_when_measured(self):
+        df = self.frame()
+        df.loc[1, "views"] = 500
+        df.loc[1, "avg_view_percentage"] = 40.0
+        df.loc[1, "date"] = "2026-11-20"
+        now = dt.datetime(2026, 11, 20, 12, tzinfo=dt.timezone.utc)
+        picked = au.rows_to_refresh(df, today=TODAY, min_age_hours=24, now=now)
+        self.assertNotIn(1, picked)
+
+    def test_the_cap_keeps_the_newest_rows(self):
+        df = self.frame()
+        picked = au.rows_to_refresh(
+            df, today=TODAY, min_age_hours=0, max_rows=2,
+            now=dt.datetime(2026, 11, 21, tzinfo=dt.timezone.utc),
+        )
+        self.assertEqual(len(picked), 2)
+        self.assertNotIn(0, picked)  # the oldest of the three
+
+    def test_the_update_records_the_seconds_and_the_timestamp(self):
+        pd.DataFrame(
+            [
+                {"video_id": "v1", "date": "2026-11-01", "title": "A", "style_used": "s",
+                 "hook_type": "h", "views": 0, "avg_view_percentage": 0.0, "likes": 0,
+                 "comments_count": 0, "top_feedback": ""},
+            ]
+        ).to_csv(self.csv, index=False)
+
+        class Analytics:
+            def reports(self):
+                class Reports:
+                    def query(self, **kwargs):
+                        return FakeRequest({
+                            "columnHeaders": [
+                                {"name": "averageViewPercentage"},
+                                {"name": "averageViewDuration"},
+                            ],
+                            "rows": [[26.9, 12.4]],
+                        })
+
+                return Reports()
+
+        class YouTube:
+            def videos(self):
+                class Videos:
+                    def list(self, part=None, id=None):
+                        return FakeRequest({
+                            "items": [{
+                                "id": "v1",
+                                "statistics": {"viewCount": "268", "likeCount": "4",
+                                               "commentCount": "0"},
+                                "contentDetails": {"duration": "PT46S"},
+                            }]
+                        })
+
+                return Videos()
+
+        df = au.update_performance_metrics(
+            self.csv, youtube=YouTube(), analytics=Analytics(), today=TODAY,
+        )
+        self.assertAlmostEqual(float(df.loc[0, "avg_view_percentage"]), 26.9)
+        self.assertAlmostEqual(float(df.loc[0, "avg_view_duration_sec"]), 12.4)
+        self.assertAlmostEqual(float(df.loc[0, "duration_sec"]), 46.0)
+        self.assertTrue(str(df.loc[0, "updated_at"]).startswith("20"))
+
+    def test_the_new_columns_are_added_to_an_old_file(self):
+        pd.DataFrame(
+            [{"video_id": "v1", "date": "2026-11-01", "title": "A", "style_used": "s",
+              "hook_type": "h", "views": 1, "avg_view_percentage": 2.0, "likes": 0,
+              "comments_count": 0, "top_feedback": ""}]
+        ).to_csv(self.csv, index=False)
+        df = au.update_performance_metrics(
+            self.csv, youtube=FakeYouTube({}), analytics=FakeAnalytics(values={}),
+            with_analytics=False, today=TODAY,
+        )
+        for column in ("avg_view_duration_sec", "language_mode", "tts_mode",
+                       "duration_sec", "target_duration_sec", "params_json", "updated_at"):
+            self.assertIn(column, df.columns)

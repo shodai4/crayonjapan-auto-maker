@@ -140,25 +140,41 @@ def choose_best_style(
     return str(grouped.idxmax())
 
 
-def build_script_prompt(style_key: str, config: dict, reference_scan: bool = False) -> str:
+def _narration_range(style_key: str, params=None) -> tuple:
+    """Words the voice should aim for: the legacy counts, or this run's budget."""
+    if params is None:
+        if style_key == ASMR_STYLE_KEY:
+            return ASMR_NARRATION_MIN_WORDS, ASMR_NARRATION_MAX_WORDS
+        return NARRATION_MIN_WORDS, NARRATION_MAX_WORDS
+    from improvement import narration_word_budget
+
+    low, high = narration_word_budget(params)
+    if style_key == ASMR_STYLE_KEY:
+        # The ASMR style keeps the drawing sound in front, so it talks less.
+        return max(int(round(low * 0.9)), 12), max(int(round(high * 0.9)), 16)
+    return low, high
+
+
+def build_script_prompt(style_key: str, config: dict, reference_scan: bool = False, params=None) -> str:
     """The Gemini prompt for one Short; kept pure so it can be unit tested."""
     styles_cfg = config["evolution"]["styles"]
     style_desc = styles_cfg[style_key]["description"]
     shop_url = config["brand"]["shop_url"]
     material = config["brand"]["material_name"]
     theme = config["brand"].get("theme", "Happy everyday moments")
+    word_min, word_max = _narration_range(style_key, params)
     asmr_note = ""
     if style_key == ASMR_STYLE_KEY:
         asmr_note = (
             f"\nThis is the ASMR style: the drawing sound stays in front, so speak "
-            f"softly and calmly ({ASMR_NARRATION_MIN_WORDS}-{ASMR_NARRATION_MAX_WORDS} words). "
+            f"softly and calmly ({word_min}-{word_max} words). "
             f"Leave at most a one-second beat between sentences - never a long silence - "
             f"and keep every sentence short enough to say in one breath."
         )
     else:
         asmr_note = (
-            f"\nKeep the voice moving for the whole Short: {NARRATION_MIN_WORDS}-"
-            f"{NARRATION_MAX_WORDS} words, one sentence flowing into the next, with no "
+            f"\nKeep the voice moving for the whole stretch it is on: {word_min}-"
+            f"{word_max} words, one sentence flowing into the next, with no "
             f"long pauses and no filler."
         )
     artist_notes = [
@@ -177,6 +193,11 @@ def build_script_prompt(style_key: str, config: dict, reference_scan: bool = Fal
         total_seconds = int(round(float(config["video"].get("target_duration_sec", 45))))
     except (TypeError, ValueError):
         total_seconds = 45
+    if params is not None:
+        try:
+            total_seconds = int(round(float(params.get("target_duration_sec", total_seconds))))
+        except (TypeError, ValueError):
+            pass
     scan_note = ""
     if reference_scan:
         scan_note = (
@@ -185,6 +206,7 @@ def build_script_prompt(style_key: str, config: dict, reference_scan: bool = Fal
             "and let the time-lapse keyframes show how it was drawn."
         )
 
+    timeline, language_block = _run_shape(total_seconds, params)
     return f"""
 You are a creative director for the global art channel "CrayonJapan".
 Analyze the attached making-of keyframes of a hand-drawn postcard artwork.{scan_note}
@@ -196,31 +218,22 @@ Context:
 - Shop URL: {shop_url}
 - Selected Narrative Style ({style_key}): {style_desc}
 {artist_block}
-The finished Short is about {total_seconds} seconds long and the voiceover runs almost
-the whole way through it. Plan the narration on this timeline:
-- 0-3 s: the hook (point 1 below). No greeting, no warm-up.
-- 3-35 s: detailed description of the process, colour by colour, what the hand is
-doing right now, in words a viewer can almost feel. Keep talking: a new sentence
-starts before the previous one has faded, with no long pauses and no
-"and then... and then".
-- 35 s onward: one short, satisfying punchline about the finished piece, written so
-the ending naturally leads back to the opening hook (point 3 below), then the short
-call to action (this 1-of-1 original postcard is available at CrayonJapan, link in
-the description and bio). The call to action may carry the loop, but the punchline
-has to land first.
+The finished Short is about {total_seconds} seconds long. Plan the narration on this
+timeline:
+{timeline}
 
 Three things every Short has to do, woven into the narration itself (never read
 out as a list, never a checklist):
 1. Hook (0-3s): Start with a curiosity-gap sentence. (e.g., "The secret to realistic texture is..." or "You won't believe how this layer transforms...")
 2. Sensory Language: Use words like 'creamy', 'buttery', 'vibrant', 'crisp' to emphasize the material's quality.
 3. Loop-friendly Ending: The last sentence should naturally lead back to the beginning or end with a strong, satisfying punchline.
-
+{language_block}
 Generate a JSON response with the following keys:
-1. "title": Catchy English YouTube Shorts title (under 65 chars, include #Shorts).
+1. "title": Catchy YouTube Shorts title (under 65 chars, include #Shorts).
 2. "hook_text": Short punchy on-screen hook text for the first 2.5 seconds (max 7 words).
-3. "narration": Natural, engaging English voiceover script of {NARRATION_MIN_WORDS}-{NARRATION_MAX_WORDS} words (~40-45 seconds, this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Open on the curiosity-gap hook, keep the sensory words coming, mention {material} naturally, and close so the ending leads back to the opening or lands as a punchline, with the warm call-to-action in the final line. Do not leave a silent stretch longer than a breath anywhere in the Short.
+3. "narration": Natural, engaging voiceover script of {word_min}-{word_max} words (this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Open on the curiosity-gap hook, keep the sensory words coming, mention {material} naturally, and close so the ending leads back to the opening or lands as a punchline. Do not leave a silent stretch longer than a breath anywhere the voice is used.
 4. "description": YouTube description with the artwork story, the material ({material}) and the hashtags (#SakuraCrayPas #CrayPasSpecialist #OilPastelArt #JapaneseArtSupplies #OriginalPostcard #CrayonJapan). The pipeline adds the shop call to action ({shop_url}) to this field itself, so write the story and the hashtags - do not write the shop link or a "shop this piece" line.
-5. "tags": List of 10 relevant English tags.
+5. "tags": List of 10 relevant tags (English names are fine; add 1-2 Japanese ones).
 6. "title_ja": The same title in natural Japanese, keeping "#Shorts" and any emoji.
 7. "hook_ja": The same on-screen hook in natural Japanese, short enough to read in 2.5 seconds.
 8. "narration_ja": The whole narration translated into natural, warm Japanese so the artist can check it before posting - the same meaning and order as "narration", one Japanese sentence per English sentence, no emoji and no stage directions. It is a translation only: never add or drop a fact, and never write a different script.
@@ -231,6 +244,70 @@ Every Japanese field must translate the English field beside it, not re-imagine 
 
 Return strictly valid JSON without markdown fences.{asmr_note}
 """.strip()
+
+
+def _run_shape(total_seconds: int, params=None) -> tuple:
+    """The timeline paragraph and the language instruction for this run.
+
+    Without parameters the original 45-second shape is kept verbatim, so an
+    older config renders exactly what it used to. With parameters the voice is
+    given only the share the run planned for it (the rest belongs to the
+    drawing sound), and the on-screen language follows ``language_mode``.
+    """
+    if params is None:
+        timeline = (
+            "- 0-3 s: the hook (point 1 below). No greeting, no warm-up.\n"
+            "- 3-35 s: detailed description of the process, colour by colour, what the hand is\n"
+            "doing right now, in words a viewer can almost feel. Keep talking: a new sentence\n"
+            "starts before the previous one has faded, with no long pauses and no\n"
+            "\"and then... and then\".\n"
+            "- 35 s onward: one short, satisfying punchline about the finished piece, written so\n"
+            "the ending naturally leads back to the opening hook (point 3 below), then the short\n"
+            "call to action (this 1-of-1 original postcard is available at CrayonJapan, link in\n"
+            "the description and bio). The call to action may carry the loop, but the punchline\n"
+            "has to land first."
+        )
+        return timeline, ""
+
+    from improvement import narrated_seconds
+
+    spoken = narrated_seconds(params)
+    speech_end = max(int(min(spoken, total_seconds - 2)), 6)
+    punch_end = max(min(speech_end + 4, total_seconds - 1), speech_end + 1)
+    tts_mode = str(params.get("tts_mode", "short"))
+    voice_note = (
+        "- The voice is off for this Short (drawing sound only). Write the narration as the\n"
+        "  written story of the artwork for the description, short and vivid.\n"
+        if tts_mode == "none"
+        else (
+            f"- 0-3 s: the hook (point 1 below). No greeting, no warm-up.\n"
+            f"- 3-{speech_end} s: the process, colour by colour, in words a viewer can almost\n"
+            "feel. Nothing about the tools or the channel; only what is happening on the paper.\n"
+            f"- {speech_end}-{punch_end} s: one satisfying punchline about the finished piece that\n"
+            "leads back to the opening, then the short call to action (1-of-1 original, link in\n"
+            "the description). After that the drawing sound and the closing question carry the\n"
+            "ending, so stop talking: no long trailing sentence.\n"
+        )
+    )
+    mode = str(params.get("language_mode", "bilingual"))
+    if mode == "ja":
+        language = (
+            "\nOn-screen language: Japanese only. This Short is for a Japanese audience, so\n"
+            "\"hook_ja\" is the line that actually appears on screen - write it as the real\n"
+            "hook, not a translation afterthought - and \"title_ja\" is the title shown. Keep\n"
+            "the motif name in the words a Japanese viewer would use. The English \"hook_text\"\n"
+            "and \"title\" are still filled in for the upload metadata.\n"
+        )
+    elif mode == "bilingual":
+        language = (
+            "\nOn-screen language: Japanese with the English line under it. \"hook_ja\" is the\n"
+            "main promise on screen (write it to stop a Japanese viewer's thumb, not as a\n"
+            "literal translation), \"hook_text\" is the smaller English line beneath, and\n"
+            "\"title_ja\" follows the title. Keep both short.\n"
+        )
+    else:
+        language = "\nOn-screen language: English only. The Japanese fields are for the artist's check.\n"
+    return "\n".join([voice_note]) if tts_mode == "none" else voice_note, language
 
 
 def _text(value: object) -> str:
@@ -337,6 +414,7 @@ def generate_making_script(
     config: dict,
     model_name: str = MODEL_NAME,
     reference_scan: bool = False,
+    params=None,
 ) -> dict:
     """Send the keyframes to Gemini and return the parsed script dict."""
     from PIL import Image
@@ -346,7 +424,7 @@ def generate_making_script(
         raise RuntimeError("GEMINI_API_KEY is not set (add it to .env)")
 
     client = create_client(api_key)
-    prompt = build_script_prompt(style_key, config, reference_scan=reference_scan)
+    prompt = build_script_prompt(style_key, config, reference_scan=reference_scan, params=params)
 
     contents: List[object] = [prompt]
     for path in keyframe_paths:

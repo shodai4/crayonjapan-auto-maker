@@ -514,7 +514,12 @@ class AccentedTitleTests(unittest.TestCase):
         self.assertEqual(telop._strip_emoji("Warm 🌸 layer ✨🔥 ✦ → ♪"), "Warm layer")
 
     def test_a_script_the_face_cannot_draw_is_dropped_with_the_emoji(self):
-        self.assertEqual(telop._strip_emoji("Blue ブルー sky"), "Blue sky")
+        # The bundled Japanese face is what makes kana/kanji drawable: without
+        # it they would land as tofu boxes, so they are dropped like emoji.
+        self.assertEqual(telop._strip_emoji("Blue ブルー sky"), "Blue ブルー sky")
+        with mock.patch.object(telop, "japanese_font_available", return_value=False):
+            self.assertEqual(telop._strip_emoji("Blue ブルー sky"), "Blue sky")
+            self.assertEqual(telop._strip_emoji("油絵具について 😀"), "")
 
     def test_the_word_at_the_cut_is_not_dropped_when_it_is_whole(self):
         title = telop.clean_title("Turning a Pokémon Card into Thick Oil Pastel Art", "CrayonJapan")
@@ -647,3 +652,138 @@ class ClosingLineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JapaneseTelopTests(unittest.TestCase):
+    """Requirement 4: Japanese on screen, and a bilingual option."""
+
+    def test_the_bundled_japanese_face_is_in_the_repository(self):
+        self.assertTrue(telop.japanese_font_available())
+        self.assertTrue(os.path.isfile(telop.JP_FONT_FILE))
+        self.assertGreater(os.path.getsize(telop.JP_FONT_FILE), 100_000)
+        self.assertEqual(telop.japanese_fonts_dir(), telop.JP_FONT_DIR)
+
+    def test_kana_and_kanji_are_measured_in_the_japanese_face(self):
+        self.assertTrue(telop.contains_cjk("ポケモンカード"))
+        self.assertFalse(telop.contains_cjk("Pokemon card"))
+        width = telop.text_width("あ", 96, telop.JP_FONT_FAMILY)
+        self.assertGreater(width, 40)
+
+    def test_japanese_wraps_by_character_not_by_space(self):
+        layout = telop.LineLayout(96, 900, 96, telop.JP_FONT_FAMILY)
+        lines = layout.wrap_cjk("次の動画で描いてほしいものをコメントで教えてくださいね")
+        self.assertGreater(len(lines), 1)
+        self.assertTrue(all(layout.fits(line) for line in lines))
+        self.assertEqual("".join(lines), "次の動画で描いてほしいものをコメントで教えてくださいね")
+
+    def test_a_line_never_starts_with_a_closing_mark(self):
+        layout = telop.LineLayout(72, 300, 72, telop.JP_FONT_FAMILY)
+        lines = layout.wrap_cjk("あいうえお、かきくけこ。")
+        for line in lines[1:]:
+            self.assertNotIn(line[0], "、。")
+
+    def test_a_bilingual_hook_shows_the_japanese_first_and_the_english_under_it(self):
+        ass = telop.build_telop_ass(
+            [],
+            hook_text="ポケモンカードを描いてみた",
+            hook_text_secondary="I drew a Pokemon card",
+            video_seconds=8.0,
+        )
+        row = next(row for row in dialogues(ass) if row["style"] == "Hook")
+        self.assertIn("ポケモンカード", row["text"])
+        self.assertIn("I drew", row["text"])
+        # The Japanese block is the big one; the translation carries its own size.
+        japanese_at = row["text"].index("ポケモンカード")
+        english_at = row["text"].index("I drew")
+        self.assertLess(japanese_at, english_at)
+        self.assertIn("\\fn" + telop.JP_FONT_FAMILY, row["text"])
+        sizes = [int(size) for size in re.findall(r"\\fs(\d+)", row["text"])]
+        self.assertGreater(sizes[0], sizes[-1])
+
+    def test_a_english_only_hook_is_unchanged(self):
+        ass = telop.build_telop_ass([], hook_text="One warm layer", video_seconds=6.0)
+        row = next(row for row in dialogues(ass) if row["style"] == "Hook")
+        self.assertEqual(visible_text(row["text"]), "One warm layer")
+        self.assertNotIn("\\fn", row["text"])
+
+    def test_a_japanese_title_carries_the_japanese_face(self):
+        ass = telop.build_telop_ass(
+            [], title="オイルパステル / ポケモンカード", video_seconds=6.0
+        )
+        row = next(row for row in dialogues(ass) if row["style"] == "Title")
+        self.assertIn("ポケモンカード", row["text"])
+        self.assertIn("\\fn" + telop.JP_FONT_FAMILY, row["text"])
+
+
+class ClosingQuestionTests(unittest.TestCase):
+    """Requirement 3: the ending asks for the next idea."""
+
+    def ass(self, **kwargs):
+        return telop.build_telop_ass([], video_seconds=24.0, **kwargs)
+
+    def test_the_ask_style_exists(self):
+        styles = style_rows(self.ass())
+        self.assertIn("Ask", styles)
+        self.assertGreater(styles["Ask"]["margin_v"], styles["Cta"]["margin_v"])
+
+    def test_the_question_is_shown_above_the_follow_line(self):
+        ass = self.ass(
+            ask_text="次は何を描いてほしい？",
+            ask_text_secondary="What should I draw next?",
+        )
+        ask = next(row for row in dialogues(ass) if row["style"] == "Ask")
+        self.assertIn("次は何を描いてほしい", ask["text"])
+        self.assertIn("What should I draw", ask["text"])
+        cta = next(row for row in dialogues(ass) if row["style"] == "Cta")
+        self.assertAlmostEqual(ask["start"], cta["start"], places=1)
+        self.assertAlmostEqual(ask["end"], cta["end"], places=1)
+
+    def test_without_an_ask_text_nothing_extra_is_drawn(self):
+        ass = self.ass()
+        self.assertFalse([row for row in dialogues(ass) if row["style"] == "Ask"])
+
+    def test_the_ask_keeps_its_own_scale_for_both_languages(self):
+        ass = self.ass(
+            ask_text="次は何を描いてほしい？",
+            ask_text_secondary="What should I draw next?",
+        )
+        ask = next(row for row in dialogues(ass) if row["style"] == "Ask")
+        sizes = [int(size) for size in re.findall(r"\\fs(\d+)", ask["text"])]
+        self.assertGreater(sizes[0], sizes[-1])
+
+
+class JapaneseCueTests(unittest.TestCase):
+    """A Japanese voice rarely reports word boundaries: the cues are spread."""
+
+    def test_sentences_are_split_and_kept_short(self):
+        cues = telop.split_japanese_sentences(
+            "今日はポケモンカードを描きました。色を重ねるのが楽しいですね。"
+        )
+        self.assertEqual(len(cues), 2)
+        self.assertTrue(all(len(cue) <= telop.SUB_MAX_CHARS + 1 for cue in cues), cues)
+
+    def test_a_long_sentence_is_cut_at_a_clause(self):
+        cues = telop.split_japanese_sentences(
+            "まずは下書きをして、そのあとに色を重ねて、最後にハイライトを入れました。",
+            max_chars=12,
+        )
+        self.assertGreater(len(cues), 1)
+        self.assertTrue(all(cue.strip() for cue in cues))
+
+    def test_no_cue_holds_only_punctuation(self):
+        cues = telop.split_japanese_sentences("あ" * 17 + "。次です。", max_chars=16)
+        self.assertTrue(all(any(ch not in "。！？、，" for ch in cue) for cue in cues), cues)
+
+    def test_the_cues_follow_the_measured_voice(self):
+        cues = ["今日はポケモンカードを描きました。", "色を重ねるのが楽しいですね。"]
+        words = telop.spread_cues(cues, 8.0)
+        self.assertEqual(len(words), 2)
+        self.assertGreaterEqual(words[0]["start"], 0.3)
+        self.assertLessEqual(words[-1]["end"], 8.0)
+        self.assertLess(words[0]["end"], words[1]["start"] + 0.01)
+
+    def test_cues_become_cards(self):
+        words = telop.spread_cues(["今日はポケモンカードを描きました。"], 4.0)
+        cards = telop.plan_cards(words)
+        self.assertEqual(len(cards), 1)
+        self.assertIn("ポケモンカード", cards[0]["text"])

@@ -213,13 +213,23 @@ def build_upload_body(
     }
 
 
-def build_analytics_query(video_id: str, start_date: str, end_date: str) -> dict:
-    """Parameters for youtubeAnalytics.reports().query for one video."""
+def build_analytics_query(
+    video_id: str,
+    start_date: str,
+    end_date: str,
+    metrics: Sequence[str] = (ANALYTICS_METRIC,),
+) -> dict:
+    """Parameters for youtubeAnalytics.reports().query for one video.
+
+    ``metrics`` is a sequence so one request can ask for the retention and the
+    average view duration together (one quota unit, one round trip).
+    """
+    requested = [metric for metric in metrics if metric] or [ANALYTICS_METRIC]
     return {
         "ids": "channel==MINE",
         "startDate": start_date,
         "endDate": end_date,
-        "metrics": ANALYTICS_METRIC,
+        "metrics": ",".join(requested),
         "filters": f"video=={video_id}",
     }
 

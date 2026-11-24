@@ -15,12 +15,58 @@ brand:
     - "Past work: a 100-day drawing project that ended with a solo exhibition at Atelier Sangatsu in Nakazaki-cho, Osaka. The exhibition is over now, so it may only ever be mentioned in the past."
 
 video:
-  target_duration_sec: 45
-  hook_duration_sec: 2.5
+  target_duration_sec: 28
+  hook_duration_sec: 2.4
   aspect_ratio: "9:16"
   width: 1080
   height: 1920
   motion_threshold: 1.8
+
+# The PDCA loop (see improvement.py). `defaults` is where a run starts: the
+# reflection may move any of these inside its allowed range, and falls back here
+# when there is no measured Short yet or Gemini cannot answer.
+improvement:
+  enabled: true
+  # Two measured Shorts are enough to say something; before that the defaults
+  # below are used and no Gemini call is spent.
+  min_rows: 2
+  review_model: "gemini-3-flash-preview"
+  # What the reflection is told about the audience (checked on 2026-11-25 in
+  # YouTube Studio): English titles did not stop 89 % of the viewers being in
+  # Japan, and the long Pokémon-card Short lost most of them in the first
+  # seconds.
+  audience_note: >-
+    YouTube Studio, 2026-11-25: 89% of the viewers of the English-titled Shorts
+    were in Japan. "Pokemon card" (46 s, 2026-11-23) got 268 views with a 26.9%
+    retention - 73.1% swiped away within the first seconds - and 36.4% average
+    view (about 17 s watched). "Blue candy" (83 s) got 1,044 views at 50.0%
+    retention. Most Shorts so far were 45-50 s.
+  # Which rows the collect step asks YouTube about.
+  collect:
+    min_age_hours: 24
+    max_rows: 8
+    refresh_hours: 6
+  defaults:
+    # 20-30 s: the length the brief asks for, and the one the data supports.
+    target_duration_sec: 28
+    # finished artwork flash -> the last seconds -> the blank page
+    hook_style: "finish_flash_to_blank"
+    hook_duration_sec: 2.4
+    hook_flash_seconds: 0.4
+    # the paper-and-pastel sound is the strongest reason to stay
+    hook_audio_boost_db: 6
+    finish_hold_seconds: 2.5
+    drawing_audio_volume: 0.35
+    # the voice fills ~62% of the Short; the rest is drawing sound
+    narration_ratio: 0.62
+    tempo: 1.0
+    # Japanese on screen with the English line under it (89% of viewers: Japan)
+    language_mode: "bilingual"
+    tts_mode: "short"
+    cta_text: "Follow for more oil pastel art!"
+    cta_text_ja: "フォローしてね！"
+    cta_question_en: "What should I draw next?"
+    cta_question_ja: "次は何を描いてほしい？"
 
 evolution:
   exploration_rate: 0.25

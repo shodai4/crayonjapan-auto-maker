@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import shutil
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -19,6 +21,8 @@ import pandas as pd
 import yaml
 
 import drive_sync
+import improvement
+import pdca_state
 import telop
 from ai_writer import (
     ASMR_STYLE_KEY,
@@ -26,7 +30,7 @@ from ai_writer import (
     choose_best_style,
     generate_making_script,
 )
-from analytics_updater import CSV_COLUMNS
+from analytics_updater import CSV_COLUMNS, update_performance_metrics
 from metadata_writer import JST, ensure_shop_cta, write_metadata_files
 from video_processor import (
     DEFAULT_ARTWORK_OFFSET,
@@ -34,6 +38,7 @@ from video_processor import (
     assemble_finale,
     build_vertical_timelapse,
     compute_finish_window,
+    compute_hook_plan,
     compute_project_plan,
     concat_segments,
     ensure_disk_space,
@@ -44,6 +49,7 @@ from video_processor import (
     probe_audio_seconds,
     probe_duration,
     render_project_segment,
+    render_still_segment,
     run_command,
 )
 from youtube_uploader import get_latest_upload_time, upload_short
@@ -61,6 +67,10 @@ RAW_LOCAL_EXTENSIONS = (".mp4", ".mov", ".avi")
 HOOK_TYPE = "finish_preview_2.5s"
 TTS_VOICE = "en-US-JennyNeural"
 TTS_RATE = "+5%"
+# A Japanese Short is spoken by a Japanese voice, a touch faster: the same
+# message in fewer syllables, and the audience is in Japan.
+TTS_VOICE_JA = "ja-JP-NanamiNeural"
+TTS_RATE_JA = "+8%"
 # edge-tts 7 defaults to SentenceBoundary, so the subtitle cues only arrive on
 # the channel we ask for. Word timing matches the previous edge-tts 6 output
 # (one cue per word); either channel is accepted so a version that ignores the
@@ -98,8 +108,16 @@ def build_subtitle_filter(srt_path: str) -> str:
 
 
 def build_ass_filter(ass_path: str) -> str:
-    """Burn the telop ASS document; its styles travel inside the file."""
-    return f"ass='{_escaped_filter_path(ass_path)}'"
+    """Burn the telop ASS document; its styles travel inside the file.
+
+    ``fontsdir`` points libass at the bundled Japanese face, so kana and kanji
+    render on the runner even though the workflow only installs a Latin font.
+    """
+    path = _escaped_filter_path(ass_path)
+    fonts_dir = telop.japanese_fonts_dir()
+    if not fonts_dir:
+        return f"ass='{path}'"
+    return f"ass=filename='{path}':fontsdir='{_escaped_filter_path(fonts_dir)}'"
 
 
 def build_mux_command(
@@ -110,6 +128,7 @@ def build_mux_command(
     mix_original_audio: bool = False,
     with_subtitles: bool = True,
     ass_path: str = "",
+    original_volume: float = 0.55,
 ) -> List[str]:
     """Burn subtitles and lay the narration over the time-lapse.
 
@@ -128,10 +147,14 @@ def build_mux_command(
         picture = f"[0:v]{build_subtitle_filter(srt_path)}[v]"
     else:
         picture = "[0:v]null[v]"
+    try:
+        level = min(max(float(original_volume), 0.0), 2.0)
+    except (TypeError, ValueError):
+        level = 0.55
     if mix_original_audio:
         filter_complex = (
             f"{picture};"
-            "[0:a]volume=0.55[orig];"
+            f"[0:a]volume={level:.2f}[orig];"
             "[1:a]volume=1.0[narr];"
             "[narr]apad[narrpad];"
             "[orig][narrpad]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]"
@@ -254,6 +277,28 @@ def subtitles_available(srt_path: str) -> bool:
         return False
 
 
+def _on_screen_lines(
+    english: str,
+    japanese: str,
+    language_mode: str,
+) -> tuple:
+    """The primary and secondary on-screen line for a hook/title/ask.
+
+    ``ja`` shows Japanese only, ``en`` English only, and ``bilingual`` shows the
+    Japanese line large with the English one under it (the audience is mostly in
+    Japan; the English stays so the overseas viewers are not shut out).
+    """
+    english = str(english or "").strip()
+    japanese = str(japanese or "").strip()
+    if language_mode == "ja":
+        return (japanese or english, "")
+    if language_mode == "bilingual":
+        if japanese and english and japanese != english:
+            return (japanese, english)
+        return (japanese or english, "")
+    return (english or japanese, "")
+
+
 def write_telop(
     base_name: str,
     output_dir: str,
@@ -261,6 +306,7 @@ def write_telop(
     config: dict,
     video_seconds: Optional[float] = None,
     marked: Sequence[str] = (),
+    params: Optional[dict] = None,
 ) -> str:
     """Lay out the ASS telop for one Short and return its path.
 
@@ -268,33 +314,69 @@ def write_telop(
     one config line away. The word timings come from the voice step; without
     them the hook, title and closing line are still burned, which is what a
     voice that answered without boundaries can offer.
+
+    ``params`` decides the language of the on-screen text and the closing
+    question; without it the original English-only look is kept.
     """
     settings = config.get("telop") or {}
     if settings.get("enabled", True) is False:
         print("      telop disabled in config.yaml; burning the plain SRT cues")
         return ""
 
+    params = params or {}
+    language_mode = str(params.get("language_mode") or "en")
     words = telop.load_word_timings(f"{output_dir}/{base_name}_words.json")
     series_label = str(settings.get("series_label") or config["brand"].get("name", ""))
     title = telop.clean_title(str(script_data.get("title", "")), series_label)
+    title_en_short = telop.clean_title(str(script_data.get("title", "")), "")
+    title_ja = telop.clean_title(str(script_data.get("title_ja", "")), "", max_chars=26)
     hook = telop.clean_hook(str(script_data.get("hook_text", "")))
-    cta = telop.clean_caption_text(str(settings.get("cta_text", DEFAULT_CTA_TEXT)))
+    hook_ja = telop.clean_hook(str(script_data.get("hook_ja", "")))
+    primary_hook, secondary_hook = _on_screen_lines(hook, hook_ja, language_mode)
+    # The title is one line of its own: the series label prefixes the English
+    # title, and a Japanese title is never prefixed (22 characters would leave
+    # nothing but the label once the cut ran through it).
+    if language_mode == "ja" or (language_mode == "bilingual" and title_ja):
+        primary_title, secondary_title = title_ja, (
+            title_en_short if language_mode == "bilingual" else ""
+        )
+    else:
+        primary_title, secondary_title = title, ""
+    cta_en = telop.clean_caption_text(
+        str(params.get("cta_text") or settings.get("cta_text", DEFAULT_CTA_TEXT))
+    )
+    cta_ja = telop.clean_caption_text(str(params.get("cta_text_ja") or ""))
+    if language_mode == "ja":
+        primary_cta, secondary_cta = (cta_ja or cta_en), ""
+    elif language_mode == "bilingual" and cta_ja:
+        primary_cta, secondary_cta = cta_ja, cta_en
+    else:
+        primary_cta, secondary_cta = cta_en, ""
+    ask_ja = str(params.get("cta_question_ja") or telop.DEFAULT_ASK_JA)
+    ask_en = str(params.get("cta_question_en") or telop.DEFAULT_ASK_EN)
+    primary_ask, secondary_ask = _on_screen_lines(ask_en, ask_ja, language_mode)
     font = str(settings.get("font") or "") or telop.detect_font()
 
     path = telop.write_telop_ass(
         f"{output_dir}/{base_name}.ass",
         words=words,
-        hook_text=hook,
-        title=title,
-        cta_text=cta,
+        hook_text=primary_hook,
+        hook_text_secondary=secondary_hook,
+        title=primary_title,
+        title_secondary=secondary_title,
+        cta_text=primary_cta,
+        cta_secondary=secondary_cta,
+        ask_text=primary_ask,
+        ask_text_secondary=secondary_ask,
         video_seconds=video_seconds,
         font_name=font,
         marked=marked,
+        karaoke=language_mode != "ja",
     )
     stats = telop.summarise(telop.plan_cards(words, marked=marked))
     print(
         f"      {int(stats['cards'])} caption card(s) in {font}, "
-        f"longest line {int(stats['longest_line'])} chars"
+        f"longest line {int(stats['longest_line'])} chars, language={language_mode}"
     )
     return path
 
@@ -306,10 +388,9 @@ def mux_audio_and_subtitles(
     final_path: str,
     keep_original_audio: bool = False,
     ass_path: str = "",
+    original_volume: float = 0.55,
 ) -> str:
     """Render the upload-ready file."""
-    import subprocess
-
     mix = bool(keep_original_audio) and has_audio_stream(video_path)
     with_subtitles = subtitles_available(srt_path)
     if ass_path and os.path.exists(ass_path):
@@ -322,6 +403,7 @@ def mux_audio_and_subtitles(
             mix_original_audio=mix,
             with_subtitles=with_subtitles,
             ass_path=ass_path if os.path.exists(ass_path) else "",
+            original_volume=original_volume,
         ),
         check=True,
     )
@@ -335,20 +417,36 @@ def append_performance_row(
     csv_path: str = CSV_PATH,
     date: Optional[str] = None,
     hook_type: str = HOOK_TYPE,
+    params: Optional[dict] = None,
+    duration_sec: float = 0.0,
 ) -> pd.DataFrame:
-    """Record the new Short so the style evolution has data to learn from."""
-    new_row = pd.DataFrame([{
+    """Record the new Short so the next reflection knows what made it.
+
+    Besides the identity of the upload, the row carries the parameters it was
+    made with: without them the numbers cannot be attributed to a hook style, a
+    language or a length, and the loop would only see noise.
+    """
+    params = params or {}
+    row = {
         "video_id": video_id,
         "date": date or datetime.now().strftime("%Y-%m-%d"),
         "title": script_data.get("title", ""),
         "style_used": style_key,
-        "hook_type": hook_type,
+        "hook_type": str(params.get("hook_style") or hook_type),
         "views": 0,
         "avg_view_percentage": 0.0,
+        "avg_view_duration_sec": 0.0,
         "likes": 0,
         "comments_count": 0,
+        "language_mode": str(params.get("language_mode") or ""),
+        "tts_mode": str(params.get("tts_mode") or ""),
+        "duration_sec": round(float(duration_sec or 0.0), 3),
+        "target_duration_sec": params.get("target_duration_sec", ""),
+        "params_json": json.dumps(params, ensure_ascii=False, sort_keys=True) if params else "",
         "top_feedback": "",
-    }])
+        "updated_at": "",
+    }
+    new_row = pd.DataFrame([row])
     if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
         df = pd.read_csv(csv_path)
         df = pd.concat([df, new_row], ignore_index=True)
@@ -409,6 +507,75 @@ def _clip_local_path(work_dir: str, index: int, ref: drive_sync.DriveFileRef) ->
     return os.path.join(work_dir, f"{index:02d}_{name or 'clip.mp4'}")
 
 
+def write_silent_audio(path: str, seconds: float = 0.5) -> str:
+    """A short silent track, for a Short whose voice is switched off.
+
+    The mux expects an audio input; ``apad`` then stretches this silence to the
+    length of the picture, which is what leaves the drawing sound alone.
+    """
+    try:
+        length = max(float(seconds or 0.5), 0.2)
+    except (TypeError, ValueError):
+        length = 0.5
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", f"{length:.2f}", "-c:a", "libmp3lame", "-q:a", "7", path,
+        ],
+        check=True,
+    )
+    return path
+
+
+def _narrate(
+    script_data: dict,
+    audio_path: str,
+    srt_path: str,
+    words_path: str,
+    params: dict,
+    language_mode: str,
+    tts_mode: str,
+) -> tuple:
+    """Voice the script in the run's language, or leave the drawing sound alone.
+
+    Returns ``(words, marked)``: the timed words for the telop and the words the
+    script emphasised. With ``tts_mode="none"`` a short silent track is written
+    instead, so the mux still has an audio input to pad.
+    """
+    english, marked = telop.strip_emphasis_markers(str(script_data.get("narration") or ""))
+    japanese, _ = telop.strip_emphasis_markers(str(script_data.get("narration_ja") or ""))
+    if tts_mode == "none":
+        write_silent_audio(audio_path)
+        with open(srt_path, "w", encoding="utf-8") as handle:
+            handle.write("")
+        print("      voice off (drawing sound only); a silent track keeps the mux valid")
+        return [], []
+
+    spoken = english
+    voice, rate = TTS_VOICE, TTS_RATE
+    if language_mode == "ja":
+        if japanese:
+            spoken, voice, rate = japanese, TTS_VOICE_JA, TTS_RATE_JA
+            marked = []  # the English emphasis markers do not exist in Japanese
+        else:
+            print("      no Japanese narration to speak; falling back to the English voice")
+    words = asyncio.run(
+        synthesize_voice(spoken, audio_path, srt_path, voice=voice, rate=rate, words_path=words_path)
+    )
+    if telop.contains_cjk(spoken):
+        # Japanese boundaries arrive in sentence-sized chunks with timings that
+        # do not add up (one 0.3 s span for a whole sentence), so the captions
+        # are cut from the sentences themselves and spread over the measured
+        # voice: predictable, one line per beat, in step with the audio.
+        cues = telop.split_japanese_sentences(spoken)
+        words = telop.spread_cues(cues, probe_audio_seconds(audio_path))
+        if words:
+            telop.write_word_timings(words_path, words)
+            print(f"      {len(words)} Japanese cue(s) spread over the voice")
+    return words, marked
+
+
 def _publish_bundle(
     base_name: str,
     raw_vertical: str,
@@ -420,20 +587,29 @@ def _publish_bundle(
     output_folder: str = "",
     reference_scan: bool = False,
     finale: Optional[dict] = None,
+    params: Optional[dict] = None,
 ) -> dict:
     """Script, voice, subtitles, upload pack and (optionally) the upload.
 
     ``finale`` turns the hook/body/finish cut into the final picture: after the
     voice is measured, a slow zoom over the artwork is appended so the video
     ends with the narration instead of cutting it off.
+
+    ``params`` is this run's parameter set (language, voice mode, closing
+    question...); it defaults to the active set or config.yaml's defaults.
     """
+    params = dict(params or improvement.active_params(config))
+    language_mode = str(params.get("language_mode") or "en")
+    tts_mode = str(params.get("tts_mode") or "short")
+    drawing_volume = float(params.get("drawing_audio_volume") or 0.0)
+
     audio_path = f"{output_dir}/{base_name}.mp3"
     srt_path = f"{output_dir}/{base_name}.srt"
     words_path = f"{output_dir}/{base_name}_words.json"
     final_video = f"{output_dir}/{base_name}_final.mp4"
     keyframe_dir = f"{output_dir}/{base_name}_frames"
 
-    print("[3/6] Extracting keyframes & writing the English script...")
+    print("[3/6] Extracting keyframes & writing the script...")
     # The finale is appended later, so the frames come from the cut that exists.
     frames_source = (finale or {}).get("base_video") or raw_vertical
     frames = extract_keyframes(frames_source, keyframe_dir)
@@ -442,7 +618,7 @@ def _publish_bundle(
         # so Gemini sees it first, next to the time-lapse keyframes.
         frames = [artwork_path] + frames
     script_data = generate_making_script(
-        frames, style_key, config, reference_scan=reference_scan
+        frames, style_key, config, reference_scan=reference_scan, params=params
     )
     # The shop link and the "original artwork" line are put in here, not left to
     # the model: the pack and the upload both read this same description.
@@ -450,12 +626,10 @@ def _publish_bundle(
         script_data.get("description"), config["brand"].get("shop_url", "")
     )
 
-    print(f"[4/6] Generating English voiceover ({style_key})...")
-    # **word** markers are the script's own emphasis: spoken without them,
-    # highlighted on screen instead.
-    narration, marked_words = telop.strip_emphasis_markers(script_data["narration"])
-    asyncio.run(
-        synthesize_voice(narration, audio_path, srt_path, words_path=words_path)
+    print(f"[4/6] Voicing the script ({style_key}, lang={language_mode}, voice={tts_mode})...")
+    words, marked_words = _narrate(
+        script_data, audio_path, srt_path, words_path,
+        params, language_mode, tts_mode,
     )
 
     vertical = raw_vertical
@@ -467,7 +641,7 @@ def _publish_bundle(
             artwork_path=artwork_path,
             output_path=raw_vertical,
             target_total=float(finale["target_total"]),
-            narration_seconds=probe_audio_seconds(audio_path),
+            narration_seconds=probe_audio_seconds(audio_path) if tts_mode != "none" else None,
             runner=finale["runner"],
         )
         print(
@@ -477,7 +651,11 @@ def _publish_bundle(
         )
 
     print("[5/6] Laying out the telop and mixing audio...")
-    keep_audio = should_keep_audio(style_key)
+    # The drawing sound is what sells the material, so it stays under the voice
+    # (or alone, when the voice is off); ASMR keeps its louder bed.
+    asmr = should_keep_audio(style_key)
+    keep_audio = asmr or drawing_volume > 0
+    original_volume = max(drawing_volume, 0.55) if asmr else drawing_volume
     video_seconds = float((finale_plan or {}).get("total_seconds") or 0.0)
     if video_seconds <= 0:
         video_seconds = probe_duration(vertical)
@@ -488,14 +666,16 @@ def _publish_bundle(
         config=config,
         video_seconds=video_seconds,
         marked=marked_words,
+        params=params,
     )
     mux_audio_and_subtitles(
         vertical, audio_path, srt_path, final_video,
         keep_original_audio=keep_audio,
         ass_path=telop_path,
+        original_volume=original_volume,
     )
 
-    print("[6/6] Writing the English metadata bundle...")
+    print("[6/6] Writing the metadata bundle...")
     missing_ja = [key for key in TRANSLATION_KEYS if not script_data.get(key)]
     if missing_ja:
         print(
@@ -519,6 +699,7 @@ def _publish_bundle(
         shop_url=str(config["brand"].get("shop_url", "")),
     )
 
+    duration_sec = probe_duration(final_video)
     video_id = ""
     privacy = str(config["youtube"]["default_privacy"])
     if upload:
@@ -530,7 +711,9 @@ def _publish_bundle(
             category_id=str(config["youtube"].get("category_id", "22")),
             default_language=str(config["youtube"].get("default_language", "en")),
         )
-        append_performance_row(script_data, style_key, video_id)
+        append_performance_row(
+            script_data, style_key, video_id, params=params, duration_sec=duration_sec
+        )
         print(f"Completed! Video ID: {video_id} (privacy={privacy})")
     else:
         print("Completed without a YouTube upload (--no-upload); metadata is ready to paste.")
@@ -552,6 +735,8 @@ def _publish_bundle(
         "script": script_data,
         "video_id": video_id,
         "finale": finale_plan,
+        "duration_sec": duration_sec,
+        "params": params,
     }
 
 
@@ -570,6 +755,7 @@ def process_video_bundle(
     metadata (.txt + .json) all live in ``output_dir``.
     """
     config = config or load_config()
+    params = improvement.active_params(config)
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
 
@@ -583,22 +769,31 @@ def process_video_bundle(
 
     # The style is chosen first: the ASMR style needs the original audio kept.
     style_key = choose_best_style(CSV_PATH, config)
-    keep_audio = should_keep_audio(style_key)
+    drawing_volume = float(params.get("drawing_audio_volume") or 0.0)
+    keep_audio = should_keep_audio(style_key) or drawing_volume > 0
 
-    print(f"[1/6] Editing vertical timelapse: {input_path} (style={style_key})")
-    build_vertical_timelapse(
-        input_path,
-        raw_vertical,
-        target_duration=config["video"]["target_duration_sec"],
-        hook_duration=config["video"]["hook_duration_sec"],
-        keep_audio=keep_audio,
-    )
-
-    print("[2/6] Cutting the finished artwork out of the drawing...")
+    print(f"[1/6] Cutting the finished artwork out of the drawing...")
+    # The artwork comes first, because the opening flash is made of it.
     extract_final_artwork(
         input_path,
         artwork_path,
         offset_seconds=artwork_offset_seconds,
+    )
+
+    print(
+        f"[2/6] Editing vertical timelapse: {input_path} (style={style_key}, "
+        f"{improvement.describe_params(params)})"
+    )
+    build_vertical_timelapse(
+        input_path,
+        raw_vertical,
+        target_duration=float(params["target_duration_sec"]),
+        hook_duration=float(params["hook_duration_sec"]),
+        keep_audio=keep_audio,
+        hook_style=str(params["hook_style"]),
+        flash_image=artwork_path,
+        flash_seconds=float(params["hook_flash_seconds"]),
+        volume_db=float(params["hook_audio_boost_db"]),
     )
 
     return dict(
@@ -612,6 +807,7 @@ def process_video_bundle(
             output_dir=output_dir,
             upload=upload,
             output_folder=output_folder,
+            params=params,
         ),
     )
 
@@ -647,25 +843,38 @@ def process_project_bundle(
 
     clips = list(source.videos)
     style_key = choose_best_style(CSV_PATH, config)
-    keep_audio = should_keep_audio(style_key)
-    target_total = float(config["video"]["target_duration_sec"])
-    hook_seconds = float(config["video"]["hook_duration_sec"])
+    params = improvement.active_params(config)
+    drawing_volume = float(params.get("drawing_audio_volume") or 0.0)
+    keep_audio = should_keep_audio(style_key) or drawing_volume > 0
+    target_total = float(params["target_duration_sec"])
+    # The opening: a flash of the finished piece, then the tail at natural
+    # speed, or (text_only) no opening footage at all.
+    hook = compute_hook_plan(
+        str(params["hook_style"]),
+        float(params["hook_duration_sec"]),
+        float(params["hook_flash_seconds"]),
+    )
     # The cut leaves room for the finale: the finish shot replayed slowly, then a
     # closing zoom over the artwork. Both are only appended after the voice is
     # measured, so their length can follow the narration.
-    finish_window = compute_finish_window(clips[-1].duration_seconds if clips else None)
+    finish_window = compute_finish_window(
+        clips[-1].duration_seconds if clips else None,
+        hold_seconds=float(params["finish_hold_seconds"]),
+    )
     timelapse_target = target_total - finish_window["screen_seconds"] - ZOOM_OUTRO_SECONDS
     plan = compute_project_plan(
         [clip.duration_seconds for clip in clips],
         target_duration=timelapse_target,
-        hook_duration=hook_seconds,
+        hook_duration=float(hook["total"]),
+        tempo=float(params["tempo"]),
     )
 
     print(
         f"[1/6] Editing project {source.name}: {len(clips)} clip(s), "
         f"{plan['total_duration']:.0f}s -> {plan['main_duration']:.0f}s "
+        f"+ {hook['flash']:.1f}s flash + {hook['tail']:.1f}s hook "
         f"+ {finish_window['screen_seconds']:.1f}s finish + zoom "
-        f"(style={style_key})"
+        f"(style={style_key}; {improvement.describe_params(params)})"
     )
 
     # The scan comes first (it is small): if it is there the artwork is settled
@@ -698,27 +907,45 @@ def process_project_bundle(
         try:
             audio = has_audio_stream(local)
             is_last = index == len(clips) - 1
+            if is_last and not reference_scan:
+                # The opening flash is made of the finished piece, so the
+                # artwork has to exist before the first segment is rendered.
+                print("      no scan in the folder: taking the artwork from the last clip...")
+                extract_final_artwork(
+                    local, artwork_path, offset_seconds=artwork_offset_seconds
+                )
             if is_last:
                 # Hook start comes from the real tail of the last clip, so a
                 # slightly different metadata duration cannot overrun it.
                 duration = probe_duration(local)
-                hook_length = min(plan["hook_duration"], max(duration, 0.1))
-                hook_start = min(plan["hook_start"], max(duration - hook_length, 0.0))
-                hook_path = f"{vertical_stem}_hook.mp4"
-                render_project_segment(
-                    local, hook_path,
-                    keep_audio=keep_audio,
-                    has_audio=audio,
-                    runner=runner,
-                    seek=max(hook_start, 0.0),
-                    length=hook_length,
-                    duration=hook_length,
-                )
-                hook_paths.append(hook_path)
+                if hook["flash"] > 0 and os.path.exists(artwork_path):
+                    flash_path = f"{vertical_stem}_flash.mp4"
+                    render_still_segment(
+                        artwork_path, flash_path, hook["flash"],
+                        with_audio=keep_audio, runner=runner,
+                    )
+                    hook_paths.append(flash_path)
+                if hook["tail"] > 0:
+                    hook_length = min(float(hook["tail"]), max(duration, 0.1))
+                    hook_start = min(plan["hook_start"], max(duration - hook_length, 0.0))
+                    hook_path = f"{vertical_stem}_hook.mp4"
+                    render_project_segment(
+                        local, hook_path,
+                        keep_audio=keep_audio,
+                        has_audio=audio,
+                        runner=runner,
+                        seek=max(hook_start, 0.0),
+                        length=hook_length,
+                        duration=hook_length,
+                        volume_db=float(params["hook_audio_boost_db"]),
+                    )
+                    hook_paths.append(hook_path)
 
                 # Finale, part one: the same last moment, played slowly, so the
                 # finished piece is actually looked at before the zoom begins.
-                finish = compute_finish_window(duration)
+                finish = compute_finish_window(
+                    duration, hold_seconds=float(params["finish_hold_seconds"])
+                )
                 finish_path = f"{vertical_stem}_finish.mp4"
                 render_project_segment(
                     local, finish_path,
@@ -743,12 +970,6 @@ def process_project_bundle(
                 duration=plan["segment_durations"][index],
             )
             body_paths.append(segment_path)
-
-            if is_last and not reference_scan:
-                print("      no scan in the folder: taking the artwork from the last clip...")
-                extract_final_artwork(
-                    local, artwork_path, offset_seconds=artwork_offset_seconds
-                )
         finally:
             if not keep_local_raw and os.path.exists(local):
                 os.remove(local)  # the original still lives in Drive until archived
@@ -773,6 +994,7 @@ def process_project_bundle(
         output_folder=output_folder,
         reference_scan=reference_scan,
         finale={"base_video": base_video, "target_total": target_total, "runner": runner},
+        params=params,
     )
     if not keep_local_raw and os.path.exists(base_video):
         os.remove(base_video)  # only the final, zoom-finished Short is kept
@@ -898,6 +1120,85 @@ def post_interval_state(
     return {**state, "reason": "interval-passed", "hours_elapsed": elapsed}
 
 
+def _collect_settings(config: Optional[dict]) -> dict:
+    """How stale a row has to be before it is worth asking YouTube again."""
+    block = dict(((config or {}).get("improvement") or {}).get("collect") or {})
+    def _number(key, default, cast):
+        try:
+            return cast(block.get(key, default))
+        except (TypeError, ValueError):
+            return default
+    return {
+        "min_age_hours": max(_number("min_age_hours", 24, float), 0.0),
+        "max_rows": max(_number("max_rows", 8, int), 1),
+        "refresh_hours": max(_number("refresh_hours", 6.0, float), 0.0),
+    }
+
+
+def learning_prepare(
+    config: dict,
+    service,
+    folders: "drive_sync.DriveFolders",
+    csv_path: str = CSV_PATH,
+    log=print,
+) -> tuple:
+    """Restore the history, collect the numbers, decide this run's parameters.
+
+    The order is the PDCA cycle the brief asks for and it matters: the CSV has to
+    come back from Drive before the numbers are collected, and the numbers have
+    to be collected before the reflection reads them. Every step degrades to the
+    safe defaults instead of stopping the render.
+    """
+    if not improvement.improvement_enabled(config):
+        log("[pdca] improvement disabled in config.yaml; using the config defaults")
+        return improvement.config_params(config), {"status": "disabled"}
+
+    try:
+        pdca_state.restore_all(service, folders, csv_path=csv_path, log=log)
+    except Exception as exc:  # noqa: BLE001 - a render must still happen
+        log(f"[pdca] could not restore the history from Drive: {exc}")
+
+    settings = _collect_settings(config)
+    try:
+        update_performance_metrics(
+            csv_path,
+            min_age_hours=settings["min_age_hours"],
+            max_rows=settings["max_rows"],
+            refresh_hours=settings["refresh_hours"],
+        )
+    except Exception as exc:  # noqa: BLE001 - YouTube being unavailable is not fatal
+        log(f"[pdca] could not collect the numbers this run: {exc}")
+
+    params, review = improvement.decide_params(csv_path, config, log=log)
+    improvement.set_active_params(params)
+    log(f"[pdca] this run: {improvement.describe_params(params)}")
+    return params, review
+
+
+def learning_finish(
+    results: Sequence[dict],
+    service,
+    folders: "drive_sync.DriveFolders",
+    params: Optional[dict] = None,
+    review: Optional[dict] = None,
+    csv_path: str = CSV_PATH,
+    log=print,
+) -> None:
+    """Record what this run made and put the history back in Drive."""
+    params = dict(params or improvement.active_params())
+    state = improvement.load_state()
+    improvement.record_run(state, params, review, results)
+    improvement.save_state(state)
+    done = [result for result in results if str(result.get("status")) == "done"]
+    if not done:
+        log("[pdca] nothing was published this run; the history was left as it was")
+        return
+    try:
+        pdca_state.backup_all(service, folders, csv_path=csv_path, log=log)
+    except Exception as exc:  # noqa: BLE001 - the Shorts are already out
+        log(f"[pdca] could not save the history to Drive: {exc}")
+
+
 def run_drive_mode(args, config: dict) -> int:
     """Phase 2: Google Drive folder in, upload-ready package out."""
     schedule = schedule_settings(config)
@@ -938,6 +1239,15 @@ def run_drive_mode(args, config: dict) -> int:
         return 2
 
     service = drive_sync.build_drive_service()
+    ignore_pdca = bool(getattr(args, "ignore_pdca", False))
+    params: Optional[dict] = None
+    review: Optional[dict] = None
+    if publishes and not ignore_pdca:
+        params, review = learning_prepare(config, service, folders)
+    elif publishes:
+        print("[pdca] --ignore-pdca: rendering with the config defaults, no collection")
+    else:
+        improvement.clear_active_params()
 
     def pipeline(source: "drive_sync.ProjectSource") -> dict:
         if source.is_project:
@@ -980,7 +1290,13 @@ def run_drive_mode(args, config: dict) -> int:
     }
 
     if args.drive_once:
-        results = drive_sync.sync_once(service, folders, pipeline, **sync_kwargs)
+        results: List[dict] = []
+        try:
+            results = drive_sync.sync_once(service, folders, pipeline, **sync_kwargs)
+        finally:
+            if publishes and params is not None:
+                learning_finish(results, service, folders, params, review)
+            improvement.clear_active_params()
         done = [r for r in results if r["status"] == "done"]
         print(f"[drive] {len(done)} item(s) processed, {len(results) - len(done)} failed/skipped.")
         return 0 if len(done) == len(results) else 1
@@ -1057,6 +1373,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--no-upload",
         action="store_true",
         help="Render and write the metadata but skip the YouTube upload",
+    )
+    parser.add_argument(
+        "--ignore-pdca",
+        action="store_true",
+        help=(
+            "Skip the collect/reflect steps and render with config.yaml's "
+            "improvement defaults (a manual, comparable run)"
+        ),
     )
     parser.add_argument(
         "--artwork-offset",

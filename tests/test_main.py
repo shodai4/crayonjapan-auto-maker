@@ -8,7 +8,9 @@ from unittest import mock
 import pandas as pd
 
 import drive_sync
+import improvement
 import main
+import pdca_state
 import telop
 from analytics_updater import CSV_COLUMNS
 
@@ -207,13 +209,16 @@ class TelopIntegrationTests(unittest.TestCase):
             "v.mp4", "a.mp3", "s.srt", "final.mp4", ass_path="clip.ass"
         )
         fc = cmd[cmd.index("-filter_complex") + 1]
-        self.assertIn("ass='clip.ass'", fc)
+        self.assertIn("ass=filename='clip.ass'", fc)
         self.assertNotIn("subtitles=", fc)
         self.assertIn("apad", fc)
 
     def test_the_ass_filter_escapes_a_windows_path(self):
         vf = main.build_ass_filter("C:\\work\\clip.ass")
-        self.assertEqual(vf, "ass='C\\:/work/clip.ass'")
+        self.assertIn("ass=filename='C\\:/work/clip.ass'", vf)
+        # The bundled Japanese face travels with the repository, so libass is
+        # pointed at its folder explicitly.
+        self.assertIn("fontsdir=", vf)
 
     def test_an_ass_file_is_preferred_over_the_srt(self):
         ass_path = os.path.join(self.tmp.name, "clip.ass")
@@ -538,36 +543,52 @@ class ProcessProjectBundleTests(unittest.TestCase):
     def test_the_hook_is_cut_from_the_last_clip_and_comes_first(self):
         self._run(self._source())
         self.assertIn("concat", self.runner_cmds[-1])
-        self.assertEqual(len(self.concat_order), 4)
-        self.assertIn("hook", self.concat_order[0])
-        self.assertIn("seg00", self.concat_order[1])
-        self.assertIn("seg01", self.concat_order[2])
-        self.assertIn("finish", self.concat_order[3])
+        # flash of the finished piece -> its last seconds -> the drawing -> finish
+        self.assertEqual(len(self.concat_order), 5)
+        self.assertIn("flash", self.concat_order[0])
+        self.assertIn("hook", self.concat_order[1])
+        self.assertIn("seg00", self.concat_order[2])
+        self.assertIn("seg01", self.concat_order[3])
+        self.assertIn("finish", self.concat_order[4])
 
     def test_the_cut_keeps_room_for_the_slow_finish_and_the_zoom(self):
+        params = improvement.config_params(self.config)
         bundle, _ = self._run(self._source())
         plan = bundle["plan"]
-        finish_screen = 4.0 / 0.75
+        finish_screen = params["finish_hold_seconds"] / 0.75
+        hook_total = max(
+            params["hook_duration_sec"] - params["hook_flash_seconds"], 0.0
+        ) + params["hook_flash_seconds"]
         self.assertAlmostEqual(
-            plan["main_duration"], 45.0 - finish_screen - 4.0 - 2.5, places=3
+            plan["main_duration"],
+            params["target_duration_sec"] - finish_screen - 4.0 - hook_total,
+            places=3,
         )
         self.assertAlmostEqual(
-            plan["main_duration"] + 2.5 + finish_screen + 4.0, 45.0, places=3
+            plan["main_duration"] + hook_total + finish_screen + 4.0,
+            params["target_duration_sec"],
+            places=3,
         )
 
     def test_the_last_moment_is_replayed_slowly_before_the_zoom(self):
+        params = improvement.config_params(self.config)
         self._run(self._source())
-        # Two seeks: the 2.5 s hook and the 4 s finish shot, both from the tail.
-        cuts = [cmd for cmd in self.runner_cmds if "-ss" in cmd and "concat" not in cmd]
+        # Two seeks: the hook tail and the finish shot, both from the tail.
+        cuts = [
+            cmd for cmd in self.runner_cmds
+            if "-ss" in cmd and "-vf" in cmd and "concat" not in cmd
+        ]
         self.assertEqual(len(cuts), 2)
         finish = next(cmd for cmd in cuts if "setpts" in cmd[cmd.index("-vf") + 1])
-        self.assertEqual(finish[finish.index("-ss") + 1], "236.000")
-        self.assertEqual(finish[finish.index("-t") + 1], "4.000")
+        hold = params["finish_hold_seconds"]
+        self.assertAlmostEqual(float(finish[finish.index("-ss") + 1]), 240.0 - hold, places=3)
+        self.assertAlmostEqual(float(finish[finish.index("-t") + 1]), hold, places=3)
         vf = finish[finish.index("-vf") + 1]
         self.assertTrue(vf.startswith("setpts=1.333333*PTS,"))
         self.assertTrue(finish[finish.index("-i") + 1].endswith("part2.mp4"))
 
     def test_the_zoom_is_sized_from_the_measured_narration(self):
+        params = improvement.config_params(self.config)
         bundle, _ = self._run(self._source())
         self.assertEqual(
             self.finale_kwargs["base_video"],
@@ -575,7 +596,9 @@ class ProcessProjectBundleTests(unittest.TestCase):
         )
         self.assertEqual(self.finale_kwargs["output_path"], bundle["vertical"])
         self.assertEqual(self.finale_kwargs["artwork_path"], bundle["artwork"])
-        self.assertAlmostEqual(self.finale_kwargs["target_total"], 45.0)
+        self.assertAlmostEqual(
+            self.finale_kwargs["target_total"], params["target_duration_sec"]
+        )
         self.assertAlmostEqual(self.finale_kwargs["narration_seconds"], 38.0)
         self.assertEqual(self.keyframes_source, self.finale_kwargs["base_video"])
         self.assertFalse(os.path.exists(self.finale_kwargs["base_video"]))
@@ -919,3 +942,239 @@ class DriveOnceScheduleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RunParameterTests(unittest.TestCase):
+    """Requirements 1, 2, 3 and 5: the run's parameters reach the render."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.config = main.load_config(os.path.join(ROOT, "config.yaml"))
+        self.out = os.path.join(self.tmp.name, "output")
+        improvement.clear_active_params()
+
+    def tearDown(self):
+        improvement.clear_active_params()
+
+    def _run(self, upload=False, script=None):
+        with mock.patch.object(main, "choose_best_style", return_value="style_B_story"), \
+                mock.patch.object(main, "build_vertical_timelapse") as timelapse, \
+                mock.patch.object(main, "extract_final_artwork", side_effect=fake_artwork), \
+                mock.patch.object(main, "extract_keyframes", return_value=["kf.jpg"]), \
+                mock.patch.object(
+                    main, "generate_making_script", return_value=dict(script or SCRIPT)
+                ) as gemini, \
+                mock.patch.object(main, "synthesize_voice") as voice, \
+                mock.patch.object(main.asyncio, "run") as ran, \
+                mock.patch.object(main, "probe_audio_seconds", return_value=14.0), \
+                mock.patch.object(main, "probe_duration", return_value=28.0), \
+                mock.patch.object(main, "mux_audio_and_subtitles") as mux, \
+                mock.patch.object(main, "upload_short", return_value="yt-9"), \
+                mock.patch.object(main, "append_performance_row") as row:
+            bundle = main.process_video_bundle(
+                "input/clip.mp4", self.config, output_dir=self.out, upload=upload
+            )
+        return bundle, timelapse, gemini, voice, ran, mux, row
+
+    def test_the_short_is_rendered_at_the_new_length_and_hook(self):
+        bundle, timelapse, _, _, _, _, _ = self._run()
+        kwargs = timelapse.call_args.kwargs
+        self.assertAlmostEqual(kwargs["target_duration"], 28.0)
+        self.assertEqual(kwargs["hook_style"], "finish_flash_to_blank")
+        self.assertAlmostEqual(kwargs["hook_duration"], 2.4)
+        self.assertAlmostEqual(kwargs["flash_seconds"], 0.4)
+        self.assertEqual(bundle["params"]["language_mode"], "bilingual")
+
+    def test_a_pinned_parameter_set_changes_the_render(self):
+        improvement.set_active_params(
+            {
+                "target_duration_sec": 24,
+                "hook_style": "text_only",
+                "language_mode": "ja",
+                "tts_mode": "none",
+                "drawing_audio_volume": 0.9,
+            }
+        )
+        _, timelapse, _, voice, ran, mux, _ = self._run()
+        kwargs = timelapse.call_args.kwargs
+        self.assertAlmostEqual(kwargs["target_duration"], 24.0)
+        self.assertEqual(kwargs["hook_style"], "text_only")
+        # tts_mode none: no edge-tts call, and a silent track keeps the mux valid
+        ran.assert_not_called()
+        self.assertFalse(voice.called)
+        self.assertTrue(os.path.exists(self._last_audio()))
+        self.assertAlmostEqual(mux.call_args.kwargs["original_volume"], 0.9)
+
+    def _last_audio(self):
+        for name in os.listdir(self.out):
+            folder = os.path.join(self.out, name)
+            if os.path.isdir(folder):
+                for item in os.listdir(folder):
+                    if item.endswith(".mp3"):
+                        return os.path.join(folder, item)
+        return os.path.join(self.out, "missing.mp3")
+
+    def test_a_japanese_short_is_spoken_by_the_japanese_voice(self):
+        improvement.set_active_params({"language_mode": "ja", "tts_mode": "short"})
+        _, _, _, voice, ran, _, _ = self._run()
+        self.assertTrue(ran.called)
+        args, kwargs = voice.call_args.args, voice.call_args.kwargs
+        self.assertEqual(kwargs["voice"], main.TTS_VOICE_JA)
+        self.assertIn("まっ白な紙", args[0])
+
+    def test_the_english_mode_keeps_the_english_voice(self):
+        improvement.set_active_params({"language_mode": "en"})
+        _, _, _, voice, _, _, _ = self._run()
+        self.assertEqual(voice.call_args.kwargs["voice"], main.TTS_VOICE)
+        self.assertIn("postcard", voice.call_args.args[0])
+
+    def test_the_youtube_row_records_what_the_short_was_made_with(self):
+        improvement.set_active_params({"hook_style": "finish_flash_to_blank", "language_mode": "ja"})
+        _, _, _, _, _, _, row = self._run(upload=True)
+        kwargs = row.call_args.kwargs
+        self.assertEqual(kwargs["params"]["language_mode"], "ja")
+        self.assertAlmostEqual(kwargs["duration_sec"], 28.0)
+
+    def test_the_prompt_is_given_the_run_parameters(self):
+        improvement.set_active_params({"target_duration_sec": 24, "language_mode": "ja"})
+        _, _, gemini, _, _, _, _ = self._run()
+        self.assertEqual(gemini.call_args.kwargs["params"]["language_mode"], "ja")
+
+    def test_a_japanese_script_on_screen_uses_the_japanese_hook(self):
+        improvement.set_active_params({"language_mode": "ja"})
+        bundle, _, _, _, _, _, _ = self._run()
+        with open(bundle["telop"], "r", encoding="utf-8") as handle:
+            ass = handle.read()
+        self.assertIn("ちいさな", ass)
+        self.assertIn("次は何を描いてほしい", ass)   # the closing question
+        self.assertIn("Noto Sans CJK JP", ass)
+
+    def test_the_english_mode_keeps_the_english_hook_on_screen(self):
+        improvement.set_active_params({"language_mode": "en"})
+        bundle, _, _, _, _, _, _ = self._run()
+        with open(bundle["telop"], "r", encoding="utf-8") as handle:
+            ass = handle.read()
+        self.assertIn("One tiny", ass)
+        self.assertIn("postcard", ass)
+        self.assertIn("What should I draw", ass)
+        self.assertNotIn("次は何を描いてほしい", ass)
+
+    def test_the_bilingual_mode_shows_both_and_never_drops_the_shop_link(self):
+        bundle, _, _, _, _, _, _ = self._run(upload=True)
+        with open(bundle["telop"], "r", encoding="utf-8") as handle:
+            ass = handle.read()
+        self.assertIn("ちいさな", ass)
+        self.assertIn("One tiny", ass)
+        self.assertIn("crayonjapan.base.shop", bundle["script"]["description"])
+        self.assertTrue(
+            any("crayonjapan.base.shop" in str(value) for value in bundle["script"].values())
+        )
+
+
+class SilentTrackTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_silent_track_is_written_with_ffmpeg(self):
+        path = os.path.join(self.tmp.name, "silence.mp3")
+        with mock.patch.object(main.subprocess, "run") as run:
+            main.write_silent_audio(path, 0.5)
+        cmd = run.call_args.args[0]
+        self.assertIn("anullsrc", " ".join(cmd))
+        self.assertEqual(run.call_args.kwargs.get("check"), True)
+
+
+class LearningLoopTests(unittest.TestCase):
+    """Requirement 5: collect -> reflect -> render -> save, end to end."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.csv = os.path.join(self.tmp.name, "performance.csv")
+        self.config = main.load_config(os.path.join(ROOT, "config.yaml"))
+        self.folders = drive_sync.DriveFolders("raw", "ready", "archive")
+        improvement.clear_active_params()
+
+    def tearDown(self):
+        improvement.clear_active_params()
+
+    def test_prepare_restores_collects_and_pins_the_parameters(self):
+        order = []
+
+        def fake_restore(service, folders, **kwargs):
+            order.append("restore")
+            return {}
+
+        def fake_update(*args, **kwargs):
+            order.append(("collect", kwargs["min_age_hours"], kwargs["max_rows"]))
+            return None
+
+        def fake_decide(csv_path, config, log=print):
+            order.append("reflect")
+            return {"target_duration_sec": 26.0}, {"status": "gemini"}
+
+        with mock.patch.object(pdca_state, "restore_all", side_effect=fake_restore), \
+                mock.patch.object(main, "update_performance_metrics", side_effect=fake_update), \
+                mock.patch.object(improvement, "decide_params", side_effect=fake_decide):
+            params, review = main.learning_prepare(
+                self.config, object(), self.folders, csv_path=self.csv, log=lambda *_: None
+            )
+
+        self.assertEqual([step if not isinstance(step, tuple) else step[0] for step in order],
+                         ["restore", "collect", "reflect"])
+        self.assertEqual(order[1][1], 24)
+        self.assertEqual(order[1][2], 8)
+        self.assertEqual(review["status"], "gemini")
+        self.assertEqual(improvement.active_params(self.config)["target_duration_sec"], 26.0)
+
+    def test_a_broken_restore_or_collect_does_not_stop_the_run(self):
+        logs = []
+        with mock.patch.object(pdca_state, "restore_all", side_effect=RuntimeError("drive")), \
+                mock.patch.object(main, "update_performance_metrics", side_effect=RuntimeError("quota")), \
+                mock.patch.object(
+                    improvement, "decide_params",
+                    return_value=(improvement.config_params(self.config), {"status": "not-enough-data"}),
+                ):
+            params, review = main.learning_prepare(
+                self.config, object(), self.folders, csv_path=self.csv, log=logs.append
+            )
+        self.assertEqual(review["status"], "not-enough-data")
+        self.assertTrue(any("drive" in line for line in logs))
+        self.assertTrue(any("quota" in line for line in logs))
+
+    def test_a_disabled_improvement_block_uses_the_config_defaults(self):
+        config = dict(self.config)
+        config["improvement"] = dict(config["improvement"], enabled=False)
+        with mock.patch.object(pdca_state, "restore_all") as restore:
+            params, review = main.learning_prepare(
+                config, object(), self.folders, csv_path=self.csv, log=lambda *_: None
+            )
+        restore.assert_not_called()
+        self.assertEqual(review["status"], "disabled")
+        self.assertEqual(params["language_mode"], "bilingual")
+
+    def test_finish_writes_the_history_and_pushes_it_to_drive(self):
+        results = [
+            {"status": "done", "name": "GO_a", "package": "a_1",
+             "artifacts": {"video_id": "yt-1"}},
+        ]
+        with mock.patch.object(pdca_state, "backup_all") as backup:
+            main.learning_finish(
+                results, object(), self.folders,
+                params=improvement.validate_params(),
+                review={"status": "gemini", "diagnosis": "d"},
+                csv_path=self.csv,
+            )
+        backup.assert_called_once()
+        state = improvement.load_state()
+        self.assertEqual(state["review"]["status"], "gemini")
+        self.assertEqual(state["history"][-1]["videos"][0]["video_id"], "yt-1")
+
+    def test_finish_without_a_publication_keeps_drive_untouched(self):
+        with mock.patch.object(pdca_state, "backup_all") as backup:
+            main.learning_finish(
+                [{"status": "failed"}], object(), self.folders,
+                params=improvement.validate_params(), review={}, csv_path=self.csv,
+            )
+        backup.assert_not_called()

@@ -597,3 +597,98 @@ class BuildTimelapseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OpeningHookTests(unittest.TestCase):
+    """Requirement 1: the finished piece flashes first, then the blank page."""
+
+    def test_the_flash_style_splits_the_hook_into_flash_and_tail(self):
+        plan = vp.compute_hook_plan("finish_flash_to_blank", 2.4, 0.4)
+        self.assertAlmostEqual(plan["flash"], 0.4)
+        self.assertAlmostEqual(plan["tail"], 2.0)
+        self.assertAlmostEqual(plan["total"], 2.4)
+
+    def test_the_previous_look_keeps_the_whole_tail(self):
+        plan = vp.compute_hook_plan("finish_preview", 2.4, 0.4)
+        self.assertEqual(plan["flash"], 0.0)
+        self.assertAlmostEqual(plan["tail"], 2.4)
+
+    def test_text_only_leaves_the_opening_to_the_time_lapse(self):
+        plan = vp.compute_hook_plan("text_only", 2.4, 0.4)
+        self.assertEqual(plan["total"], 0.0)
+        self.assertEqual(plan["tail"], 0.0)
+
+    def test_the_hook_never_runs_past_three_seconds(self):
+        self.assertLessEqual(vp.compute_hook_plan("finish_preview", 9.0)["total"], 3.0)
+
+    def test_the_tail_keeps_room_to_read_as_the_finished_piece(self):
+        plan = vp.compute_hook_plan("finish_flash_to_blank", 2.0, 1.9)
+        self.assertGreaterEqual(plan["tail"], vp.MIN_HOOK_TAIL_SECONDS)
+        self.assertAlmostEqual(plan["flash"] + plan["tail"], 2.0)
+
+    def test_an_unknown_style_falls_back_to_the_previous_look(self):
+        self.assertEqual(vp.compute_hook_plan("bogus", 2.4)["style"], "finish_preview")
+
+    def test_the_flash_is_a_still_on_the_shared_canvas(self):
+        cmd = vp.build_still_segment_command("/tmp/art.jpg", "flash.mp4", 0.4)
+        vf = cmd[cmd.index("-vf") + 1]
+        self.assertIn("force_original_aspect_ratio=decrease", vf)
+        self.assertIn("color=white", vf)
+        self.assertIn("fade=t=in", vf)
+        self.assertEqual(cmd[cmd.index("-loop") + 1], "1")
+        self.assertIn("anullsrc", " ".join(cmd))
+        self.assertIn("libx264", cmd)
+
+    def test_a_muted_flash_has_no_audio_stream(self):
+        cmd = vp.build_still_segment_command("/tmp/art.jpg", "flash.mp4", 0.4, with_audio=False)
+        self.assertIn("-an", cmd)
+        self.assertNotIn("anullsrc", " ".join(cmd))
+
+    def test_the_hook_audio_can_be_boosted(self):
+        cmd = vp.build_hook_command("in.mp4", "hook.mp4", 10.0, 2.0, keep_audio=True, volume_db=6)
+        self.assertIn("volume=6.0dB", cmd[cmd.index("-af") + 1])
+
+    def test_the_segment_audio_carries_the_boost_after_the_speed_change(self):
+        cmd = vp.build_segment_audio_command(
+            "in.mp4", "a.m4a", speed_factor=2.0, volume_db=6,
+        )
+        af = cmd[cmd.index("-af") + 1]
+        self.assertTrue(af.startswith(vp.build_atempo_filter(2.0)))
+        self.assertIn("volume=6.0dB", af)
+
+    def test_no_boost_means_no_volume_filter(self):
+        cmd = vp.build_segment_audio_command("in.mp4", "a.m4a", speed_factor=2.0)
+        af = cmd[cmd.index("-af") + 1]
+        self.assertNotIn("volume=", af)
+
+
+class TempoTests(unittest.TestCase):
+    """Requirement 2: the body can be played faster than the target implies."""
+
+    def plan(self, tempo):
+        return vp.compute_project_plan(
+            [100.0], target_duration=24.0, hook_duration=2.0, tempo=tempo
+        )
+
+    def test_tempo_one_keeps_the_planned_length(self):
+        plan = self.plan(1.0)
+        self.assertAlmostEqual(plan["main_duration"], 22.0, places=3)
+
+    def test_a_faster_tempo_shortens_the_body(self):
+        slow = self.plan(1.0)
+        fast = self.plan(1.5)
+        self.assertAlmostEqual(fast["main_duration"], slow["main_duration"] / 1.5, places=3)
+        self.assertLess(fast["pts_multiplier"], slow["pts_multiplier"])
+
+    def test_a_broken_tempo_is_ignored(self):
+        for value in (0, -3, "fast", None):
+            self.assertAlmostEqual(self.plan(value)["main_duration"], 22.0, places=3)
+
+    def test_the_tempo_is_clamped(self):
+        self.assertAlmostEqual(self.plan(9.0)["tempo"], vp.TEMPO_MAX)
+
+    def test_the_finish_hold_follows_the_parameter(self):
+        short = vp.compute_finish_window(60.0, hold_seconds=2.0)
+        long = vp.compute_finish_window(60.0, hold_seconds=4.0)
+        self.assertLess(short["screen_seconds"], long["screen_seconds"])
+        self.assertAlmostEqual(short["source_seconds"], 2.0)
