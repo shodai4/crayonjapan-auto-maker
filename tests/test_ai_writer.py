@@ -293,6 +293,54 @@ class JapaneseTranslationTests(unittest.TestCase):
             self.assertEqual(data[key], "")
 
 
+class OverseasCaptionTests(unittest.TestCase):
+    """Gemini's one sentence for the TikTok / Instagram / Pinterest block."""
+
+    REPLY = dict(
+        JapaneseTranslationTests.REPLY,
+        overseas_caption="A Cyndaquil card turned into soft pastel flames",
+        overseas_caption_ja="ヒノアラシのカードを、やわらかなパステルの炎にしました。",
+    )
+
+    def test_every_style_asks_for_the_overseas_sentence_and_its_japanese(self):
+        for style in CONFIG["evolution"]["styles"]:
+            with self.subTest(style=style):
+                prompt = ai_writer.build_script_prompt(style, CONFIG)
+                for key in ai_writer.OVERSEAS_KEYS:
+                    self.assertIn(f'"{key}"', prompt)
+                self.assertIn("TikTok / Instagram Reels / Pinterest", prompt)
+
+    def test_the_prompt_asks_for_the_two_search_keywords(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
+        self.assertIn("Oil pastel", prompt)
+        self.assertIn("do not describe a person or a camera", prompt)
+
+    def test_parse_keeps_the_overseas_fields_and_trims_them(self):
+        reply = dict(self.REPLY, overseas_caption="  A pastel flame  ", overseas_caption_ja=" パステルの炎 ")
+        data = ai_writer.parse_script_json(json.dumps(reply))
+        self.assertEqual(data["overseas_caption"], "A pastel flame")
+        self.assertEqual(data["overseas_caption_ja"], "パステルの炎")
+
+    def test_a_reply_without_them_still_parses(self):
+        reply = {key: self.REPLY[key] for key in ai_writer.REQUIRED_SCRIPT_KEYS}
+        data = ai_writer.parse_script_json(json.dumps(reply))
+        for key in ai_writer.OVERSEAS_KEYS:
+            self.assertEqual(data[key], "")
+
+    def test_the_naming_slip_of_geminis_own_reply_is_accepted(self):
+        reply = dict(self.REPLY)
+        reply.pop("overseas_caption")
+        reply["overseas_text"] = "A pastel flame on paper"
+        data = ai_writer.parse_script_json(json.dumps(reply))
+        self.assertEqual(data["overseas_caption"], "A pastel flame on paper")
+
+    def test_blank_or_non_text_values_become_empty(self):
+        reply = dict(self.REPLY, overseas_caption="   ", overseas_caption_ja=["x"])
+        data = ai_writer.parse_script_json(json.dumps(reply))
+        for key in ai_writer.OVERSEAS_KEYS:
+            self.assertEqual(data[key], "")
+
+
 class _FakeApiError(Exception):
     """Stands in for google.genai.errors.APIError without the SDK."""
 

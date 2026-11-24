@@ -357,6 +357,20 @@ class ProcessVideoBundleTests(unittest.TestCase):
         self.assertIn(SCRIPT["title_ja"], text)
         self.assertIn(SCRIPT["hook_ja"], text)
 
+    def test_the_pack_carries_the_overseas_sns_captions_without_gemini_fields(self):
+        """The script has no overseas sentence here: the block is still built."""
+        bundle, _, _, _, _, _ = self._run()
+        with open(bundle["metadata_text"], "r", encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("=== OVERSEAS SNS CAPTIONS (TikTok / Instagram Reels / Pinterest) ===", text)
+        self.assertIn("=== OVERSEAS SNS CAPTIONS (JA / 日本語訳) ===", text)
+        for keyword in ("Oil Pastel", "Sakura Cray-Pas"):
+            self.assertIn(keyword, text)
+        for tag in ("#oilpastel", "#sakuracraypas", "#crayonart", "#artprocess"):
+            self.assertIn(tag, text)
+        self.assertIn("--- Pinterest ---", text)
+        self.assertIn("https://crayonjapan.base.shop/", text)
+
     def test_the_upload_description_carries_the_shop_call_to_action(self):
         _, _, _, _, upload_short, _ = self._run(upload=True)
         description = upload_short.call_args.args[1]["description"]

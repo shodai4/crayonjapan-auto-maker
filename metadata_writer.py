@@ -4,11 +4,14 @@ Two files land next to the rendered Short so the same package can be dropped
 into ``02_READY_TO_POST`` and reused for the BASE shop listing:
 
 * ``{stem}_metadata.txt``       - paste-ready title / description / tags, plus
-  the full English narration with its Japanese translation for the check
+  the full English narration with its Japanese translation for the check, and
+  a paste-ready TikTok / Instagram Reels / Pinterest caption block
 * ``{stem}_art_metadata.json``  - the same data as structured art metadata
 
 Keeping this separate from ``ai_writer.py`` means the Gemini reply stays the
-only AI-dependent step; formatting the bundle is pure and unit tested.
+only AI-dependent step; formatting the bundle is pure and unit tested. The
+overseas caption block is built here, without an API call, so the keywords and
+hashtags the artist asked for survive a Gemini outage or an offline run.
 """
 
 from __future__ import annotations
@@ -37,6 +40,191 @@ SHOP_CTA_JA = "1点ものの原画はこちらで販売中です：\n{url}"
 # above) when what is left of it after the URL is this short.
 SHOP_LINE_MAX_REMAINDER = 45
 _URL = re.compile(r"https?://\S+")
+
+
+# ---------------------------------------------------------------------------
+# Overseas SNS captions (TikTok / Instagram Reels / Pinterest)
+# ---------------------------------------------------------------------------
+# The overseas viewer searches in English for the material, not for the channel,
+# so every caption opens with "Oil Pastel" and names "Sakura Cray-Pas" as the
+# Japanese maker beside it. These four hashtags are the ones the artist asked to
+# carry on every post; a platform's own extras are appended after them, never
+# instead of them. The block is assembled purely from the script and the config,
+# so a Gemini outage or an offline run still produces it.
+OVERSEAS_MAIN_KEYWORD = "Oil Pastel"
+OVERSEAS_MATERIAL_KEYWORD = "Sakura Cray-Pas"
+OVERSEAS_REQUIRED_HASHTAGS = ("#oilpastel", "#sakuracraypas", "#crayonart", "#artprocess")
+OVERSEAS_PLATFORMS = ("tiktok", "instagram", "pinterest")
+OVERSEAS_PLATFORM_LABELS = {
+    "tiktok": "TikTok",
+    "instagram": "Instagram Reels",
+    "pinterest": "Pinterest",
+}
+OVERSEAS_PLATFORM_HASHTAGS = {
+    "tiktok": ("#oilpastelart", "#arttok"),
+    "instagram": ("#oilpastelart", "#crayonartwork", "#artreels", "#reelsart"),
+    "pinterest": ("#oilpastelart", "#arttimelapse"),
+}
+# The subject is one short sentence; a long reply is cut on a word boundary so
+# the caption stays readable on a phone.
+OVERSEAS_SUBJECT_MAX_CHARS = 90
+OVERSEAS_SUBJECT_FALLBACK = "A small original postcard, drawn by hand"
+
+# A caption line is English: Japanese, emoji and decoration are dropped, while
+# accented Latin letters (é, ü) stay like any other letter.
+_NON_LATIN = re.compile(r"[^\x20-\x7E\u00C0-\u024F\u2010-\u2027\u2030-\u205E\u20AC]")
+_SERIES_PREFIX = re.compile(r"^\s*CrayonJapan\s*[/|:\-]\s*", re.IGNORECASE)
+
+
+def _material_keyword(material_name: object) -> str:
+    """The material as the overseas captions name it (always Sakura Cray-Pas)."""
+    text = _clean(material_name)
+    if text and OVERSEAS_MATERIAL_KEYWORD.lower() in text.lower():
+        return text
+    return OVERSEAS_MATERIAL_KEYWORD
+
+
+def _english_subject(text: object, max_chars: int = OVERSEAS_SUBJECT_MAX_CHARS) -> str:
+    """One English caption line: no hashtags, links, emoji or series label."""
+    line = _NON_LATIN.sub(" ", str(text or ""))
+    line = re.sub(r"https?://\S+", " ", line)
+    line = re.sub(r"#\S+", " ", line)
+    line = line.replace("**", "")
+    line = _SERIES_PREFIX.sub("", line)
+    line = re.sub(r"\s+", " ", line).strip(" \"'“”‘’-–—|/,;:.")
+    if len(line) > max_chars:
+        cut = line[:max_chars]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        line = f"{cut.rstrip(' ,-|/')}..."
+    return line
+
+
+def _sentence(text: str) -> str:
+    """The subject with one full stop, never a doubled one after ``!``."""
+    stripped = (text or "").strip().rstrip(".,;:")
+    if not stripped:
+        return stripped
+    return stripped if stripped[-1] in "!?…" else f"{stripped}."
+
+
+def _hashtags_for(platform: str) -> List[str]:
+    """The four fixed hashtags first, then the ones this platform uses."""
+    return list(OVERSEAS_REQUIRED_HASHTAGS) + list(OVERSEAS_PLATFORM_HASHTAGS.get(platform, ()))
+
+
+def _english_caption(platform: str, subject: str, shop_url: str, material: str) -> str:
+    """One paste-ready English caption: body, then its hashtags."""
+    opening = f"{OVERSEAS_MAIN_KEYWORD} on paper with {material}: {_sentence(subject)}"
+    if platform == "tiktok":
+        body = f"{opening}\nLayered until the colour glows."
+    elif platform == "instagram":
+        body = (
+            f"{opening}\nOne creamy stroke at a time, layered until the colour glows.\n"
+            "1-of-1 original postcard - link in bio."
+        )
+    else:
+        body = (
+            f"{opening}\nA making-of time-lapse of a 1-of-1 original postcard, "
+            "drawn with Japanese oil pastels."
+        )
+        if shop_url:
+            body = f"{body}\nOriginal artwork: {shop_url}"
+    return f"{body}\n\n{' '.join(_hashtags_for(platform))}"
+
+
+def _japanese_caption(platform: str, subject_ja: str, shop_url: str) -> str:
+    """The same caption in Japanese, for the artist's check before posting."""
+    lines = [
+        f"紙にオイルパステル（{OVERSEAS_MAIN_KEYWORD}）。"
+        f"日本製の{OVERSEAS_MATERIAL_KEYWORD}で色を重ねました。"
+    ]
+    # A reply without Japanese has no subject to translate, so the block is left
+    # with the fixed Japanese lines instead of a marker mid-sentence.
+    if subject_ja:
+        lines.append(f"作品：{subject_ja}")
+    if platform == "instagram":
+        lines.append("一層ずつ重ねて、つやが出るまで。")
+        lines.append("1点ものの原画はプロフィールのリンクから。")
+    elif platform == "pinterest":
+        lines.append("1点ものの原画の制作過程です。")
+        if shop_url:
+            lines.append(f"原画：{shop_url}")
+    return "\n".join(lines)
+
+
+def build_overseas_captions(
+    script_data: dict,
+    material_name: object = "",
+    shop_url: object = "",
+) -> Dict[str, object]:
+    """The overseas SNS block: keywords, hashtags and one caption per platform.
+
+    Gemini's own sentence (``overseas_caption``) is used when it sent one; the
+    artist's hook, then the title, stands in when it did not, so the required
+    keywords and hashtags are never missing from the pack. The Japanese subject
+    comes from ``overseas_caption_ja`` / ``hook_ja`` / ``title_ja`` and is marked
+    as missing rather than left blank when the reply carried no Japanese.
+    """
+    script = script_data or {}
+    model_line = _clean(script.get("overseas_caption"))
+    subject = _english_subject(
+        model_line
+        or _clean(script.get("hook_text"))
+        or _clean(script.get("title"))
+    ) or OVERSEAS_SUBJECT_FALLBACK
+    subject_ja = (
+        _clean(script.get("overseas_caption_ja"))
+        or _clean(script.get("hook_ja"))
+        or _clean(script.get("title_ja"))
+    )
+    material = _material_keyword(material_name)
+    url = str(shop_url or "").strip()
+
+    captions: Dict[str, object] = {
+        "source": "gemini" if model_line else "fallback",
+        "keywords": [OVERSEAS_MAIN_KEYWORD, OVERSEAS_MATERIAL_KEYWORD],
+        "hashtags": [
+            tag
+            for tag in dict.fromkeys(
+                tag for platform in OVERSEAS_PLATFORMS for tag in _hashtags_for(platform)
+            )
+        ],
+        "subject": subject,
+        "subject_ja": subject_ja,
+    }
+    for platform in OVERSEAS_PLATFORMS:
+        captions[platform] = _english_caption(platform, subject, url, material)
+        captions[f"{platform}_ja"] = _japanese_caption(platform, subject_ja, url)
+    return captions
+
+
+def _overseas_text(overseas: Dict[str, object]) -> List[str]:
+    """The overseas block as pack lines: English first, then the check copy."""
+    if not overseas:
+        return []
+    lines = [
+        "=== OVERSEAS SNS CAPTIONS (TikTok / Instagram Reels / Pinterest) ===",
+        f"KEYWORDS : {' / '.join(overseas.get('keywords') or [])}",
+        f"HASHTAGS : {' '.join(overseas.get('hashtags') or [])}",
+        "",
+    ]
+    for platform in OVERSEAS_PLATFORMS:
+        lines += [
+            f"--- {OVERSEAS_PLATFORM_LABELS[platform]} ---",
+            _clean(overseas.get(platform)),
+            "",
+        ]
+    lines.append("=== OVERSEAS SNS CAPTIONS (JA / 日本語訳) ===")
+    for platform in OVERSEAS_PLATFORMS:
+        lines += [
+            f"--- {OVERSEAS_PLATFORM_LABELS[platform]}（日本語訳）---",
+            _block(overseas.get(f"{platform}_ja")),
+            "",
+        ]
+    lines.append("（投稿するハッシュタグと固有名詞は英語のままです）")
+    lines.append("")
+    return lines
 
 
 def _url_needle(url: str) -> str:
@@ -139,6 +327,11 @@ def build_art_metadata(
         "shop_url": _clean(shop_url),
         "artwork_image": os.path.basename(artwork_path) if artwork_path else "",
         "short_video": os.path.basename(video_path) if video_path else "",
+        # Paste-ready captions for TikTok / Instagram Reels / Pinterest, with the
+        # keywords and hashtags the artist asked for guaranteed by the builder.
+        "overseas_captions": build_overseas_captions(
+            script_data, material_name=material_name, shop_url=shop_url
+        ),
         "generated_at": generated_at or datetime.now(JST).replace(microsecond=0).isoformat(),
     }
 
@@ -184,6 +377,7 @@ def format_metadata_text(metadata: Dict[str, object]) -> str:
         _clean(metadata.get("shop_url")),
         "",
     ]
+    lines += _overseas_text(metadata.get("overseas_captions") or {})
     return "\n".join(lines)
 
 

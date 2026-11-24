@@ -41,7 +41,9 @@ viewers actually watch.
    BASE shop where the original is sold cannot go missing from a Short; then the Short is
    uploaded (`public` by default, see `config.yaml`) and one row is appended to
    `analytics/performance.csv`.
-   A plain-text upload pack and an `art_metadata.json` are written next to the video.
+   A plain-text upload pack and an `art_metadata.json` are written next to the video. The pack
+   also carries a paste-ready **TikTok / Instagram Reels / Pinterest** caption block, built
+   locally from the same script (see *Overseas captions* below).
 8. **Learning loop** – `analytics_updater.py` refreshes views / likes / comments from the
    YouTube Data API and the average view percentage from the YouTube Analytics API.
    `choose_best_style()` then reuses the best-performing style, with a 25 % exploration rate
@@ -81,6 +83,34 @@ the plain SRT cues. Every rule below is covered by `tests/test_telop.py`.
 
 `telop.enabled: false` in `config.yaml` puts the plain SRT burn back; `telop.font` pins a font
 family instead of the auto-detect. The SRT is written either way and stays in the upload pack.
+
+## Overseas captions
+
+TikTok, Instagram Reels and Pinterest are served in English, so `{stem}_metadata.txt` ends with
+a block that can be pasted into each app as it is:
+
+```
+=== OVERSEAS SNS CAPTIONS (TikTok / Instagram Reels / Pinterest) ===
+KEYWORDS : Oil Pastel / Sakura Cray-Pas
+HASHTAGS : #oilpastel #sakuracraypas #crayonart #artprocess #oilpastelart #arttok ...
+
+--- TikTok ---
+Oil Pastel on paper with Sakura Cray-Pas Specialist: A sakura petal pressed into creamy pink layers.
+Layered until the colour glows.
+
+#oilpastel #sakuracraypas #crayonart #artprocess #oilpastelart #arttok
+```
+
+The same block in Japanese follows it under `=== OVERSEAS SNS CAPTIONS (JA / 日本語訳) ===`,
+for the artist's check before posting.
+
+| what | how |
+| --- | --- |
+| Search keywords | **Oil Pastel** is the phrase overseas viewers search for, so it opens every caption; **Sakura Cray-Pas** names the Japanese maker beside it. Both are in `KEYWORDS`. |
+| Hashtags | `#oilpastel` `#sakuracraypas` `#crayonart` `#artprocess` lead every platform's tag line; TikTok, Instagram and Pinterest each get their own extras after those four. |
+| Subject | one English sentence from Gemini (`overseas_caption`) names the artwork; the artist's hook, then the title, stands in when the reply has no sentence. Emoji, hashtags, links and Japanese are stripped, and a long line is cut on a word boundary. |
+| Platform shape | TikTok stays short, Instagram Reels adds the 1-of-1 / link-in-bio line, Pinterest adds the BASE shop link (it is the one that allows a link in the caption). |
+| Without Gemini | the block is assembled by `metadata_writer.build_overseas_captions` from the script and `config.yaml` alone, so an outage or an offline run still writes every keyword and hashtag. Nothing is posted automatically: the block is text in the pack. |
 
 ## Setup
 
@@ -132,7 +162,7 @@ Output files land in one folder per drawing, `./output/{base_name}_{YYYYMMDD_HHM
 | `*_words.json`, `*.ass` | word timings and the telop document that is burned into the picture |
 | `*_final.mp4` | the upload-ready Short |
 | `*_artwork.jpg` | the finished drawing, full frame, for thumbnail / shop listing |
-| `*_metadata.txt` | paste-ready title, hook text, description, tags |
+| `*_metadata.txt` | paste-ready title, hook text, description, tags, plus the TikTok / Instagram Reels / Pinterest captions |
 | `*_art_metadata.json` | the same artwork data as structured metadata for the shop |
 
 ## Google Drive hub
@@ -293,7 +323,8 @@ The tests cover style selection, CSV handling, FFmpeg command assembly, `atempo`
 the audio-mixing branch, JSON parsing of Gemini replies, the hook/sensory/loop prompt rules,
 upload body limits, finished-artwork
 extraction (OpenCV path and FFmpeg fallback), scanned-artwork resizing, the per-clip project
-plan and its FFmpeg commands, the metadata bundle, the per-render package folder, the Drive
+plan and its FFmpeg commands, the metadata bundle (including the overseas caption block and its
+no-Gemini fallback), the per-render package folder, the Drive
 sync orchestration
 (GO_ folder discovery, natural sorting, prefix stripping, download / upload / archive / state,
 the 02_READY_TO_POST subfolder, mocked Drive client) and project file invariants.
@@ -314,7 +345,7 @@ config.yaml              brand, video, style-evolution and upload settings
 main.py                  pipeline entry point, local watcher and Drive modes
 video_processor.py       9:16 time-lapse, hook cut, ASMR audio retention, artwork still
 ai_writer.py             style selection + Gemini script generation
-metadata_writer.py       English upload pack (.txt) + art metadata (.json)
+metadata_writer.py       English upload pack (.txt) + art metadata (.json), incl. the overseas SNS captions
 drive_sync.py            Google Drive hub: list / download / upload / archive
 scripts/verify_drive_access.py  CI pre-flight check for the Drive credential
 .github/workflows/auto-edit.yml  Actions job: dispatch → render → Drive

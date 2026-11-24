@@ -29,6 +29,10 @@ RETRYABLE_STATUS_CODES = frozenset({404, 429, 500, 502, 503, 504})
 # optional (an older or partial reply must still render); the metadata pack
 # simply says the translation is missing.
 TRANSLATION_KEYS = ("title_ja", "hook_ja", "narration_ja")
+# The overseas caption sentence is optional in the same way: metadata_writer
+# builds the TikTok / Instagram / Pinterest block without it, using the hook or
+# the title as the subject, so an older or partial reply never costs the pack.
+OVERSEAS_KEYS = ("overseas_caption", "overseas_caption_ja")
 REQUIRED_SCRIPT_KEYS = ("title", "hook_text", "narration", "description", "tags")
 # Gemini occasionally answers with the key names of its own proposal ("hook",
 # "script") or a different spelling of a Japanese field, so one naming slip does
@@ -41,6 +45,20 @@ TRANSLATION_KEY_ALIASES = {
     "title_ja": ("title_ja", "title_jp", "title_japanese"),
     "hook_ja": ("hook_ja", "hook_text_ja", "hook_jp", "hook_japanese"),
     "narration_ja": ("narration_ja", "script_ja", "narration_jp", "script_japanese"),
+}
+OVERSEAS_KEY_ALIASES = {
+    "overseas_caption": (
+        "overseas_caption",
+        "overseas_caption_en",
+        "overseas_text",
+        "caption_overseas",
+    ),
+    "overseas_caption_ja": (
+        "overseas_caption_ja",
+        "overseas_caption_jp",
+        "overseas_text_ja",
+        "caption_overseas_ja",
+    ),
 }
 ASMR_STYLE_KEY = "style_C_asmr"
 # The voice now has to carry the whole Short. The earlier 65-85 word script (and
@@ -206,6 +224,8 @@ Generate a JSON response with the following keys:
 6. "title_ja": The same title in natural Japanese, keeping "#Shorts" and any emoji.
 7. "hook_ja": The same on-screen hook in natural Japanese, short enough to read in 2.5 seconds.
 8. "narration_ja": The whole narration translated into natural, warm Japanese so the artist can check it before posting - the same meaning and order as "narration", one Japanese sentence per English sentence, no emoji and no stage directions. It is a translation only: never add or drop a fact, and never write a different script.
+9. "overseas_caption": One English sentence (max 18 words) about this artwork for a TikTok / Instagram Reels / Pinterest caption: name the subject and what the oil pastel looks like. No emoji, no hashtags, no shop link, no "#Shorts". Do not open with "Oil pastel" (the caption already does) and do not describe a person or a camera.
+10. "overseas_caption_ja": The same sentence in natural Japanese, for the artist's check. A translation only: no emoji, no hashtags, no shop link.
 
 Every Japanese field must translate the English field beside it, not re-imagine it.
 
@@ -238,6 +258,15 @@ def translation_text(data: dict, key: str) -> str:
     return ""
 
 
+def overseas_text(data: dict, key: str) -> str:
+    """The overseas caption field under any accepted spelling, or ''."""
+    for alias in OVERSEAS_KEY_ALIASES[key]:
+        text = _text(data.get(alias))
+        if text:
+            return text
+    return ""
+
+
 def parse_script_json(raw_text: str) -> dict:
     """Parse Gemini's JSON reply even when it arrives inside markdown fences."""
     text = (raw_text or "").strip()
@@ -262,6 +291,10 @@ def parse_script_json(raw_text: str) -> dict:
     # render and the English upload pack are never lost over it.
     for key in TRANSLATION_KEYS:
         data[key] = translation_text(data, key)
+    # Same for the overseas caption: metadata_writer fills the block from the
+    # hook or the title when the reply has no sentence of its own.
+    for key in OVERSEAS_KEYS:
+        data[key] = overseas_text(data, key)
     return data
 
 

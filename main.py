@@ -502,6 +502,12 @@ def _publish_bundle(
             f"      Gemini sent no {', '.join(missing_ja)}; "
             "the pack marks that translation as missing"
         )
+    if not script_data.get("overseas_caption"):
+        # The block itself is always written; only its subject falls back.
+        print(
+            "      Gemini sent no overseas caption sentence; "
+            "the TikTok / Instagram / Pinterest block uses the hook as its subject"
+        )
     metadata_paths = write_metadata_files(
         script_data,
         output_dir=output_dir,
