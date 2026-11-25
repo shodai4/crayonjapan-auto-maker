@@ -20,8 +20,11 @@ from typing import List, Optional, Sequence
 import pandas as pd
 import yaml
 
+import ai_writer
+import doctor
 import drive_sync
 import improvement
+import local_hub
 import pdca_state
 import telop
 from ai_writer import (
@@ -576,6 +579,36 @@ def _narrate(
     return words, marked
 
 
+def _script_for(
+    frames: Sequence[str],
+    style_key: str,
+    config: dict,
+    reference_scan: bool,
+    params: dict,
+    motif: str = "",
+) -> dict:
+    """The script for this Short, with the offline template as the floor.
+
+    Gemini stopped being affordable for this channel, so a run may have no key
+    or a key that answers 403 / 429 for the day. In that case the script is
+    built from config.yaml and the artwork's own name (see
+    ``ai_writer.fallback_script``) and the Short is still voiced, teloped,
+    packed and uploaded - a missing script never costs the render or the post.
+    """
+    try:
+        return generate_making_script(
+            frames, style_key, config, reference_scan=reference_scan, params=params
+        )
+    except Exception as exc:  # noqa: BLE001 - the Short must still be made
+        print(
+            f"      no script from Gemini ({exc}); using the offline template "
+            "script built from config.yaml and the artwork name"
+        )
+        return ai_writer.fallback_script(
+            style_key, config, motif=motif, params=params, reason=str(exc)
+        )
+
+
 def _publish_bundle(
     base_name: str,
     raw_vertical: str,
@@ -617,9 +650,14 @@ def _publish_bundle(
         # The finished scan is the strongest reference for colours and details,
         # so Gemini sees it first, next to the time-lapse keyframes.
         frames = [artwork_path] + frames
-    script_data = generate_making_script(
-        frames, style_key, config, reference_scan=reference_scan, params=params
+    script_data = _script_for(
+        frames, style_key, config, reference_scan, params, motif=base_name
     )
+    if str(script_data.get("script_source")) == ai_writer.SCRIPT_SOURCE_TEMPLATE:
+        print(
+            "      the upload pack uses the offline template script; "
+            "set GEMINI_API_KEY in .env to have Gemini write it again"
+        )
     # The shop link and the "original artwork" line are put in here, not left to
     # the model: the pack and the upload both read this same description.
     script_data["description"] = ensure_shop_cta(
@@ -1137,8 +1175,8 @@ def _collect_settings(config: Optional[dict]) -> dict:
 
 def learning_prepare(
     config: dict,
-    service,
-    folders: "drive_sync.DriveFolders",
+    service=None,
+    folders: Optional["drive_sync.DriveFolders"] = None,
     csv_path: str = CSV_PATH,
     log=print,
 ) -> tuple:
@@ -1148,15 +1186,22 @@ def learning_prepare(
     come back from Drive before the numbers are collected, and the numbers have
     to be collected before the reflection reads them. Every step degrades to the
     safe defaults instead of stopping the render.
+
+    Without ``service``/``folders`` (the local PC mode) there is no Drive to
+    restore from: the history in ``analytics/`` on this PC is the only copy and
+    is already local, so the restore step is simply skipped.
     """
     if not improvement.improvement_enabled(config):
         log("[pdca] improvement disabled in config.yaml; using the config defaults")
         return improvement.config_params(config), {"status": "disabled"}
 
-    try:
-        pdca_state.restore_all(service, folders, csv_path=csv_path, log=log)
-    except Exception as exc:  # noqa: BLE001 - a render must still happen
-        log(f"[pdca] could not restore the history from Drive: {exc}")
+    if service is None or folders is None:
+        log("[pdca] local mode: the learning history stays in analytics/ on this PC")
+    else:
+        try:
+            pdca_state.restore_all(service, folders, csv_path=csv_path, log=log)
+        except Exception as exc:  # noqa: BLE001 - a render must still happen
+            log(f"[pdca] could not restore the history from Drive: {exc}")
 
     settings = _collect_settings(config)
     try:
@@ -1182,8 +1227,8 @@ def learning_prepare(
 
 def learning_finish(
     results: Sequence[dict],
-    service,
-    folders: "drive_sync.DriveFolders",
+    service=None,
+    folders: Optional["drive_sync.DriveFolders"] = None,
     params: Optional[dict] = None,
     review: Optional[dict] = None,
     csv_path: str = CSV_PATH,
@@ -1201,6 +1246,9 @@ def learning_finish(
     done = [result for result in results if str(result.get("status")) == "done"]
     if not done:
         log("[pdca] nothing was published this run; the history was left as it was")
+        return
+    if service is None or folders is None:
+        log("[pdca] local mode: the history was saved in analytics/ on this PC")
         return
     try:
         pdca_state.backup_all(service, folders, csv_path=csv_path, log=log)
@@ -1328,6 +1376,277 @@ def run_drive_mode(args, config: dict) -> int:
     return 0
 
 
+def local_settings(config: Optional[dict]) -> dict:
+    """The ``local`` block of config.yaml, with safe defaults.
+
+    Only numbers and switches live here; the three folder names are fixed by the
+    hub, because they are the artist's habit and the README's promise.
+    """
+    block = dict(((config or {}).get("local") or {}))
+
+    def _number(key, default, cast):
+        try:
+            return cast(block.get(key, default))
+        except (TypeError, ValueError):
+            return default
+
+    return {
+        "base_dir": str(block.get("base_dir") or "").strip(),
+        "min_age_seconds": max(_number("min_age_seconds", local_hub.DEFAULT_MIN_AGE_SECONDS, int), 0),
+        "go_min_age_seconds": max(
+            _number("go_min_age_seconds", local_hub.DEFAULT_GO_FOLDER_MIN_AGE_SECONDS, int), 0
+        ),
+        "scan_interval_seconds": max(
+            _number("scan_interval_seconds", local_hub.DEFAULT_SCAN_INTERVAL_SECONDS, float), 1.0
+        ),
+        "archive_after_render": bool(block.get("archive_after_render", True)),
+    }
+
+
+def local_folders_for(args, config: dict) -> "local_hub.LocalFolders":
+    """The base folder for this run: ``--local-base``, the env, config, default."""
+    return local_hub.load_local_folders(
+        base_dir=getattr(args, "local_base", "") or None, config=config
+    )
+
+
+def run_local_init(args, config: dict) -> int:
+    """Create the folder layout (``--local-init``), then show it."""
+    folders = local_folders_for(args, config)
+    local_hub.ensure_local_layout(folders)
+    print(f"Local mode is ready in: {folders.base}")
+    print(local_hub.describe_layout(folders))
+    print(
+        f"\nDrop one artwork into {local_hub.RAW_DIRNAME} as a folder named "
+        "GO_<name> (several clips + an optional scan.jpg), then run run_local.bat."
+    )
+    return 0
+
+
+def run_doctor(args, config: dict) -> int:
+    """``--doctor``: is this PC able to render and upload at all?"""
+    folders = local_folders_for(args, config)
+    checks = doctor.run_checks(config=config, folders=folders)
+    print(f"CrayonJapan local setup check - base folder: {folders.base}")
+    print(doctor.format_checks(checks))
+    code = doctor.exit_code(checks)
+    if code == 0:
+        print("\nReady: a publishing run needs nothing else on this PC.")
+    else:
+        print("\nNot ready yet: fix the FAIL lines above, then run --doctor again.")
+    return code
+
+
+def run_auth(config: dict) -> int:
+    """``--auth``: walk the first browser sign-in and keep ``token.json``.
+
+    The render needs three YouTube scopes (upload, read, analytics). This is the
+    one interactive step of a local setup and it is deliberately its own
+    command: a scheduled run can then start unattended with the saved token.
+    """
+    import youtube_uploader
+
+    print("Opening the browser for the YouTube sign-in of the CrayonJapan channel...")
+    print("Choose the Google account that owns the channel and allow upload, read and analytics.")
+    try:
+        credentials = youtube_uploader.load_credentials(force_authorize=True)
+    except FileNotFoundError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        print(
+            "Create a Desktop OAuth client in Google Cloud Console (YouTube Data API v3 "
+            "and YouTube Analytics API enabled) and save it as client_secret.json.",
+            file=sys.stderr,
+        )
+        return 1
+    except Exception as exc:  # noqa: BLE001 - the browser flow can fail in many ways
+        print(f"\nThe sign-in did not finish: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        service = youtube_uploader.get_youtube_service(credentials)
+        channel = service.channels().list(part="snippet", mine=True).execute()
+        items = (channel or {}).get("items") or []
+        title = str(((items[0] if items else {}).get("snippet") or {}).get("title") or "")
+    except Exception as exc:  # noqa: BLE001 - a saved token is still useful
+        print(f"Signed in, but the channel could not be read: {exc}")
+        print("The token was saved as token.json; --doctor shows the rest.")
+        return 0
+
+    print(f"Signed in as: {title or '(no channel name returned)'}")
+    print("token.json saved. An unattended run can now upload without a browser.")
+    return 0
+
+
+def run_local_mode(args, config: dict) -> int:
+    """Windows local mode: folder in, Short out, no Google Drive anywhere.
+
+    The three Drive folders of the CI path become three folders on this PC, and
+    the posting rhythm is the one ``schedule`` already describes: a publishing
+    run first reads the newest upload on the channel, renders at most one
+    waiting artwork and posts it. Nothing about the render changes - the same
+    project plan, the same telop, the same pack.
+    """
+    settings = local_settings(config)
+    folders = local_folders_for(args, config)
+    dry_run = bool(getattr(args, "dry_run", False))
+    publishes = not bool(getattr(args, "no_upload", False))
+    ignore_schedule = bool(getattr(args, "ignore_schedule", False))
+    schedule = schedule_settings(config)
+    local_once = bool(getattr(args, "local_once", False))
+
+    print(f"[local] base folder: {folders.base}")
+    if dry_run:
+        print("[local] --dry-run: nothing is rendered, uploaded or moved")
+        for path in local_hub.missing_folders(folders):
+            print(f"[local] folder not created yet: {path}")
+
+    gated = local_once and schedule["enabled"] and not ignore_schedule and publishes
+    max_items: Optional[int] = None
+    if gated and not dry_run:
+        gate = post_interval_state(config, log=print)
+        if not gate["allowed"]:
+            # Nothing may be posted, so nothing is rendered either: a run inside
+            # the interval must not read, cut or upload a drawing.
+            return 1 if gate["reason"] == "unknown-latest-upload" else 0
+        max_items = schedule["max_videos_per_run"]
+    elif gated and dry_run:
+        max_items = schedule["max_videos_per_run"]
+    elif local_once and schedule["enabled"] and ignore_schedule:
+        print("[schedule] --ignore-schedule: the posting interval is not checked this run")
+    elif local_once and schedule["enabled"] and not publishes:
+        print(
+            "[schedule] --no-upload: nothing is posted, so the posting interval is "
+            f"not checked and every waiting item is rendered into {local_hub.READY_DIRNAME}"
+        )
+    elif getattr(args, "local_watch", False) and schedule["enabled"] and not ignore_schedule:
+        print(
+            "[schedule] the interval gate belongs to the scheduled run (--local-once); "
+            "this watcher renders whatever is waiting"
+        )
+
+    if dry_run:
+        items = local_hub.list_local_items(folders)
+        if not items:
+            print(f"[dry-run] nothing is waiting in {local_hub.RAW_DIRNAME}")
+        else:
+            print(f"[dry-run] {len(items)} item(s) waiting in {local_hub.RAW_DIRNAME}:")
+            for item in items:  # every item, not just the head of the queue
+                kind = "project" if item.is_project else "single clip"
+                scan = f", {len(item.images)} scan(s)" if item.images else ""
+                print(f"  - {item.name}: {kind}, {len(item.videos)} clip(s){scan}")
+        if gated:
+            gate = post_interval_state(config, log=print)
+            if gate["allowed"]:
+                print(
+                    f"[dry-run] the posting gate is open ({gate['reason']}): "
+                    f"a real run would render {min(len(items), max_items)} and post it"
+                )
+            else:
+                left = gate.get("hours_left")
+                print(
+                    "[dry-run] the posting gate is closed "
+                    f"({gate['reason']}{', %.1f h to go' % left if left is not None else ''}): "
+                    "this slot would render and post nothing, and the GO_ folders would wait"
+                )
+        elif items:
+            print(
+                f"[dry-run] a real run would render all {len(items)} of them, since "
+                "nothing is posted or the posting rhythm is off"
+            )
+        print("[dry-run] no file was created, changed or uploaded")
+        return 0
+
+    local_hub.ensure_local_layout(folders)
+
+    ignore_pdca = bool(getattr(args, "ignore_pdca", False))
+    params: Optional[dict] = None
+    review: Optional[dict] = None
+    if publishes and not ignore_pdca:
+        # No Drive in local mode: the history in analytics/ is the only copy.
+        params, review = learning_prepare(config, None, None)
+    elif publishes:
+        print("[pdca] --ignore-pdca: rendering with the config defaults, no collection")
+    else:
+        improvement.clear_active_params()
+
+    def pipeline(item: "drive_sync.RawItem") -> dict:
+        if item.is_project:
+            source = local_hub.source_for(item, folders)
+            return process_project_bundle(
+                source,
+                config,
+                output_dir=folders.output,
+                upload=not args.no_upload,
+                artwork_offset_seconds=args.artwork_offset,
+            )
+        # A loose recording is rendered straight from where it lies: nothing is
+        # copied, and the original is only ever moved to 03_ARCHIVE afterwards.
+        return dict(
+            {"file": item.name},
+            **process_video_bundle(
+                item.id,
+                config,
+                output_dir=folders.output,
+                upload=not args.no_upload,
+                artwork_offset_seconds=args.artwork_offset,
+                base_name=item.stem,
+            ),
+        )
+
+    sync_kwargs = {
+        "state_path": getattr(args, "local_state", "") or folders.state_path,
+        "min_age_seconds": (
+            args.local_min_age
+            if getattr(args, "local_min_age", None) is not None
+            else settings["min_age_seconds"]
+        ),
+        "go_min_age_seconds": (
+            args.local_go_min_age
+            if getattr(args, "local_go_min_age", None) is not None
+            else settings["go_min_age_seconds"]
+        ),
+        "archive_after_render": settings["archive_after_render"],
+        "max_items": max_items,
+    }
+
+    if local_once:
+        results: List[dict] = []
+        try:
+            results = local_hub.sync_once(folders, pipeline, **sync_kwargs)
+        finally:
+            if publishes and params is not None:
+                learning_finish(results, None, None, params, review)
+            improvement.clear_active_params()
+        print(local_hub.format_results(results))
+        done = [r for r in results if r.get("status") == "done"]
+        log_path = os.path.join(
+            folders.logs, f"run_{datetime.now(JST).strftime('%Y-%m-%d')}.log"
+        )
+        try:
+            local_hub.write_scan_log(log_path, local_hub.format_results(results))
+        except OSError:  # a log that cannot be written must not fail the run
+            pass
+        print(
+            f"[local] {len(done)} item(s) rendered and published, "
+            f"{len(results) - len(done)} failed."
+        )
+        return 0 if len(done) == len(results) else 1
+
+    interval = args.local_interval or settings["scan_interval_seconds"]
+    print(
+        f"Watching {folders.raw} every {interval:g}s (Ctrl+C to stop)..."
+    )
+    try:
+        local_hub.watch(
+            folders, pipeline,
+            interval_seconds=interval,
+            **sync_kwargs,
+        )
+    except KeyboardInterrupt:
+        print("\nStopped watching the local folder.")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="CrayonJapan making-of Short pipeline")
     parser.add_argument(
@@ -1392,6 +1711,82 @@ def main(argv: Optional[List[str]] = None) -> int:
         ),
     )
     parser.add_argument(
+        "--local-once",
+        action="store_true",
+        help=(
+            "Windows local mode: scan the local 01_RAW_VIDEO once, render one "
+            "waiting artwork into 02_READY_TO_POST, post it and archive it"
+        ),
+    )
+    parser.add_argument(
+        "--local-watch",
+        action="store_true",
+        help="Keep scanning the local 01_RAW_VIDEO on an interval",
+    )
+    parser.add_argument(
+        "--local-base",
+        default="",
+        help=(
+            "Base folder of local mode (default: CRAYONJAPAN_HOME, else "
+            "local.base_dir in config.yaml, else C:\\CrayonJapan)"
+        ),
+    )
+    parser.add_argument(
+        "--local-state",
+        default="",
+        help="Processed-item log of local mode (default: <base>\\local_state.json)",
+    )
+    parser.add_argument(
+        "--local-interval",
+        type=float,
+        default=None,
+        help=(
+            "Seconds between local scans for --local-watch "
+            f"(default {local_hub.DEFAULT_SCAN_INTERVAL_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--local-min-age",
+        type=int,
+        default=None,
+        help=(
+            "Seconds a loose recording has to sit still before it is rendered "
+            f"(default {local_hub.DEFAULT_MIN_AGE_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--local-go-min-age",
+        type=int,
+        default=None,
+        help=(
+            "Seconds to wait after a folder was renamed to GO_ "
+            f"(default {local_hub.DEFAULT_GO_FOLDER_MIN_AGE_SECONDS})"
+        ),
+    )
+    parser.add_argument(
+        "--local-init",
+        action="store_true",
+        help="Create the local folder layout (01_RAW_VIDEO, 02_READY_TO_POST, 03_ARCHIVE)",
+    )
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Check FFmpeg, the Python packages, the folders and the credentials",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "With --local-once/--local-watch: show the folder layout, the posting "
+            "gate and what would be rendered, without rendering, uploading or moving"
+        ),
+    )
+    parser.add_argument(
+        "--auth",
+        action="store_true",
+        help="Open the browser once for the YouTube sign-in and save token.json",
+    )
+    parser.add_argument(
         "--artwork-offset",
         type=float,
         default=DEFAULT_ARTWORK_OFFSET,
@@ -1404,9 +1799,25 @@ def main(argv: Optional[List[str]] = None) -> int:
     load_dotenv()
     config = load_config()
 
+    if args.doctor:
+        return run_doctor(args, config)
+
+    if args.auth:
+        return run_auth(config)
+
+    if args.local_init:
+        return run_local_init(args, config)
+
     if args.input:
         process_new_video(args.input, config)
         return 0
+
+    if args.local_once or args.local_watch or (args.dry_run and not args.drive_once and not args.drive_watch):
+        if args.dry_run and not (args.local_once or args.local_watch):
+            # `--dry-run` on its own describes the local slot that run_local.bat
+            # would take, so it is read as a local one-shot.
+            args.local_once = True
+        return run_local_mode(args, config)
 
     if args.drive_once or args.drive_watch:
         return run_drive_mode(args, config)

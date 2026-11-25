@@ -13,10 +13,14 @@ output/
 
 # Drive sync bookkeeping (holds personal Drive file IDs)
 drive_state.json
+# Windows local mode bookkeeping (holds the paths of the artist's own PC)
+local_state.json
 
 # The learning history is runtime state, mirrored to Drive by pdca_state.py
 analytics/improvement_state.json
 output_preview/
+# run_local.bat logs (only created when the base folder is inside the repo)
+logs/
 
 # Python
 __pycache__/

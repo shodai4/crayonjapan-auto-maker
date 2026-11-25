@@ -63,6 +63,17 @@ actually watch.
    package into a second folder, then moves the source into an archive folder. A run only
    makes **one** Short and only when the last one is at least **48 h** old. See
    *Google Drive hub* below.
+10. **Windows local mode** – the same hub with three folders on the artist's own PC instead
+    of Drive: `01_RAW_VIDEO` → render → `02_READY_TO_POST` → upload → `03_ARCHIVE`, with no
+    Google Drive call anywhere. `setup_local.bat` / `run_local.bat` and a Task Scheduler
+    entry make it a double-click (or a daily slot), `--doctor` checks the PC and `--dry-run`
+    shows what a run would do. See *Windows local mode* below and
+    `docs/SETUP_WINDOWS_LOCAL.md` (Japanese walk-through).
+11. **Never needs Gemini** – if `GEMINI_API_KEY` is absent, out of quota or refused (403 /
+    429 / 5xx / billing stopped), the script falls back to templates built from
+    `config.yaml` and the artwork's own name: title, hook, narration (sized to the run's
+    word budget), its Japanese translation, description, tags and the overseas captions.
+    The Short is still voiced, teloped, packed and uploaded.
 
 ## Requirements
 
@@ -74,7 +85,8 @@ actually watch.
   subset to the JIS X 0208 character set, ~4 MB, SIL OFL - see `assets/fonts/README.md`) ships
   with the repository and is handed to libass through `fontsdir=`, because the workflow may
   not be edited to install one. Kana and kanji render on the runner because of it.
-- A Gemini API key (Google AI Studio)
+- A Gemini API key (Google AI Studio) – **optional**: without one the script is written
+  from templates (see *Never needs Gemini* above), so a render and upload still complete
 - A Google Cloud OAuth client (type: *Desktop app*) with **YouTube Data API v3** and
   **YouTube Analytics API** enabled for the channel the videos are uploaded to (`@CrayonJapan`)
 
@@ -141,7 +153,7 @@ pip install -r requirements.txt
 1. Create `.env` in the project root (`cp .env.example .env`) and fill in:
 
    ```dotenv
-   GEMINI_API_KEY=your_api_key
+   GEMINI_API_KEY=your_api_key     # optional: the template script covers a missing key
    DRIVE_RAW_FOLDER_ID=...       # only needed for --drive-once / --drive-watch
    DRIVE_READY_FOLDER_ID=...
    DRIVE_ARCHIVE_FOLDER_ID=...
@@ -157,6 +169,9 @@ pip install -r requirements.txt
    `token.json` is reused afterwards. Drive keeps its own `drive_token.json` (same client
    JSON, Drive scope only), created the first time Drive mode runs.
 
+On Windows, `setup_local.bat` does steps 0-4 for the local mode (virtual environment, packages,
+`.env`, the three folders) and then checks the PC; see *Windows local mode* below.
+
 ## Usage
 
 ```bash
@@ -167,6 +182,14 @@ python main.py --drive-watch         # keep scanning the Drive raw folder
 python main.py --drive-once --no-upload   # render + metadata only, no YouTube upload
 python main.py --drive-once --ignore-schedule   # post even inside the 48 h window (test runs)
 python analytics_updater.py          # refresh views / likes / comments / avg view %
+
+# Windows local mode (no Drive)
+python main.py --local-init          # create 01_RAW_VIDEO / 02_READY_TO_POST / 03_ARCHIVE
+python main.py --local-once          # the posting slot: render one, upload, archive
+python main.py --local-watch         # keep scanning the local raw folder
+python main.py --dry-run             # show the gate and the queue, change nothing
+python main.py --doctor              # check FFmpeg, folders, tokens before a real run
+python main.py --auth                # the one browser sign-in (saves token.json)
 ```
 
 Output files land in one folder per drawing, `./output/{base_name}_{YYYYMMDD_HHMM}/`
@@ -310,6 +333,58 @@ A double dispatch is harmless: `01_RAW_VIDEO` is scanned on every run and a `GO_
 loose file) only leaves it once the package is uploaded, so a second run simply finds nothing to
 render.
 
+## Windows local mode (no Google Drive)
+
+Drive's free 15 GB ran out, so the folder hub now also exists on the artist's own Windows PC:
+three folders under one base folder, and not a single Google Drive call in the run.
+
+```
+C:\CrayonJapan\                  <- local.base_dir / CRAYONJAPAN_HOME / --local-base
+    01_RAW_VIDEO\               <- a GO_<name> folder, or one loose recording
+    02_READY_TO_POST\           <- {base_name}_{YYYYMMDD_HHMM}\ with the four artifacts
+    03_ARCHIVE\                 <- the GO_ folder, once it has been rendered
+    _WORK\                      temporary render files (emptied after each Short)
+    logs\                       run_local.bat output + one summary per day
+    local_state.json            what has already been rendered
+```
+
+The rules are the Drive hub's rules, unchanged: only a `GO_` folder (or a loose video) is
+picked up, clips sort naturally with `finish` / `final` / `完成` last, the run publishes at
+most one artwork and only when the newest upload on the channel is at least
+`min_interval_hours` old, the package is named `{base_name}_{YYYYMMDD_HHMM}`, and an item is
+marked done only after its package exists *and* the source has moved to `03_ARCHIVE`.
+`local_hub.py` reuses `drive_sync.py`'s naming and ordering functions, so the two hubs cannot
+drift apart.
+
+| command | what it does |
+| --- | --- |
+| `python main.py --local-init` | create the three folders (+ `_WORK`, `logs`) and print them |
+| `python main.py --local-once` | one posting slot: gate → render one artwork → publish → archive |
+| `python main.py --local-watch` | scan every `local.scan_interval_seconds` (no gate: for testing) |
+| `python main.py --dry-run` | the layout, the queue and the gate decision; creates, renders and posts nothing |
+| `python main.py --doctor` | Python, FFmpeg (+ `ass`, `subtitles`, `libx264`), the font, the base folder, free space, `client_secret.json`, `token.json`, the Gemini key, the queue, the posting rhythm |
+| `python main.py --auth` | the one interactive step: browser sign-in, `token.json` saved |
+
+Windows entry points:
+
+| file | what it does |
+| --- | --- |
+| `setup_local.bat` | venv, `pip install -r requirements.txt`, `.env` from `.env.example`, folder layout, `--doctor` |
+| `run_local.bat` | one slot (`--local-once`) with every argument passed through (`--dry-run`, `--auth`, `--no-upload`, `--local-watch`), logging to `<base>\logs\run_local.log` |
+| `scripts/register_local_task.bat 22:00` | Task Scheduler entry, daily; `/delete` removes it |
+
+A clip is not copied into `_WORK`: it is hard-linked (NTFS), so an hour-long recording costs
+no extra disk, and the pipeline deleting its work copy never touches the original. On a file
+system that refuses a link (another volume, FAT32) it falls back to a real copy.
+
+The learning history (`analytics/performance.csv`, `analytics/improvement_state.json`) simply
+stays on the PC in local mode - there is no Drive copy to restore or push back, so
+`learning_prepare`/`learning_finish` skip the restore and the backup and log that they did.
+
+Use **one** hub per channel: a Drive run and a local run would each judge the 48 h interval
+from the same channel and could post twice. To retire the Drive path, remove the `schedule`
+cron from `.github/workflows/auto-edit.yml` and delete the Apps Script trigger.
+
 ## Narrative styles
 
 | style | intent |
@@ -386,15 +461,26 @@ plan and its FFmpeg commands, the metadata bundle (including the overseas captio
 no-Gemini fallback), the per-render package folder, the Drive
 sync orchestration
 (GO_ folder discovery, natural sorting, prefix stripping, download / upload / archive / state,
-the 02_READY_TO_POST subfolder, mocked Drive client) and project file invariants.
-They need `pandas`, `pyyaml` and `opencv-python` only – no FFmpeg run, API key or network
-access.
+the 02_READY_TO_POST subfolder, mocked Drive client), the Windows local hub (folder resolution,
+layout, queue, natural order, hard-link hand-off, publish, archive, state, cap, dry run),
+`--doctor` and project file invariants. They need `pandas`, `pyyaml` and `opencv-python`
+only – no FFmpeg run, API key or network access (one audio-mux path needs `ffmpeg` on the
+PATH, which the workflow installs).
 
 For a real end-to-end check with FFmpeg (synthetic clips, different resolutions and audio,
 plus a scanned PNG), run:
 
 ```bash
 python3 scripts/verify_project_pipeline.py --ffmpeg "$(command -v ffmpeg)"
+```
+
+The local hub has its own end-to-end check: it builds a throw-away base folder, renders one
+synthetic `GO_` artwork through `local_hub.sync_once` with the real FFmpeg (canned script,
+`tts_mode: none`, no upload), and verifies the package, the 1080x1920 length, the archive move
+and the state file. No key, no network, no quota, and nothing outside the temporary folder:
+
+```bash
+python3 scripts/verify_local_mode.py --ffmpeg "$(command -v ffmpeg)"
 ```
 
 To look at the current layout with your own eyes, render one sample from a local recording.
@@ -416,18 +502,26 @@ ffmpeg -ss 0.4 -i output_preview/*/*_final.mp4 -frames:v 1 -update 1 frame.png
 ## Repository layout
 
 ```
-config.yaml              brand, video, improvement (PDCA) and upload settings
-main.py                  pipeline entry point, local watcher, Drive mode and the learning steps
+config.yaml              brand, video, improvement (PDCA), local mode and upload settings
+main.py                  pipeline entry point, local watcher, Drive mode, local mode (--local-*)
+local_hub.py             Windows local hub: 01_RAW_VIDEO / 02_READY_TO_POST / 03_ARCHIVE, no Drive
+doctor.py                --doctor: FFmpeg, font, folders, credentials, queue, posting rhythm
 improvement.py           parameter defaults / validation, the reflection prompt and the state
 pdca_state.py            performance.csv + improvement_state.json in Drive
 video_processor.py       9:16 time-lapse, opening flash/hook, ASMR audio retention, artwork still
-ai_writer.py             style selection + Gemini script generation
+ai_writer.py             style selection, the Gemini script and the offline template script
 metadata_writer.py       upload pack (.txt) + art metadata (.json), incl. the overseas SNS captions
 drive_sync.py            Google Drive hub: list / download / upload / archive / state files
-scripts/verify_drive_access.py  CI pre-flight check for the Drive credential
-scripts/render_preview.py       local sample render for the visual check (no Gemini, no upload)
+setup_local.bat          one-time Windows local setup (venv, packages, .env, folders, doctor)
+run_local.bat            one local slot, logging to <base>\logs\run_local.log
+scripts/register_local_task.bat  Task Scheduler entry for the daily local slot
+scripts/verify_drive_access.py   CI pre-flight check for the Drive credential
+scripts/render_preview.py        local sample render for the visual check (no Gemini, no upload)
+scripts/verify_local_mode.py     end-to-end check of the local hub (real FFmpeg, no key)
+docs/SETUP_WINDOWS_LOCAL.md      Japanese walk-through of the Windows local mode
 assets/fonts/            bundled Noto Sans CJK JP (JIS X 0208 subset) + its OFL licence
 .github/workflows/auto-edit.yml  Actions job: dispatch → render → Drive
+.github/workflows/tests.yml      unit tests on every push and pull request
 gas/Code_drive_watch.gs  Apps Script half: 1-minute folder watch → repository_dispatch
 youtube_uploader.py      OAuth, Data API upload, Analytics API client
 analytics_updater.py     performance.csv refresh (views, length, retention, seconds watched)
@@ -442,7 +536,8 @@ tests/                   unittest suite
   git-ignored. Never commit them; if one leaks, revoke it in Google Cloud Console / AI Studio
   and re-issue.
 - `input/` and `output/` (raw footage and renders) are git-ignored as well, and so is
-  `drive_state.json` (it lists your personal Drive file IDs).
+  `drive_state.json` (it lists your personal Drive file IDs) and `local_state.json` (it lists
+  the folder paths of the artist's own PC).
 - This repository is public: the Drive folder IDs are read from `.env`
   (`DRIVE_*_FOLDER_ID`), never hard-coded in the code or committed.
 - The OAuth tokens are stored locally only; the scopes requested are
@@ -482,3 +577,10 @@ tests/                   unittest suite
   the Short immediately; set it back to `unlisted` if you want to look at it first. Nothing is
   published by a run that is inside the interval, and `--ignore-schedule` is the only way to
   post early.
+- Local mode: a clip is hard-linked into `_WORK`, so deleting the work copy never touches the
+  recording. A run that fails before publishing leaves the `GO_` folder in `01_RAW_VIDEO` and
+  renders it again next slot; a run that publishes but cannot archive it is not marked done, so
+  the same artwork is rendered once more rather than silently lost. The `command` window the
+  Task Scheduler opens closes when the run ends; the log stays in `<base>\logs\`.
+- Local mode keeps the learning history in `analytics/` on that PC. It is not committed back to
+  the repository: copy the two files to another machine if the channel moves again.

@@ -9,8 +9,8 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 from typing import Dict, List, Mapping, Optional, Sequence
-
 import pandas as pd
 
 MODEL_NAME = "gemini-3-flash-preview"
@@ -406,6 +406,321 @@ def create_client(api_key: str):
 
     http_options = types.HttpOptions(api_version=API_VERSION)
     return genai.Client(api_key=api_key, http_options=http_options)
+
+
+# ---------------------------------------------------------------------------
+# The offline script: a render that never depends on Gemini
+# ---------------------------------------------------------------------------
+# The artist stopped paying for Gemini, so a run may have no key at all, or the
+# key may answer 403 / 429 / 5xx for the whole day. A Short still has to be made
+# and published, so the script falls back to templates built from the config and
+# the artwork's own name: honest sentences about the material and the process,
+# nothing invented about a drawing nobody looked at.
+SCRIPT_SOURCE_GEMINI = "gemini"
+SCRIPT_SOURCE_TEMPLATE = "template"
+# An artwork name that is only a date or a number says nothing about the motif.
+_DATE_LIKE = re.compile(r"^(?:\d{6,8}|\d{4}[-_.]?\d{2}[-_.]?\d{2}|\d+)$")
+_NAME_PREFIX = re.compile(r"^(?:GO_|go_)", re.S)
+
+
+def motif_from_name(name: str) -> str:
+    """A readable motif from an artwork name (``20261121_sushi`` -> ``Sushi``).
+
+    The folder name is the only material the offline script has, so it is used
+    as the subject when it carries one: the ``GO_`` signal and a date prefix are
+    dropped, separators become spaces and a Japanese name is kept as it is.
+    """
+    text = os.path.splitext(os.path.basename(str(name or "").strip()))[0]
+    text = _NAME_PREFIX.sub("", text)
+    tokens = [token for token in re.split(r"[\s_.\-]+", text) if token]
+    tokens = [token for token in tokens if not _DATE_LIKE.match(token)]
+    motif = " ".join(tokens).strip(" .,")
+    if len(motif) > 40:
+        motif = motif[:40].rsplit(" ", 1)[0] or motif[:40]
+    return motif
+
+
+def _motif_title(motif: str) -> str:
+    """The motif in the form a sentence uses (``sushi`` -> ``Sushi``)."""
+    if not motif:
+        return ""
+    if all(ord(ch) < 128 for ch in motif):
+        return motif[0].upper() + motif[1:]
+    return motif
+
+
+# Sentence pairs for the offline narration: English and its Japanese
+# translation, so the pack the artist checks keeps the same order as the voice.
+# Every sentence is about the material or the process (or the motif the name
+# gives) - nothing that would have needed a look at the drawing.
+MATERIAL_SENTENCES = (
+    (
+        "The first layer of colour goes down like a breath on the paper.",
+        "最初の色は、紙の上に息をのせるように置かれます。",
+    ),
+    (
+        "{material} is soft enough to blend with a fingertip and firm enough to keep a line.",
+        "{material}は指先で混ざるほど柔らかく、線を保てるほど芯があります。",
+    ),
+    (
+        "The pigment settles creamy at first, then holds on to the grain of the sheet.",
+        "絵の具はまずクリーミーにのり、それから紙の目にしっかり留まります。",
+    ),
+    (
+        "A paler pastel lifted over the top lets the light back into the colour.",
+        "上から淡い色を重ねると、色の中に光が戻ってきます。",
+    ),
+    (
+        "The corner of the stick draws the edge, the flat side lays the colour down.",
+        "パステルの角で輪郭を描き、腹で色を置いていきます。",
+    ),
+    (
+        "Little by little the drawing stops being lines and becomes colour.",
+        "少しずつ、線だったものが色になっていきます。",
+    ),
+    (
+        "The time-lapse hides the minutes, but every layer is still there on the paper.",
+        "早送りでは時間は見えませんが、重ねた層はすべて紙の上に残っています。",
+    ),
+)
+STYLE_SENTENCES = {
+    "style_A_material": (
+        (
+            "Buttery layers stack without turning muddy, and that is the whole point of this material.",
+            "バターのような層は濁らずに重なり、それがこの画材の持ち味です。",
+        ),
+        (
+            "The richer the layer, the more the finished surface catches the light.",
+            "層が濃いほど、完成した面は光をよく受けとめます。",
+        ),
+    ),
+    "style_B_story": (
+        (
+            "It started with a small, ordinary thing that most people walk past.",
+            "はじまりは、多くの人が通り過ぎてしまう、小さな日常のかけらでした。",
+        ),
+        (
+            "Colour is the way that small thing gets to be looked at properly.",
+            "色を重ねることで、その小さなものが、ちゃんと見てもらえます。",
+        ),
+    ),
+    "style_C_asmr": (
+        (
+            "You can hear the pastel catching on the paper, a dry and soft sound.",
+            "紙の上をパステルがすべる、乾いた柔らかい音が聞こえます。",
+        ),
+        (
+            "No music, no hurry, just the sound of a drawing being made.",
+            "音楽もなく、急ぐこともなく、ただ描かれる音だけがあります。",
+        ),
+    ),
+}
+CLOSING_SENTENCES = (
+    (
+        "One original postcard, drawn by hand and never repeated.",
+        "世界に1枚だけのポストカードを、手描きで。",
+    ),
+    (
+        "And it begins again with a single quiet line.",
+        "そしてまた、静かな一本の線から始まります。",
+    ),
+)
+FALLBACK_TAGS = (
+    "oil pastel",
+    "sakura cray-pas",
+    "crayon art",
+    "oil pastel art",
+    "art process",
+    "timelapse art",
+    "postcard art",
+    "japanese art supplies",
+    "satisfying art",
+    "手描き",
+)
+FALLBACK_HASHTAGS = (
+    "#SakuraCrayPas",
+    "#CrayPasSpecialist",
+    "#OilPastelArt",
+    "#JapaneseArtSupplies",
+    "#OriginalPostcard",
+    "#CrayonJapan",
+)
+
+
+def _format_pair(pair: tuple, motif: str, material: str) -> tuple:
+    english, japanese = pair
+    return (
+        english.format(motif=motif, material=material),
+        japanese.format(motif=motif, material=material),
+    )
+
+
+def _budgeted_sentences(pool: tuple, low: int, high: int, motif: str, material: str) -> List[tuple]:
+    """Fill the narration to the planned word budget from the sentence pool."""
+    chosen: List[tuple] = []
+    words = 0
+    index = 0
+    while words < max(low, 1) and index < len(pool) * 4:
+        english, japanese = _format_pair(pool[index % len(pool)], motif, material)
+        index += 1
+        count = len(english.split())
+        if words + count > max(high, low) and words >= low:
+            break
+        chosen.append((english, japanese))
+        words += count
+    return chosen
+
+
+def _word_count(sentences: Sequence[tuple]) -> int:
+    return sum(len(english.split()) for english, _ in sentences)
+
+
+def _compose_narration(
+    pool: tuple,
+    closing_pool: tuple,
+    low: int,
+    high: int,
+    motif: str,
+    material: str,
+) -> List[tuple]:
+    """Body sentences sized to the voice budget, with the closing line last.
+
+    The closing line is booked first so the ending is always there inside the
+    budget, then the body fills what is left; a sentence that would run past the
+    planned share of the Short is left out instead of stretching the cut.
+    """
+    low = max(int(low), 8)
+    high = max(int(high), low + 4)
+    closing = [_format_pair(closing_pool[0], motif, material)]
+    closing_words = _word_count(closing)
+    body_low = max(low - closing_words, 6)
+    body_high = max(high - closing_words, body_low + 4)
+    body = _budgeted_sentences(pool, body_low, body_high, motif, material)
+    sentences = body + closing
+    # A last body sentence that overshot the budget is dropped again.
+    while len(sentences) > 1 and _word_count(sentences) > high:
+        sentences.pop(-2)
+    return sentences
+
+
+def fallback_script(
+    style_key: str,
+    config: dict,
+    motif: str = "",
+    params=None,
+    reason: str = "",
+) -> dict:
+    """A complete script written without Gemini, from the config and the name.
+
+    It fills every key the pipeline and the metadata pack read (title, hook,
+    narration, description, tags and the four Japanese / overseas fields), so a
+    run with no API key - or one whose key is out of quota - still compiles a
+    telop, voices the narration, writes the pack and uploads the Short.
+    """
+    from improvement import narration_word_budget
+
+    brand = (config or {}).get("brand") or {}
+    material = str(brand.get("material_name") or "oil pastel").strip()
+    series = str(brand.get("name") or "CrayonJapan").strip()
+    motif = motif_from_name(motif)
+    shown = _motif_title(motif)
+    low, high = _narration_range(style_key, params)
+
+    if shown:
+        title = f"{shown} in oil pastel #Shorts"
+        title_ja = f"{shown}をオイルパステルで描く #Shorts"
+        hook_text = f"Watch this {motif} appear"
+        hook_ja = f"{shown}が色になっていく"
+        opening = (
+            f"This is how {shown} comes out of a few oil pastel strokes.",
+            f"{shown}が、いくつかの線から生まれます。",
+        )
+        overseas = f"{shown} drawn in creamy oil pastel, layer by layer"
+        overseas_ja = f"クレヨンで描く{shown}。色を重ねて、少しずつ形になっていきます。"
+    else:
+        title = "A tiny oil pastel drawing #Shorts"
+        title_ja = "小さなオイルパステル画 #Shorts"
+        hook_text = "Watch it appear stroke by stroke"
+        hook_ja = "一筆ずつ、色が生まれる"
+        opening = (
+            "This is how a small oil pastel drawing is built, stroke by stroke.",
+            "小さなオイルパステル画が、一筆ずつ出来ていきます。",
+        )
+        overseas = "A small original postcard, drawn in creamy oil pastel"
+        overseas_ja = "小さなポストカードを、クレヨンで一筆ずつ描いています。"
+
+    # The opening, then the sentences of this run's style, then the material
+    # ones: what the style is about has to survive the word budget.
+    pool = (opening,) + STYLE_SENTENCES.get(style_key, ()) + MATERIAL_SENTENCES
+    sentences = _compose_narration(
+        pool, CLOSING_SENTENCES, low, high, motif or shown, material
+    )
+    narration = " ".join(english for english, _ in sentences)
+    narration_ja = "".join(japanese for _, japanese in sentences)
+
+    description_lines = [
+        f"{shown or 'A small original'} - drawn by hand with {material}.",
+        "" if not shown else f"The {motif} is built up layer by layer: soft pigment first, then the details.",
+        "Every artwork is a one-of-a-kind original postcard, drawn once and never repeated.",
+        "",
+        " ".join(FALLBACK_HASHTAGS),
+    ]
+    tags = list(FALLBACK_TAGS)
+    if motif and motif.lower() not in {tag.lower() for tag in tags}:
+        tags = [motif] + tags
+
+    script = {
+        "title": title[:100],
+        "hook_text": hook_text,
+        "narration": narration,
+        "description": "\n".join(line for line in description_lines if line is not None).strip(),
+        "tags": tags[:10],
+        "title_ja": title_ja,
+        "hook_ja": hook_ja,
+        "narration_ja": narration_ja,
+        "overseas_caption": overseas,
+        "overseas_caption_ja": overseas_ja,
+        "script_source": SCRIPT_SOURCE_TEMPLATE,
+        "script_note": (reason or "written without Gemini")[:300],
+    }
+    return script
+
+
+def write_script(
+    keyframe_paths: Sequence[str],
+    style_key: str,
+    config: dict,
+    reference_scan: bool = False,
+    params=None,
+    motif: str = "",
+    log=print,
+    generator=None,
+) -> dict:
+    """The script for this Short: Gemini's when it answers, the template otherwise.
+
+    ``generator`` is the Gemini call (``generate_making_script`` by default), so
+    the render keeps working when the key is missing, out of quota or rejected;
+    the returned dict always carries every key the rest of the pipeline reads.
+    """
+    call = generator or generate_making_script
+    try:
+        script = call(
+            keyframe_paths,
+            style_key,
+            config,
+            reference_scan=reference_scan,
+            params=params,
+        )
+    except Exception as exc:  # noqa: BLE001 - a Short must still be made
+        log(
+            f"[gemini] no script from Gemini ({exc}); "
+            "using the offline template script from config.yaml and the artwork name"
+        )
+        return fallback_script(style_key, config, motif=motif, params=params, reason=str(exc))
+
+    script = dict(script or {})
+    script.setdefault("script_source", SCRIPT_SOURCE_GEMINI)
+    return script
 
 
 def generate_making_script(

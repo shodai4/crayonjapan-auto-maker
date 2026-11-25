@@ -99,6 +99,29 @@ schedule:
   min_interval_hours: 48
   max_videos_per_run: 1
 
+# Windows local mode (see docs/SETUP_WINDOWS_LOCAL.md). The three folders under
+# `base_dir` replace the Drive hub for a run on the artist's own PC: a GO_
+# folder in 01_RAW_VIDEO is rendered, the package lands in 02_READY_TO_POST and
+# the source moves to 03_ARCHIVE. Google Drive is not used at all in this mode;
+# the learning history stays in analytics/ on the same PC.
+local:
+  # Empty = CRAYONJAPAN_HOME, else C:\CrayonJapan on Windows (~/CrayonJapan
+  # elsewhere). --local-base overrides both.
+  base_dir: ""
+  # A loose recording is only picked up once it has sat still this long, so a
+  # file still being copied from the camera is never rendered half-written.
+  min_age_seconds: 60
+  # A GO_ folder only waits this long after the rename: the rename is the
+  # artist's "this artwork is complete" signal.
+  go_min_age_seconds: 5
+  # Seconds between scans of --local-watch (the scheduled run is --local-once).
+  scan_interval_seconds: 60
+  # Move the rendered GO_ folder into 03_ARCHIVE. false keeps the recordings in
+  # 01_RAW_VIDEO (local_state.json still stops a second render).
+  archive_after_render: true
+  # The Task Scheduler entry scripts/register_local_task.bat creates.
+  task_name: "CrayonJapan Auto-Maker"
+
 # On-screen telop (see telop.py). `enabled: false` falls back to the plain SRT
 # cues; nothing else in the render depends on this block.
 telop:
