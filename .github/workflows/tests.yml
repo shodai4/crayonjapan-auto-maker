@@ -1,0 +1,64 @@
+name: Tests
+
+# The render workflow (auto-edit.yml) only runs on a dispatch or its daily cron,
+# and it needs the Drive and YouTube secrets. This one proves the code itself on
+# every push: no credentials, no network, no upload - just the unit suite that
+# the render depends on, on the oldest and the current Python.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crayonjapan-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg and the OpenCV system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libgl1 libglib2.0-0 fonts-dejavu-core
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Local mode works without credentials
+        run: |
+          base="$RUNNER_TEMP/CrayonJapan"
+          python main.py --local-init --local-base "$base"
+          mkdir -p "$base/01_RAW_VIDEO/GO_20260101_probe"
+          python main.py --dry-run --ignore-schedule --local-base "$base"
+          test -d "$base/02_READY_TO_POST"
+          test -d "$base/03_ARCHIVE"
+
+      - name: Local mode end to end (real FFmpeg, no Gemini, no upload)
+        run: python scripts/verify_local_mode.py --ffmpeg "$(command -v ffmpeg)"
