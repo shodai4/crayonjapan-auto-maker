@@ -17,7 +17,6 @@ import time
 from datetime import datetime, timezone
 from typing import List, Optional, Sequence
 
-import pandas as pd
 import yaml
 
 import ai_writer
@@ -33,7 +32,12 @@ from ai_writer import (
     choose_best_style,
     generate_making_script,
 )
-from analytics_updater import CSV_COLUMNS, update_performance_metrics
+from analytics_updater import (
+    CSV_COLUMNS,
+    read_performance_csv,
+    update_performance_metrics,
+    write_performance_csv,
+)
 from metadata_writer import JST, ensure_shop_cta, write_metadata_files
 from video_processor import (
     DEFAULT_ARTWORK_OFFSET,
@@ -422,12 +426,14 @@ def append_performance_row(
     hook_type: str = HOOK_TYPE,
     params: Optional[dict] = None,
     duration_sec: float = 0.0,
-) -> pd.DataFrame:
+) -> list:
     """Record the new Short so the next reflection knows what made it.
 
     Besides the identity of the upload, the row carries the parameters it was
     made with: without them the numbers cannot be attributed to a hook style, a
     language or a length, and the loop would only see noise.
+
+    Returns all rows now in the file, in file order.
     """
     params = params or {}
     row = {
@@ -449,19 +455,16 @@ def append_performance_row(
         "top_feedback": "",
         "updated_at": "",
     }
-    new_row = pd.DataFrame([row])
+    rows = []
     if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
-        df = pd.read_csv(csv_path)
-        df = pd.concat([df, new_row], ignore_index=True)
-    else:
-        df = new_row
-    for column in CSV_COLUMNS:
-        if column not in df.columns:
-            df[column] = ""
-    df = df[CSV_COLUMNS]
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    df.to_csv(csv_path, index=False)
-    return df
+        rows = read_performance_csv(csv_path)
+    rows = [
+        {column: existing.get(column, "") for column in CSV_COLUMNS}
+        for existing in rows
+    ]
+    rows.append({column: row.get(column, "") for column in CSV_COLUMNS})
+    write_performance_csv(csv_path, rows)
+    return rows
 
 
 def get_output_dir(

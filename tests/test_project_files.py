@@ -39,7 +39,6 @@ REQUIRED_PACKAGES = [
     "edge-tts",
     "google-api-python-client",
     "google-auth-oauthlib",
-    "pandas",
     "pyyaml",
     "watchdog",
     "python-dotenv",

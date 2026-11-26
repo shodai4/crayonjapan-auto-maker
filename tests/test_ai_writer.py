@@ -1,10 +1,9 @@
+import csv
 import json
 import os
 import tempfile
 import unittest
 from unittest import mock
-
-import pandas as pd
 
 import ai_writer
 from main import load_config
@@ -14,9 +13,12 @@ CONFIG = load_config(os.path.join(ROOT, "config.yaml"))
 
 
 def write_csv(path, rows):
-    pd.DataFrame(rows, columns=["video_id", "style_used", "avg_view_percentage"]).to_csv(
-        path, index=False
-    )
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=["video_id", "style_used", "avg_view_percentage"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 STATS_ROWS = [

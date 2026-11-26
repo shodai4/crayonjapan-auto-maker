@@ -463,7 +463,7 @@ sync orchestration
 (GO_ folder discovery, natural sorting, prefix stripping, download / upload / archive / state,
 the 02_READY_TO_POST subfolder, mocked Drive client), the Windows local hub (folder resolution,
 layout, queue, natural order, hard-link hand-off, publish, archive, state, cap, dry run),
-`--doctor` and project file invariants. They need `pandas`, `pyyaml` and `opencv-python`
+`--doctor` and project file invariants. They need `pyyaml` and `opencv-python`
 only – no FFmpeg run, API key or network access (one audio-mux path needs `ffmpeg` on the
 PATH, which the workflow installs).
 

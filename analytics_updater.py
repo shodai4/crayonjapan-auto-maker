@@ -14,11 +14,11 @@ parameter set) and when the numbers were last refreshed.
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
+import os
 import sys
 from typing import Dict, Iterable, List, Optional, Sequence
-
-import pandas as pd
 
 from youtube_uploader import (
     build_analytics_query,
@@ -73,6 +73,42 @@ AVG_VIEW_DURATION = "averageViewDuration"
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)
+
+
+# One row of analytics/performance.csv: every value is a string as read,
+# and _ensure_columns turns the number columns into floats.
+PerformanceRow = Dict[str, object]
+
+
+def read_performance_csv(csv_path: str) -> List[PerformanceRow]:
+    """Read the performance log as a list of rows, in file order.
+
+    A missing file raises FileNotFoundError (as before); a file with only a
+    header, or an empty file, reads as no rows. Rows keep the file's own
+    column order - _ensure_columns normalises them to CSV_COLUMNS.
+    """
+    with open(csv_path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            return []
+        return [dict(row) for row in reader]
+
+
+def write_performance_csv(csv_path: str, rows: List[PerformanceRow]) -> None:
+    """Write rows back in CSV_COLUMNS order, creating the folder if needed."""
+    parent = os.path.dirname(csv_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(csv_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=CSV_COLUMNS, extrasaction="ignore", restval=""
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(
+                {column: ("" if row.get(column) is None else row.get(column))
+                 for column in CSV_COLUMNS}
+            )
 
 
 def chunked(items: Sequence[str], size: int = LIST_BATCH_SIZE) -> Iterable[List[str]]:
@@ -245,19 +281,24 @@ def fetch_view_metrics(
 
 
 def _as_date(value) -> Optional[dt.date]:
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    """A ``YYYY-MM-DD`` cell (or date/datetime) as a date, else None."""
+    if value is None:
         return None
     if isinstance(value, dt.datetime):
         return value.date()
     if isinstance(value, dt.date):
         return value
+    text = str(value).strip()
+    if not text:
+        return None
     try:
-        parsed = pd.to_datetime(str(value))
-    except (ValueError, TypeError):
+        return dt.date.fromisoformat(text)
+    except ValueError:
+        pass
+    try:
+        return dt.datetime.fromisoformat(text).date()
+    except ValueError:
         return None
-    if pd.isna(parsed):
-        return None
-    return parsed.date()
 
 
 def _metric_start_date(row_date: Optional[dt.date], today: dt.date) -> dt.date:
@@ -273,21 +314,31 @@ def _to_int(value, default: int = 0) -> int:
         return default
 
 
-def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for column in CSV_COLUMNS:
-        if column not in df.columns:
-            df[column] = "" if column in TEXT_COLUMNS else 0
-    # A column that is empty in the file is read as float64 (all NaN), which
-    # refuses the timestamp/parameter text written later; keep text as objects.
-    for column in TEXT_COLUMNS:
-        if column in df.columns:
-            df[column] = df[column].astype(object)
-    # Metrics arrive as fractions (12.4 s), so every number column is a float.
-    for column in CSV_COLUMNS:
-        if column in TEXT_COLUMNS:
-            continue
-        df[column] = pd.to_numeric(df[column], errors="coerce").astype(float)
-    return df[CSV_COLUMNS]
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ensure_columns(rows: List[PerformanceRow]) -> List[PerformanceRow]:
+    """Fill every CSV_COLUMNS column, in that order.
+
+    A missing text column is "" and a missing number column is 0.0; a number
+    cell that does not parse is 0.0 too, so a later write never meets a blank
+    where the reflection expects a number.
+    """
+    out: List[PerformanceRow] = []
+    for row in rows:
+        fixed: PerformanceRow = {}
+        for column in CSV_COLUMNS:
+            value = row.get(column)
+            if column in TEXT_COLUMNS:
+                fixed[column] = "" if value is None else str(value)
+            else:
+                fixed[column] = _to_float(value, 0.0) if value not in (None, "") else 0.0
+        out.append(fixed)
+    return out
 
 
 def _parse_moment(value) -> Optional[dt.datetime]:
@@ -304,13 +355,13 @@ def _parse_moment(value) -> Optional[dt.datetime]:
 
 
 def rows_to_refresh(
-    df: pd.DataFrame,
+    rows: List[PerformanceRow],
     today: Optional[dt.date] = None,
     min_age_hours: float = 0.0,
     max_rows: Optional[int] = None,
     refresh_hours: float = 6.0,
     now: Optional[dt.datetime] = None,
-) -> List:
+) -> List[int]:
     """The rows worth asking YouTube about this run.
 
     With the defaults (``min_age_hours=0``, no cap) every row is refreshed, the
@@ -323,10 +374,10 @@ def rows_to_refresh(
     now = now or dt.datetime.now(dt.timezone.utc)
     today = today or now.date()
     if min_age_hours <= 0 and max_rows is None:
-        return list(df.index)
+        return list(range(len(rows)))
 
-    candidates: List = []
-    for index, row in df.iterrows():
+    candidates: List[int] = []
+    for index, row in enumerate(rows):
         vid = str(row.get("video_id", "")).strip()
         if not vid:
             continue
@@ -350,7 +401,7 @@ def rows_to_refresh(
     if max_rows is not None and len(candidates) > max_rows:
         ordered = sorted(
             candidates,
-            key=lambda idx: str(df.at[idx, "date"] or ""),
+            key=lambda idx: str(rows[idx].get("date") or ""),
             reverse=True,
         )
         candidates = ordered[: max(int(max_rows), 1)]
@@ -367,37 +418,37 @@ def update_performance_metrics(
     max_rows: Optional[int] = None,
     refresh_hours: float = 6.0,
     now: Optional[dt.datetime] = None,
-) -> pd.DataFrame:
-    """Update the performance CSV in place and return the refreshed frame."""
-    df = _ensure_columns(pd.read_csv(csv_path))
-    if df.empty:
+) -> List[PerformanceRow]:
+    """Update the performance CSV in place and return the refreshed rows."""
+    rows = _ensure_columns(read_performance_csv(csv_path))
+    if not rows:
         print("No videos recorded yet.")
-        return df
+        return rows
 
-    video_ids = [str(vid) for vid in df["video_id"].dropna().tolist() if str(vid).strip()]
+    video_ids = [str(row.get("video_id", "")) for row in rows if str(row.get("video_id", "")).strip()]
     if not video_ids:
-        return df
+        return rows
 
     today = today or (now.date() if now else dt.date.today())
     stamp = (now or dt.datetime.now(dt.timezone.utc)).replace(microsecond=0).isoformat()
     targets = rows_to_refresh(
-        df, today=today, min_age_hours=min_age_hours,
+        rows, today=today, min_age_hours=min_age_hours,
         max_rows=max_rows, refresh_hours=refresh_hours, now=now,
     )
     target_set = set(targets)
 
     youtube = youtube or get_youtube_service()
     details = fetch_video_details(youtube, video_ids)
-    for idx, row in df.iterrows():
+    for idx, row in enumerate(rows):
         vid = str(row.get("video_id", "")).strip()
         if vid in details:
             st = details[vid]["statistics"]
-            df.at[idx, "views"] = _to_int(st.get("viewCount"), 0)
-            df.at[idx, "likes"] = _to_int(st.get("likeCount"), 0)
-            df.at[idx, "comments_count"] = _to_int(st.get("commentCount"), 0)
+            rows[idx]["views"] = _to_int(st.get("viewCount"), 0)
+            rows[idx]["likes"] = _to_int(st.get("likeCount"), 0)
+            rows[idx]["comments_count"] = _to_int(st.get("commentCount"), 0)
             length = details[vid].get("duration_sec")
             if length:
-                df.at[idx, "duration_sec"] = round(float(length), 3)
+                rows[idx]["duration_sec"] = round(float(length), 3)
 
     if with_analytics and target_set:
         if analytics is None:
@@ -409,7 +460,7 @@ def update_performance_metrics(
         if analytics is not None:
             end_date = today.isoformat()
             for idx in targets:
-                row = df.loc[idx]
+                row = rows[idx]
                 vid = str(row.get("video_id", "")).strip()
                 if not vid:
                     continue
@@ -418,17 +469,17 @@ def update_performance_metrics(
                 if not values:
                     continue
                 if AVG_VIEW_PERCENTAGE in values:
-                    df.at[idx, "avg_view_percentage"] = round(values[AVG_VIEW_PERCENTAGE], 2)
+                    rows[idx]["avg_view_percentage"] = round(values[AVG_VIEW_PERCENTAGE], 2)
                 if AVG_VIEW_DURATION in values:
-                    df.at[idx, "avg_view_duration_sec"] = round(values[AVG_VIEW_DURATION], 2)
+                    rows[idx]["avg_view_duration_sec"] = round(values[AVG_VIEW_DURATION], 2)
 
     if target_set:
         for idx in target_set:
-            df.at[idx, "updated_at"] = stamp
+            rows[idx]["updated_at"] = stamp
 
-    df.to_csv(csv_path, index=False)
-    print(f"Updated performance.csv successfully ({len(target_set)} of {len(df)} row(s)).")
-    return df
+    write_performance_csv(csv_path, rows)
+    print(f"Updated performance.csv successfully ({len(target_set)} of {len(rows)} row(s)).")
+    return rows
 
 
 if __name__ == "__main__":

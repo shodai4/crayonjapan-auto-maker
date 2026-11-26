@@ -1,10 +1,9 @@
+import csv
 import json
 import os
 import tempfile
 import unittest
 from unittest import mock
-
-import pandas as pd
 
 import improvement
 
@@ -22,7 +21,13 @@ CONFIG = {
 
 
 def make_csv(path, rows):
-    pd.DataFrame(rows).to_csv(path, index=False)
+    if not rows:
+        open(path, "w", encoding="utf-8").close()
+        return
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def rows(*specs):
@@ -155,17 +160,18 @@ class ActiveParamsTests(unittest.TestCase):
 
 class SummaryTests(unittest.TestCase):
     def test_unmeasured_rows_are_ignored(self):
-        df = pd.DataFrame(rows({"retention": 0.0, "views": 0}))
-        self.assertEqual(improvement.summarise_performance(df)["measured"], 0)
+        self.assertEqual(
+            improvement.summarise_performance(rows({"retention": 0.0, "views": 0}))["measured"],
+            0,
+        )
 
     def test_the_summary_names_the_best_and_worst_short(self):
-        df = pd.DataFrame(
+        summary = improvement.summarise_performance(
             rows(
                 {"retention": 26.9, "title": "Pokemon card", "length": 46},
                 {"retention": 50.0, "title": "Blue candy", "length": 83},
             )
         )
-        summary = improvement.summarise_performance(df)
         self.assertEqual(summary["measured"], 2)
         self.assertEqual(summary["best"]["title"], "Blue candy")
         self.assertEqual(summary["worst"]["title"], "Pokemon card")
@@ -173,8 +179,9 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summary["by_hook_style"]["finish_preview"], 38.5)
 
     def test_only_the_recent_rows_are_used(self):
-        df = pd.DataFrame(rows(*[{"retention": 10.0 + i} for i in range(12)]))
-        summary = improvement.summarise_performance(df, recent=4)
+        summary = improvement.summarise_performance(
+            rows(*[{"retention": 10.0 + i} for i in range(12)]), recent=4
+        )
         self.assertEqual(summary["measured"], 4)
         self.assertEqual(len(summary["recent"]), 4)
 
@@ -193,7 +200,7 @@ class ReviewTests(unittest.TestCase):
 
     def test_the_prompt_carries_the_numbers_and_the_current_parameters(self):
         summary = improvement.summarise_performance(
-            pd.DataFrame(rows({"retention": 26.9, "title": "Pokemon card", "length": 46}))
+            rows({"retention": 26.9, "title": "Pokemon card", "length": 46})
         )
         prompt = improvement.review_prompt(summary, improvement.validate_params(), CONFIG)
         self.assertIn("Pokemon", prompt)  # the row titles travel with the data
