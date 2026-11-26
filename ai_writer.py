@@ -11,7 +11,8 @@ import os
 import random
 import re
 from typing import Dict, List, Mapping, Optional, Sequence
-import pandas as pd
+
+from analytics_updater import read_performance_csv
 
 MODEL_NAME = "gemini-3-flash-preview"
 # The gemini-3 family is served on v1beta only. google-genai 3.x defaults to
@@ -77,13 +78,16 @@ ASMR_NARRATION_MAX_WORDS = 105
 STYLE_OVERRIDE_ENV = "STYLE_OVERRIDE"
 
 
-def load_performance(csv_path: str) -> Optional[pd.DataFrame]:
-    """Read the performance log, or None when it is missing/unreadable."""
+def load_performance(csv_path: str) -> Optional[List[dict]]:
+    """Read the performance log as rows, or None when it is missing/unreadable.
+
+    A file with only a header reads as an empty list.
+    """
     if not os.path.exists(csv_path):
         return None
     try:
-        return pd.read_csv(csv_path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError, OSError):
+        return read_performance_csv(csv_path)
+    except Exception:  # noqa: BLE001 - a broken log is the same as no log
         return None
 
 
@@ -123,21 +127,34 @@ def choose_best_style(
 
     explore_rate = float(config["evolution"].get("exploration_rate", 0.25))
 
-    df = load_performance(csv_path)
-    if df is None or df.empty or len(df) < 3:
+    rows = load_performance(csv_path)
+    if not rows or len(rows) < 3:
         return rng.choice(style_names)
     if rng.random() < explore_rate:
         return rng.choice(style_names)
 
-    if "style_used" not in df.columns or "avg_view_percentage" not in df.columns:
+    if "style_used" not in rows[0] or "avg_view_percentage" not in rows[0]:
         return rng.choice(style_names)
 
-    df = df[df["style_used"].isin(style_names)]
-    scores = pd.to_numeric(df["avg_view_percentage"], errors="coerce")
-    grouped = scores.groupby(df["style_used"]).mean().dropna()
-    if grouped.empty:
+    # Mean retention per style, ignoring rows whose number does not parse
+    # (the dropna() the groupby used to do). The first style wins a tie,
+    # the same as idxmax() on the grouped frame.
+    totals: Dict[str, float] = {}
+    counts: Dict[str, int] = {}
+    for row in rows:
+        style = str(row.get("style_used") or "")
+        if style not in style_names:
+            continue
+        try:
+            score = float(row.get("avg_view_percentage"))
+        except (TypeError, ValueError):
+            continue
+        totals[style] = totals.get(style, 0.0) + score
+        counts[style] = counts.get(style, 0) + 1
+    if not totals:
         return rng.choice(style_names)
-    return str(grouped.idxmax())
+    best = max(totals, key=lambda style: totals[style] / counts[style])
+    return str(best)
 
 
 def _narration_range(style_key: str, params=None) -> tuple:

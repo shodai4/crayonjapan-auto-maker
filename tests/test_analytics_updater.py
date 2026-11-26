@@ -1,10 +1,9 @@
+import csv
 import datetime as dt
 import os
 import tempfile
 import unittest
 from unittest import mock
-
-import pandas as pd
 
 import analytics_updater as au
 from youtube_uploader import build_analytics_query
@@ -72,7 +71,17 @@ class FakeAnalytics:
 
 
 def make_csv(path, rows):
-    pd.DataFrame(rows, columns=COLUMNS).to_csv(path, index=False)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=COLUMNS, restval="")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def read_csv(path):
+    with open(path, "r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        return list(reader), fieldnames
 
 
 class UpdatePerformanceTests(unittest.TestCase):
@@ -103,19 +112,19 @@ class UpdatePerformanceTests(unittest.TestCase):
         })
         analytics = FakeAnalytics(values={"v1": 62.536, "v2": 41.0})
 
-        df = au.update_performance_metrics(
+        rows = au.update_performance_metrics(
             self.csv, youtube=youtube, analytics=analytics, today=TODAY
         )
 
-        self.assertEqual(int(df.loc[0, "views"]), 1200)
-        self.assertEqual(int(df.loc[0, "likes"]), 34)
-        self.assertEqual(int(df.loc[0, "comments_count"]), 5)
-        self.assertAlmostEqual(float(df.loc[0, "avg_view_percentage"]), 62.54)
-        self.assertAlmostEqual(float(df.loc[1, "avg_view_percentage"]), 41.0)
-        self.assertEqual(int(df.loc[1, "likes"]), 0)
+        self.assertEqual(int(rows[0]["views"]), 1200)
+        self.assertEqual(int(rows[0]["likes"]), 34)
+        self.assertEqual(int(rows[0]["comments_count"]), 5)
+        self.assertAlmostEqual(float(rows[0]["avg_view_percentage"]), 62.54)
+        self.assertAlmostEqual(float(rows[1]["avg_view_percentage"]), 41.0)
+        self.assertEqual(int(rows[1]["likes"]), 0)
 
-        saved = pd.read_csv(self.csv)
-        self.assertAlmostEqual(float(saved.loc[0, "avg_view_percentage"]), 62.54)
+        saved, _ = read_csv(self.csv)
+        self.assertAlmostEqual(float(saved[0]["avg_view_percentage"]), 62.54)
 
     def test_analytics_failure_keeps_existing_values(self):
         make_csv(self.csv, self._rows())
@@ -123,13 +132,13 @@ class UpdatePerformanceTests(unittest.TestCase):
         analytics = FakeAnalytics(values={"v2": 48.0}, failing={"v1"})
 
         with mock.patch("sys.stderr"):
-            df = au.update_performance_metrics(
+            rows = au.update_performance_metrics(
                 self.csv, youtube=youtube, analytics=analytics, today=TODAY
             )
 
-        self.assertAlmostEqual(float(df.loc[0, "avg_view_percentage"]), 55.0)
-        self.assertEqual(int(df.loc[0, "views"]), 7)
-        self.assertAlmostEqual(float(df.loc[1, "avg_view_percentage"]), 48.0)
+        self.assertAlmostEqual(float(rows[0]["avg_view_percentage"]), 55.0)
+        self.assertEqual(int(rows[0]["views"]), 7)
+        self.assertAlmostEqual(float(rows[1]["avg_view_percentage"]), 48.0)
 
     def test_empty_analytics_rows_keep_existing_values(self):
         make_csv(self.csv, self._rows())
@@ -137,12 +146,12 @@ class UpdatePerformanceTests(unittest.TestCase):
         analytics = FakeAnalytics(values={}, empty={"v1", "v2"})
 
         with mock.patch("sys.stderr"):
-            df = au.update_performance_metrics(
+            rows = au.update_performance_metrics(
                 self.csv, youtube=youtube, analytics=analytics, today=TODAY
             )
 
-        self.assertAlmostEqual(float(df.loc[0, "avg_view_percentage"]), 55.0)
-        self.assertAlmostEqual(float(df.loc[1, "avg_view_percentage"]), 0.0)
+        self.assertAlmostEqual(float(rows[0]["avg_view_percentage"]), 55.0)
+        self.assertAlmostEqual(float(rows[1]["avg_view_percentage"]), 0.0)
 
     def test_analytics_client_failure_does_not_abort_run(self):
         make_csv(self.csv, self._rows())
@@ -153,29 +162,29 @@ class UpdatePerformanceTests(unittest.TestCase):
                     au, "get_youtube_analytics_service",
                     side_effect=RuntimeError("consent required"),
                 ):
-            df = au.update_performance_metrics(self.csv, youtube=youtube, today=TODAY)
+            rows = au.update_performance_metrics(self.csv, youtube=youtube, today=TODAY)
 
-        self.assertEqual(int(df.loc[0, "views"]), 3)
-        self.assertAlmostEqual(float(df.loc[0, "avg_view_percentage"]), 55.0)
+        self.assertEqual(int(rows[0]["views"]), 3)
+        self.assertAlmostEqual(float(rows[0]["avg_view_percentage"]), 55.0)
 
     def test_analytics_can_be_skipped(self):
         make_csv(self.csv, self._rows())
         youtube = FakeYouTube({"v1": {"viewCount": "3"}})
         analytics = FakeAnalytics(values={"v1": 90.0})
 
-        df = au.update_performance_metrics(
+        rows = au.update_performance_metrics(
             self.csv, youtube=youtube, analytics=analytics, with_analytics=False, today=TODAY
         )
 
         self.assertEqual(analytics.queries, [])
-        self.assertAlmostEqual(float(df.loc[0, "avg_view_percentage"]), 55.0)
+        self.assertAlmostEqual(float(rows[0]["avg_view_percentage"]), 55.0)
 
     def test_empty_csv_is_reported(self):
         make_csv(self.csv, [])
-        df = au.update_performance_metrics(
+        rows = au.update_performance_metrics(
             self.csv, youtube=FakeYouTube({}), analytics=FakeAnalytics(values={}), today=TODAY
         )
-        self.assertTrue(df.empty)
+        self.assertEqual(rows, [])
 
     def test_query_uses_upload_date_and_today(self):
         make_csv(self.csv, self._rows())
@@ -359,46 +368,44 @@ class RefreshSelectionTests(unittest.TestCase):
             {"video_id": "never", "date": "2026-11-10", "views": 0, "avg_view_percentage": 0.0,
              "updated_at": ""},
         ]
-        return au._ensure_columns(pd.DataFrame(rows))
+        return au._ensure_columns(rows)
 
     def test_without_limits_every_row_is_refreshed(self):
-        df = self.frame()
-        self.assertEqual(au.rows_to_refresh(df, today=TODAY), list(df.index))
+        rows = self.frame()
+        self.assertEqual(au.rows_to_refresh(rows, today=TODAY), list(range(len(rows))))
 
     def test_a_freshly_measured_row_is_left_alone(self):
-        df = self.frame()
+        rows = self.frame()
         now = dt.datetime(2026, 11, 20, 3, tzinfo=dt.timezone.utc)
-        picked = au.rows_to_refresh(df, today=TODAY, min_age_hours=24, refresh_hours=6, now=now)
+        picked = au.rows_to_refresh(rows, today=TODAY, min_age_hours=24, refresh_hours=6, now=now)
         self.assertNotIn(0, picked)  # measured two hours ago
         self.assertIn(1, picked)     # never measured
         self.assertIn(2, picked)
 
     def test_a_short_younger_than_the_age_limit_is_skipped_when_measured(self):
-        df = self.frame()
-        df.loc[1, "views"] = 500
-        df.loc[1, "avg_view_percentage"] = 40.0
-        df.loc[1, "date"] = "2026-11-20"
+        rows = self.frame()
+        rows[1]["views"] = 500
+        rows[1]["avg_view_percentage"] = 40.0
+        rows[1]["date"] = "2026-11-20"
         now = dt.datetime(2026, 11, 20, 12, tzinfo=dt.timezone.utc)
-        picked = au.rows_to_refresh(df, today=TODAY, min_age_hours=24, now=now)
+        picked = au.rows_to_refresh(rows, today=TODAY, min_age_hours=24, now=now)
         self.assertNotIn(1, picked)
 
     def test_the_cap_keeps_the_newest_rows(self):
-        df = self.frame()
+        rows = self.frame()
         picked = au.rows_to_refresh(
-            df, today=TODAY, min_age_hours=0, max_rows=2,
+            rows, today=TODAY, min_age_hours=0, max_rows=2,
             now=dt.datetime(2026, 11, 21, tzinfo=dt.timezone.utc),
         )
         self.assertEqual(len(picked), 2)
         self.assertNotIn(0, picked)  # the oldest of the three
 
     def test_the_update_records_the_seconds_and_the_timestamp(self):
-        pd.DataFrame(
-            [
-                {"video_id": "v1", "date": "2026-11-01", "title": "A", "style_used": "s",
-                 "hook_type": "h", "views": 0, "avg_view_percentage": 0.0, "likes": 0,
-                 "comments_count": 0, "top_feedback": ""},
-            ]
-        ).to_csv(self.csv, index=False)
+        make_csv(self.csv, [
+            {"video_id": "v1", "date": "2026-11-01", "title": "A", "style_used": "s",
+             "hook_type": "h", "views": 0, "avg_view_percentage": 0.0, "likes": 0,
+             "comments_count": 0, "top_feedback": ""},
+        ])
 
         class Analytics:
             def reports(self):
@@ -429,24 +436,24 @@ class RefreshSelectionTests(unittest.TestCase):
 
                 return Videos()
 
-        df = au.update_performance_metrics(
+        rows = au.update_performance_metrics(
             self.csv, youtube=YouTube(), analytics=Analytics(), today=TODAY,
         )
-        self.assertAlmostEqual(float(df.loc[0, "avg_view_percentage"]), 26.9)
-        self.assertAlmostEqual(float(df.loc[0, "avg_view_duration_sec"]), 12.4)
-        self.assertAlmostEqual(float(df.loc[0, "duration_sec"]), 46.0)
-        self.assertTrue(str(df.loc[0, "updated_at"]).startswith("20"))
+        self.assertAlmostEqual(float(rows[0]["avg_view_percentage"]), 26.9)
+        self.assertAlmostEqual(float(rows[0]["avg_view_duration_sec"]), 12.4)
+        self.assertAlmostEqual(float(rows[0]["duration_sec"]), 46.0)
+        self.assertTrue(str(rows[0]["updated_at"]).startswith("20"))
 
     def test_the_new_columns_are_added_to_an_old_file(self):
-        pd.DataFrame(
-            [{"video_id": "v1", "date": "2026-11-01", "title": "A", "style_used": "s",
-              "hook_type": "h", "views": 1, "avg_view_percentage": 2.0, "likes": 0,
-              "comments_count": 0, "top_feedback": ""}]
-        ).to_csv(self.csv, index=False)
-        df = au.update_performance_metrics(
+        make_csv(self.csv, [
+            {"video_id": "v1", "date": "2026-11-01", "title": "A", "style_used": "s",
+             "hook_type": "h", "views": 1, "avg_view_percentage": 2.0, "likes": 0,
+             "comments_count": 0, "top_feedback": ""},
+        ])
+        rows = au.update_performance_metrics(
             self.csv, youtube=FakeYouTube({}), analytics=FakeAnalytics(values={}),
             with_analytics=False, today=TODAY,
         )
         for column in ("avg_view_duration_sec", "language_mode", "tts_mode",
                        "duration_sec", "target_duration_sec", "params_json", "updated_at"):
-            self.assertIn(column, df.columns)
+            self.assertIn(column, rows[0])

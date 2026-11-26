@@ -32,7 +32,8 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
-import pandas as pd
+from analytics_updater import read_performance_csv
+
 
 STATE_PATH = "analytics/improvement_state.json"
 PERFORMANCE_PATH = "analytics/performance.csv"
@@ -225,36 +226,40 @@ def describe_params(params: Mapping[str, object]) -> str:
 # What the numbers say
 # ---------------------------------------------------------------------------
 
-def _measured_rows(df: Optional[pd.DataFrame]) -> pd.DataFrame:
+def _to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _measured_rows(rows: Optional[List[dict]]) -> List[dict]:
     """Rows that describe a real upload (an id, and some numbers at all)."""
-    if df is None or df.empty:
-        return pd.DataFrame()
-    frame = df.copy()
-    if "video_id" not in frame.columns:
-        return pd.DataFrame()
-    frame = frame[frame["video_id"].astype(str).str.strip().ne("") & frame["video_id"].notna()]
-    if frame.empty:
-        return pd.DataFrame()
-    for column in ("views", "avg_view_percentage", "avg_view_duration_sec", "likes", "comments_count"):
-        if column in frame.columns:
-            frame[column] = pd.to_numeric(frame[column], errors="coerce").fillna(0.0)
-        else:
-            frame[column] = 0.0
-    seen = (frame["views"] > 0) | (frame["avg_view_percentage"] > 0)
-    return frame[seen]
+    if not rows:
+        return []
+    measured: List[dict] = []
+    for row in rows:
+        if not str(row.get("video_id") or "").strip():
+            continue
+        frame = dict(row)
+        for column in ("views", "avg_view_percentage", "avg_view_duration_sec", "likes", "comments_count"):
+            frame[column] = _to_float(frame.get(column), 0.0)
+        if frame["views"] > 0 or frame["avg_view_percentage"] > 0:
+            measured.append(frame)
+    return measured
 
 
 def summarise_performance(
-    df: Optional[pd.DataFrame],
+    rows: Optional[List[dict]],
     recent: int = 8,
 ) -> Dict[str, object]:
     """The numbers the reflection reads, as plain JSON-friendly data."""
-    rows = _measured_rows(df)
-    if rows.empty:
+    rows = _measured_rows(rows)
+    if not rows:
         return {"measured": 0}
-    if "date" in rows.columns:
-        rows = rows.sort_values("date", kind="stable")
-    rows = rows.tail(max(int(recent), 1))
+    # ISO dates sort lexicographically, the same order sort_values gave.
+    rows = sorted(rows, key=lambda row: str(row.get("date") or ""))
+    rows = rows[-max(int(recent), 1):]
 
     def _row(item) -> Dict[str, object]:
         return {
@@ -272,7 +277,7 @@ def summarise_performance(
             "tts_mode": str(item.get("tts_mode", "")),
         }
 
-    records = [_row(item) for _, item in rows.iterrows()]
+    records = [_row(item) for item in rows]
     retention = [record["retention_pct"] for record in records]
     by_hook: Dict[str, List[float]] = {}
     by_language: Dict[str, List[float]] = {}
@@ -464,12 +469,17 @@ def decide_params(
     return params, review
 
 
-def load_performance(path: str = PERFORMANCE_PATH) -> Optional[pd.DataFrame]:
+def load_performance(path: str = PERFORMANCE_PATH) -> Optional[List[dict]]:
+    """The performance log as rows, None when it is missing or unreadable.
+
+    A file with only a header reads as an empty list, the same as the empty
+    frame it used to be.
+    """
     if not os.path.exists(path):
         return None
     try:
-        return pd.read_csv(path)
-    except (pd.errors.EmptyDataError, pd.errors.ParserError, OSError):
+        return read_performance_csv(path)
+    except Exception:  # noqa: BLE001 - a broken log is the same as no log
         return None
 
 

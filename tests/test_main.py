@@ -1,11 +1,10 @@
+import csv
 import json
 import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
-
-import pandas as pd
 
 import drive_sync
 import improvement
@@ -250,29 +249,33 @@ class PerformanceRowTests(unittest.TestCase):
     SCRIPT = {"title": "Oil pastel postcard #Shorts", "description": "d"}
 
     def test_creates_csv_with_header_and_row(self):
-        df = main.append_performance_row(self.SCRIPT, "style_B_story", "vid1", self.csv)
-        self.assertEqual(list(df.columns), CSV_COLUMNS)
-        self.assertEqual(len(df), 1)
-        self.assertEqual(df.loc[0, "style_used"], "style_B_story")
-        self.assertEqual(df.loc[0, "hook_type"], main.HOOK_TYPE)
-        self.assertEqual(float(df.loc[0, "avg_view_percentage"]), 0.0)
+        rows = main.append_performance_row(self.SCRIPT, "style_B_story", "vid1", self.csv)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["style_used"], "style_B_story")
+        self.assertEqual(rows[0]["hook_type"], main.HOOK_TYPE)
+        self.assertEqual(float(rows[0]["avg_view_percentage"]), 0.0)
         self.assertTrue(os.path.exists(self.csv))
+        with open(self.csv, "r", encoding="utf-8", newline="") as handle:
+            self.assertEqual(list(csv.DictReader(handle).fieldnames or []), CSV_COLUMNS)
 
     def test_appends_without_losing_previous_rows(self):
         main.append_performance_row(self.SCRIPT, "style_A_material", "vid1", self.csv)
-        df = main.append_performance_row(self.SCRIPT, "style_C_asmr", "vid2", self.csv)
-        self.assertEqual(len(df), 2)
-        self.assertEqual(list(df["video_id"]), ["vid1", "vid2"])
+        rows = main.append_performance_row(self.SCRIPT, "style_C_asmr", "vid2", self.csv)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([row["video_id"] for row in rows], ["vid1", "vid2"])
 
-        saved = pd.read_csv(self.csv)
-        self.assertEqual(list(saved["video_id"]), ["vid1", "vid2"])
-        self.assertEqual(list(saved.columns), CSV_COLUMNS)
+        with open(self.csv, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            saved = list(reader)
+            fieldnames = reader.fieldnames or []
+        self.assertEqual([row["video_id"] for row in saved], ["vid1", "vid2"])
+        self.assertEqual(list(fieldnames), CSV_COLUMNS)
 
     def test_records_given_date(self):
-        df = main.append_performance_row(
+        rows = main.append_performance_row(
             self.SCRIPT, "style_A_material", "vid1", self.csv, date="2026-11-20"
         )
-        self.assertEqual(df.loc[0, "date"], "2026-11-20")
+        self.assertEqual(rows[0]["date"], "2026-11-20")
 
 
 SCRIPT = {
