@@ -41,6 +41,7 @@ from analytics_updater import (
 from metadata_writer import JST, ensure_shop_cta, write_metadata_files
 from video_processor import (
     DEFAULT_ARTWORK_OFFSET,
+    PACE_MODE_REALTIME_CUTS,
     ZOOM_OUTRO_SECONDS,
     assemble_finale,
     build_vertical_timelapse,
@@ -49,15 +50,19 @@ from video_processor import (
     compute_project_plan,
     concat_segments,
     ensure_disk_space,
+    extract_active_segments,
     extract_final_artwork,
     extract_keyframes,
     has_audio_stream,
+    normalize_pace_mode,
     prepare_scanned_artwork,
     probe_audio_seconds,
     probe_duration,
     render_project_segment,
+    render_realtime_cuts,
     render_still_segment,
     run_command,
+    select_realtime_cuts,
 )
 from youtube_uploader import get_latest_upload_time, upload_short
 
@@ -101,6 +106,30 @@ def load_config(path: str = CONFIG_PATH) -> dict:
 def should_keep_audio(style_key: str) -> bool:
     """The ASMR style keeps the real pastel-on-paper sound of the drawing."""
     return style_key == ASMR_STYLE_KEY
+
+
+def resolve_pace_mode(config: Optional[dict] = None, params: Optional[dict] = None) -> str:
+    """Which body pace this render uses: config.yaml's ``video.pace_mode``.
+
+    ``"timelapse"`` (the default) speeds the whole recording up to fit the
+    body; ``"realtime_cuts"`` cuts motion-active moments at natural speed
+    instead. A ``params`` value wins when present, so one render can override
+    the config; anything missing or unknown falls back to ``"timelapse"``.
+    """
+    video = dict((config or {}).get("video") or {})
+    raw = (params or {}).get("pace_mode") if params else None
+    if raw is None or str(raw).strip() == "":
+        raw = video.get("pace_mode")
+    return normalize_pace_mode(raw)
+
+
+def _motion_threshold(config: Optional[dict] = None) -> float:
+    """The motion score above which a frame counts as active drawing."""
+    try:
+        value = float((dict((config or {}).get("video") or {})).get("motion_threshold", 1.8))
+    except (TypeError, ValueError):
+        return 1.8
+    return value if value > 0 else 1.8
 
 
 def _escaped_filter_path(path: str) -> str:
@@ -448,6 +477,7 @@ def append_performance_row(
         "likes": 0,
         "comments_count": 0,
         "language_mode": str(params.get("language_mode") or ""),
+        "pace_mode": normalize_pace_mode(params.get("pace_mode")),
         "tts_mode": str(params.get("tts_mode") or ""),
         "duration_sec": round(float(duration_sec or 0.0), 3),
         "target_duration_sec": params.get("target_duration_sec", ""),
@@ -600,7 +630,8 @@ def _script_for(
     """
     try:
         return generate_making_script(
-            frames, style_key, config, reference_scan=reference_scan, params=params
+            frames, style_key, config, reference_scan=reference_scan, params=params,
+            motif=motif,
         )
     except Exception as exc:  # noqa: BLE001 - the Short must still be made
         print(
@@ -797,6 +828,12 @@ def process_video_bundle(
     """
     config = config or load_config()
     params = improvement.active_params(config)
+    # pace_mode is a PDCA parameter (improvement.py reads it from
+    # config.yaml's video.pace_mode, and the reflection may switch it, held
+    # for 2 Shorts); it is resolved here and carried on params so the
+    # performance row records which pace the Short used.
+    pace_mode = resolve_pace_mode(config, params)
+    params["pace_mode"] = pace_mode
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(os.path.dirname(CSV_PATH), exist_ok=True)
 
@@ -835,6 +872,8 @@ def process_video_bundle(
         flash_image=artwork_path,
         flash_seconds=float(params["hook_flash_seconds"]),
         volume_db=float(params["hook_audio_boost_db"]),
+        pace_mode=pace_mode,
+        motion_threshold=_motion_threshold(config),
     )
 
     return dict(
@@ -885,6 +924,13 @@ def process_project_bundle(
     clips = list(source.videos)
     style_key = choose_best_style(CSV_PATH, config)
     params = improvement.active_params(config)
+    # pace_mode is a PDCA parameter (improvement.py reads it from
+    # config.yaml's video.pace_mode, and the reflection may switch it, held
+    # for 2 Shorts); it is resolved here and carried on params so the
+    # performance row records which pace the Short used.
+    pace_mode = resolve_pace_mode(config, params)
+    params["pace_mode"] = pace_mode
+    motion_threshold = _motion_threshold(config)
     drawing_volume = float(params.get("drawing_audio_volume") or 0.0)
     keep_audio = should_keep_audio(style_key) or drawing_volume > 0
     target_total = float(params["target_duration_sec"])
@@ -909,13 +955,14 @@ def process_project_bundle(
         hook_duration=float(hook["total"]),
         tempo=float(params["tempo"]),
     )
+    plan["pace_mode"] = pace_mode
 
     print(
         f"[1/6] Editing project {source.name}: {len(clips)} clip(s), "
         f"{plan['total_duration']:.0f}s -> {plan['main_duration']:.0f}s "
         f"+ {hook['flash']:.1f}s flash + {hook['tail']:.1f}s hook "
         f"+ {finish_window['screen_seconds']:.1f}s finish + zoom "
-        f"(style={style_key}; {improvement.describe_params(params)})"
+        f"(style={style_key}; pace={pace_mode}; {improvement.describe_params(params)})"
     )
 
     # The scan comes first (it is small): if it is there the artwork is settled
@@ -1001,15 +1048,43 @@ def process_project_bundle(
                 finish_paths.append(finish_path)
 
             segment_path = f"{vertical_stem}_seg{index:02d}.mp4"
-            render_project_segment(
-                local, segment_path,
-                pts_multiplier=plan["pts_multiplier"],
-                keep_audio=keep_audio,
-                has_audio=audio,
-                runner=runner,
-                # The planned length bounds a silent bed for a clip with no sound.
-                duration=plan["segment_durations"][index],
-            )
+            if pace_mode == PACE_MODE_REALTIME_CUTS:
+                # The narration is written only after the body exists, so the
+                # cuts cannot be lined up with its phrases yet: they use the
+                # default phrase-sized length (see select_realtime_cuts), one
+                # cut per narration phrase once phrase timings are available.
+                selection = select_realtime_cuts(
+                    extract_active_segments(local, motion_threshold=motion_threshold),
+                    plan["durations"][index],
+                    plan["segment_durations"][index],
+                )
+                if selection["cuts"]:
+                    render_realtime_cuts(
+                        local, segment_path, selection["cuts"],
+                        keep_audio=keep_audio, has_audio=audio, runner=runner,
+                    )
+                else:
+                    # No motion-active moment in this clip: time-lapse it
+                    # as before, so a quiet clip still produces a Short.
+                    render_project_segment(
+                        local, segment_path,
+                        pts_multiplier=plan["pts_multiplier"],
+                        keep_audio=keep_audio,
+                        has_audio=audio,
+                        runner=runner,
+                        # The planned length bounds a silent bed for a clip with no sound.
+                        duration=plan["segment_durations"][index],
+                    )
+            else:
+                render_project_segment(
+                    local, segment_path,
+                    pts_multiplier=plan["pts_multiplier"],
+                    keep_audio=keep_audio,
+                    has_audio=audio,
+                    runner=runner,
+                    # The planned length bounds a silent bed for a clip with no sound.
+                    duration=plan["segment_durations"][index],
+                )
             body_paths.append(segment_path)
         finally:
             if not keep_local_raw and os.path.exists(local):

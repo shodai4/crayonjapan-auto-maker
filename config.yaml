@@ -4,6 +4,11 @@ brand:
   material_name: "Sakura Cray-Pas Specialist"
   material_desc: "Japanese professional oil pastels"
   theme: "Happy everyday moments"
+  # English names for Japanese motifs, so the voice and the metadata can name
+  # them (ポッキー -> Pocky, not plain romaji). Kana without an entry here is
+  # romanised; kanji without one falls back to generic English lines.
+  motif_names:
+    ポッキー: "Pocky"
   # Facts taken from the artist's own channel (https://www.youtube.com/@shodai_ART,
   # 2026-11-21): they are the voice's background, not lines to advertise with.
   # The solo exhibition has already finished, so it is only ever past tense.
@@ -13,6 +18,7 @@ brand:
     - "He picks small, ordinary things from everyday Japanese life - a snack, a waffle, a Pokémon card found on the ground - and gives them warm, bright colour."
     - "What he likes most is the feel of the pigment on paper: colours you can layer, and the momentum of a single confident line."
     - "Past work: a 100-day drawing project that ended with a solo exhibition at Atelier Sangatsu in Nakazaki-cho, Osaka. The exhibition is over now, so it may only ever be mentioned in the past."
+    - "Each Short carries exactly one true detail from my own life - why I picked this motif, or one memory attached to it. I keep adding these stories here as I remember them."
 
 video:
   target_duration_sec: 28
@@ -21,6 +27,11 @@ video:
   width: 1080
   height: 1920
   motion_threshold: 1.8
+  # Body pace: "timelapse" speeds the whole recording up to fit the Short
+  # (today's behaviour); "realtime_cuts" cuts motion-active moments at
+  # natural speed instead. The PDCA reflection may switch it, held for
+  # 2 Shorts per mode so the comparison means anything (see improvement.py).
+  pace_mode: "timelapse"
 
 # The PDCA loop (see improvement.py). `defaults` is where a run starts: the
 # reflection may move any of these inside its allowed range, and falls back here
@@ -56,7 +67,9 @@ improvement:
     # the paper-and-pastel sound is the strongest reason to stay
     hook_audio_boost_db: 6
     finish_hold_seconds: 2.5
-    drawing_audio_volume: 0.35
+    # The drawing sound is the content, so it sits clearly audible under the
+    # voice (1.0); ASMR keeps its louder bed (0.55 floor in main.py).
+    drawing_audio_volume: 0.5
     # the voice fills ~62% of the Short; the rest is drawing sound
     narration_ratio: 0.62
     tempo: 1.0
@@ -65,21 +78,21 @@ improvement:
     tts_mode: "short"
     cta_text: "Follow for more oil pastel art!"
     cta_text_ja: "フォローしてね！"
-    cta_question_en: "What should I draw next?"
-    cta_question_ja: "次は何を描いてほしい？"
+    cta_question_en: "Sweet or salty — what should I draw next?"
+    cta_question_ja: "甘いものと塩っぱいもの、次はどっちを描こう？"
 
 evolution:
   exploration_rate: 0.25
   styles:
     style_A_material:
       weight: 0.34
-      description: "Focus on Sakura Cray-Pas Specialist texture, rich pigment, and color layering techniques."
+      description: "Focus on Sakura Cray-Pas Specialist texture, rich pigment, and color layering techniques. One motif only; name it in the first line and hold the reveal until the end."
     style_B_story:
       weight: 0.33
-      description: "Warm storytelling about happy everyday moments and why this daily motif was chosen."
+      description: "Warm storytelling about happy everyday moments and why this daily motif was chosen: one concrete personal detail - a memory, a place, a person - told once, in specific words."
     style_C_asmr:
       weight: 0.33
-      description: "Minimal narration, letting the satisfying oil pastel strokes and rhythm lead the video."
+      description: "Minimal narration, letting the satisfying oil pastel strokes and rhythm lead the video. One motif only; name it in the first line."
 
 youtube:
   default_privacy: "public"

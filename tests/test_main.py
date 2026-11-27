@@ -1192,3 +1192,142 @@ class LearningLoopTests(unittest.TestCase):
                 params=improvement.validate_params(), review={}, csv_path=self.csv,
             )
         backup.assert_not_called()
+
+
+class PaceModeTests(unittest.TestCase):
+    """Pace mode plumbing: config -> render -> performance.csv row."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.csv = os.path.join(self.tmp.name, "analytics", "performance.csv")
+        self.config = main.load_config(os.path.join(ROOT, "config.yaml"))
+        self.out = os.path.join(self.tmp.name, "output")
+        improvement.clear_active_params()
+
+    def tearDown(self):
+        improvement.clear_active_params()
+
+    def test_config_without_a_pace_mode_renders_the_timelapse(self):
+        self.assertEqual(main.resolve_pace_mode(self.config), "timelapse")
+        self.assertEqual(main.resolve_pace_mode({}), "timelapse")
+        self.assertEqual(main.resolve_pace_mode(None), "timelapse")
+
+    def test_realtime_cuts_is_read_from_the_video_section(self):
+        config = dict(self.config)
+        config["video"] = dict(self.config["video"], pace_mode="realtime_cuts")
+        self.assertEqual(main.resolve_pace_mode(config), "realtime_cuts")
+
+    def test_an_unknown_pace_mode_falls_back_to_timelapse(self):
+        config = dict(self.config)
+        config["video"] = dict(self.config["video"], pace_mode="fast")
+        self.assertEqual(main.resolve_pace_mode(config), "timelapse")
+
+    def test_a_params_value_overrides_the_config(self):
+        config = dict(self.config)
+        config["video"] = dict(self.config["video"], pace_mode="timelapse")
+        self.assertEqual(
+            main.resolve_pace_mode(config, {"pace_mode": "realtime_cuts"}),
+            "realtime_cuts",
+        )
+
+    def test_the_performance_row_carries_the_pace_mode(self):
+        script = {"title": "Oil pastel postcard #Shorts", "description": "d"}
+        rows = main.append_performance_row(
+            script, "style_B_story", "vid1", self.csv,
+            params={"language_mode": "en", "pace_mode": "realtime_cuts"},
+        )
+        self.assertEqual(rows[0]["pace_mode"], "realtime_cuts")
+        with open(self.csv, "r", encoding="utf-8", newline="") as handle:
+            self.assertIn("pace_mode", list(csv.DictReader(handle).fieldnames or []))
+
+    def test_the_performance_row_defaults_to_timelapse(self):
+        script = {"title": "Oil pastel postcard #Shorts", "description": "d"}
+        rows = main.append_performance_row(
+            script, "style_B_story", "vid1", self.csv,
+            params={"language_mode": "en"},
+        )
+        self.assertEqual(rows[0]["pace_mode"], "timelapse")
+
+    def test_the_single_clip_flow_passes_the_pace_to_the_render(self):
+        case = ProcessVideoBundleTests(
+            "test_bundle_returns_every_artifact_path"
+        )
+        case.setUp()
+        try:
+            case.config["video"]["pace_mode"] = "realtime_cuts"
+            bundle, timelapse, _, _, _, _ = case._run()
+        finally:
+            case.tmp.cleanup()
+        self.assertEqual(timelapse.call_args.kwargs["pace_mode"], "realtime_cuts")
+        self.assertEqual(bundle["params"]["pace_mode"], "realtime_cuts")
+
+    def test_the_single_clip_flow_defaults_to_timelapse(self):
+        case = ProcessVideoBundleTests(
+            "test_bundle_returns_every_artifact_path"
+        )
+        case.setUp()
+        try:
+            bundle, timelapse, _, _, _, _ = case._run()
+        finally:
+            case.tmp.cleanup()
+        self.assertEqual(timelapse.call_args.kwargs["pace_mode"], "timelapse")
+        self.assertEqual(bundle["params"]["pace_mode"], "timelapse")
+
+    def _project_case(self, pace_mode):
+        case = ProcessProjectBundleTests(
+            "test_output_names_come_from_the_folder_without_the_go_prefix"
+        )
+        case.setUp()
+        if pace_mode is not None:
+            case.config["video"]["pace_mode"] = pace_mode
+        return case
+
+    def _stamps(self, path, motion_threshold=1.8):
+        if "part1" in path:
+            bases = (10, 40, 70, 100)
+        else:
+            bases = (10, 60, 110, 160, 210)
+        return [
+            round(base + step * 0.1, 3)
+            for base in bases for step in range(5)
+        ]
+
+    def test_the_project_flow_cuts_each_clip_at_natural_speed(self):
+        case = self._project_case("realtime_cuts")
+        try:
+            with mock.patch.object(
+                main, "extract_active_segments", side_effect=self._stamps
+            ) as detected, mock.patch.object(
+                main, "render_realtime_cuts"
+            ) as realtime:
+                bundle, _ = case._run(case._source())
+        finally:
+            case.tmp.cleanup()
+        self.assertEqual(bundle["plan"]["pace_mode"], "realtime_cuts")
+        self.assertEqual(detected.call_count, 2)
+        self.assertEqual(realtime.call_count, 2)
+        for call, target in zip(
+            realtime.call_args_list, bundle["plan"]["segment_durations"]
+        ):
+            cuts = call.args[2]
+            self.assertAlmostEqual(
+                sum(cut["length"] for cut in cuts), target, places=2
+            )
+        # One body segment per clip reaches the concat, as in the timelapse.
+        segments = [name for name in case.concat_order if "_seg" in name]
+        self.assertEqual(len(segments), 2)
+        self.assertIn("seg00", segments[0])
+        self.assertIn("seg01", segments[1])
+
+    def test_the_project_flow_defaults_to_the_timelapse(self):
+        case = self._project_case(None)
+        try:
+            with mock.patch.object(main, "extract_active_segments") as detected, \
+                    mock.patch.object(main, "render_realtime_cuts") as realtime:
+                bundle, _ = case._run(case._source())
+        finally:
+            case.tmp.cleanup()
+        self.assertEqual(bundle["plan"]["pace_mode"], "timelapse")
+        detected.assert_not_called()
+        realtime.assert_not_called()

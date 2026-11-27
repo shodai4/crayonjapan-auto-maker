@@ -457,3 +457,52 @@ class RefreshSelectionTests(unittest.TestCase):
         for column in ("avg_view_duration_sec", "language_mode", "tts_mode",
                        "duration_sec", "target_duration_sec", "params_json", "updated_at"):
             self.assertIn(column, rows[0])
+
+
+class PaceColumnTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.csv = os.path.join(self.tmp.name, "performance.csv")
+
+    def _rows(self):
+        return [
+            {
+                "video_id": "v1", "date": "2026-11-01", "title": "A",
+                "style_used": "style_B_story", "hook_type": "finish_preview_2.5s",
+                "views": 0, "avg_view_percentage": 55.0, "likes": 0,
+                "comments_count": 0, "language_mode": "en",
+                "pace_mode": "realtime_cuts", "top_feedback": "",
+            },
+        ]
+
+    def test_pace_mode_is_a_recorded_text_column(self):
+        self.assertIn("pace_mode", au.CSV_COLUMNS)
+        self.assertIn("pace_mode", au.TEXT_COLUMNS)
+        self.assertEqual(
+            au.CSV_COLUMNS.index("pace_mode"),
+            au.CSV_COLUMNS.index("language_mode") + 1,
+        )
+
+    def test_an_old_row_without_the_column_reads_back_empty(self):
+        rows = au._ensure_columns([{"video_id": "v1", "language_mode": "en"}])
+        self.assertEqual(rows[0]["pace_mode"], "")
+
+    def test_pace_mode_survives_a_write_and_read_round_trip(self):
+        au.write_performance_csv(self.csv, self._rows())
+        with open(self.csv, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            self.assertIn("pace_mode", reader.fieldnames or [])
+            saved = list(reader)
+        self.assertEqual(saved[0]["pace_mode"], "realtime_cuts")
+        self.assertEqual(au.read_performance_csv(self.csv)[0]["pace_mode"], "realtime_cuts")
+
+    def test_a_metrics_refresh_keeps_the_pace_mode(self):
+        au.write_performance_csv(self.csv, self._rows())
+        rows = au.update_performance_metrics(
+            self.csv,
+            youtube=FakeYouTube({"v1": {"viewCount": "10", "likeCount": "1", "commentCount": "0"}}),
+            analytics=None, with_analytics=False, today=TODAY,
+        )
+        self.assertEqual(rows[0]["pace_mode"], "realtime_cuts")
+        self.assertEqual(au.read_performance_csv(self.csv)[0]["pace_mode"], "realtime_cuts")

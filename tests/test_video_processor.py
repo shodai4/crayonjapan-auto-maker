@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 import video_processor as vp
+import telop
 
 
 class AtempoTests(unittest.TestCase):
@@ -692,3 +693,204 @@ class TempoTests(unittest.TestCase):
         long = vp.compute_finish_window(60.0, hold_seconds=4.0)
         self.assertLess(short["screen_seconds"], long["screen_seconds"])
         self.assertAlmostEqual(short["source_seconds"], 2.0)
+
+
+def _active(*spans):
+    """Active-frame timestamps for moments given as (start, seconds) spans."""
+    stamps = []
+    for start, seconds in spans:
+        steps = max(int(seconds * 10), 1)
+        for step in range(steps + 1):
+            stamps.append(round(start + step * 0.1, 3))
+    return stamps
+
+class PaceModeTests(unittest.TestCase):
+    def test_missing_blank_or_unknown_falls_back_to_timelapse(self):
+        for bad in (None, "", "  ", "fast", "slow-motion", 42):
+            self.assertEqual(vp.normalize_pace_mode(bad), "timelapse")
+
+    def test_both_modes_are_accepted(self):
+        self.assertEqual(vp.normalize_pace_mode("timelapse"), "timelapse")
+        self.assertEqual(vp.normalize_pace_mode("realtime_cuts"), "realtime_cuts")
+        self.assertEqual(vp.normalize_pace_mode(" Realtime_Cuts "), "realtime_cuts")
+
+
+class GroupActiveMomentsTests(unittest.TestCase):
+    def test_close_frames_merge_and_distant_ones_split(self):
+        moments = vp.group_active_moments([0.0, 0.1, 0.2, 5.0, 5.1, 12.0])
+        self.assertEqual(moments, [(0.0, 0.2), (5.0, 5.1), (12.0, 12.0)])
+
+    def test_timestamps_are_sorted_and_invalid_ones_dropped(self):
+        moments = vp.group_active_moments([5.0, 0.0, None, "nope", -1.0, 0.1])
+        self.assertEqual(moments, [(0.0, 0.1), (5.0, 5.0)])
+
+
+class PhraseDurationTests(unittest.TestCase):
+    def _words(self, scripted):
+        entries = [
+            {
+                "type": "WordBoundary",
+                "offset": int(start * 10_000_000),
+                "duration": int(duration * 10_000_000),
+                "text": text,
+            }
+            for text, start, duration in scripted
+        ]
+        return telop.word_timings_from_boundaries(entries)
+
+    def test_phrases_end_on_sentences_not_on_words(self):
+        words = self._words([
+            ("Watch", 0.0, 0.4), ("the", 0.4, 0.2), ("blue", 0.6, 0.4),
+            ("grow.", 1.0, 0.5), ("Now", 1.6, 0.3), ("the", 1.9, 0.2),
+            ("pink", 2.1, 0.4), ("goes", 2.5, 0.3), ("on.", 2.8, 0.4),
+        ])
+        phrases = vp.phrase_durations_from_words(
+            words, narration="Watch the blue grow. Now the pink goes on."
+        )
+        self.assertEqual(len(phrases), 2)
+        self.assertAlmostEqual(phrases[0], 1.5, places=1)
+        self.assertAlmostEqual(phrases[1], 1.6, places=1)
+
+    def test_a_trailing_phrase_without_a_full_stop_is_kept(self):
+        words = self._words([("One", 0.0, 0.4), ("line", 0.4, 0.4)])
+        self.assertEqual(len(vp.phrase_durations_from_words(words)), 1)
+
+
+class AlignCutsToPhrasesTests(unittest.TestCase):
+    def test_one_cut_per_phrase_cycling_when_phrases_run_out(self):
+        lengths = vp.align_cuts_to_phrases([2.0, 4.0], 10.0)
+        self.assertEqual(lengths, [2.0, 4.0, 2.0, 2.0])
+        self.assertAlmostEqual(sum(lengths), 10.0)
+
+    def test_no_phrases_falls_back_to_the_default_cut_length(self):
+        lengths = vp.align_cuts_to_phrases([], 10.0)
+        self.assertEqual(lengths, [3.5, 3.5, 3.0])
+
+    def test_a_long_phrase_is_clamped_to_the_longest_readable_cut(self):
+        self.assertEqual(vp.align_cuts_to_phrases([9.0], 6.0), [6.0])
+
+
+class SelectRealtimeCutsTests(unittest.TestCase):
+    def test_cuts_are_spread_across_the_recording_and_fill_the_body(self):
+        active = _active(
+            (10, 3), (100, 3), (200, 3), (300, 3), (400, 3), (500, 3), (600, 3),
+        )
+        selection = vp.select_realtime_cuts(active, 660.0, 21.0)
+        self.assertEqual(len(selection["cuts"]), 6)
+        self.assertAlmostEqual(selection["total_seconds"], 21.0)
+        self.assertEqual(selection["fallback"], "none")
+        starts = [cut["start"] for cut in selection["cuts"]]
+        self.assertEqual(starts, sorted(starts))
+        self.assertLess(starts[0], 150.0)
+        self.assertGreater(starts[-1], 450.0)
+        for cut in selection["cuts"]:
+            self.assertLessEqual(cut["moment_start"], cut["start"])
+            self.assertLessEqual(cut["start"], cut["moment_end"] + 3.5)
+
+    def test_the_longest_moment_wins_over_a_brief_one(self):
+        active = _active((10, 0.3), (300, 10))
+        selection = vp.select_realtime_cuts(active, 660.0, 3.5)
+        self.assertEqual(len(selection["cuts"]), 1)
+        self.assertAlmostEqual(selection["cuts"][0]["moment_start"], 300.0)
+
+    def test_cuts_follow_narration_phrase_lengths_when_given(self):
+        active = _active((10, 3), (100, 3), (200, 3))
+        selection = vp.select_realtime_cuts(
+            active, 300.0, 7.0, phrase_durations=[2.0, 5.0]
+        )
+        self.assertEqual(
+            [cut["length"] for cut in selection["cuts"]], [2.0, 5.0]
+        )
+
+    def test_too_few_moments_reuses_the_longest_ones(self):
+        active = _active((10, 1))
+        selection = vp.select_realtime_cuts(active, 120.0, 10.5)
+        self.assertEqual(len(selection["cuts"]), 3)
+        self.assertAlmostEqual(selection["total_seconds"], 10.5)
+        self.assertEqual(selection["fallback"], "reuse")
+        self.assertTrue(any(cut["reused"] for cut in selection["cuts"]))
+
+    def test_no_active_moment_falls_back_to_the_timelapse(self):
+        selection = vp.select_realtime_cuts([], 120.0, 10.5)
+        self.assertEqual(selection["cuts"], [])
+        self.assertEqual(selection["fallback"], "timelapse")
+        self.assertAlmostEqual(selection["fallback_seconds"], 10.5)
+
+
+class RealtimeCutsPlanTests(unittest.TestCase):
+    def test_the_plan_keeps_the_hook_and_target_and_fills_the_body(self):
+        active = _active((10, 5), (100, 5), (200, 5), (300, 5))
+        plan = vp.compute_realtime_cuts_plan(active, 380.0, target_duration=28.0, hook_duration=2.4)
+        self.assertEqual(plan["pace_mode"], "realtime_cuts")
+        self.assertAlmostEqual(plan["hook_duration"], 2.4)
+        self.assertAlmostEqual(plan["main_duration"], 25.6)
+        self.assertAlmostEqual(
+            sum(cut["length"] for cut in plan["cuts"]), plan["main_duration"]
+        )
+
+
+class BuildVerticalTimelapsePaceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "clip_vertical.mp4")
+        self.commands = []
+
+    def _runner(self, cmd):
+        self.commands.append(list(cmd))
+        target = cmd[-1]
+        if isinstance(target, str) and target.endswith(".mp4"):
+            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(b"video")
+
+    def _active(self):
+        return _active((10, 5), (100, 5), (200, 5), (300, 5))
+
+    def _run(self, **kwargs):
+        kwargs.setdefault("pace_mode", "realtime_cuts")
+        kwargs.setdefault("active_timestamps", self._active())
+        with mock.patch.object(vp, "probe_duration", return_value=380.0), \
+                mock.patch.object(vp, "has_audio_stream", return_value=False):
+            return vp.build_vertical_timelapse(
+                "input/clip.mp4", self.out,
+                target_duration=38.0, hook_duration=2.5,
+                keep_audio=False, runner=self._runner, **kwargs,
+            )
+
+    def _video_filters(self):
+        filters = []
+        for cmd in self.commands:
+            if "-vf" in cmd:
+                filters.append(cmd[cmd.index("-vf") + 1])
+        return filters
+
+    def test_default_mode_is_still_the_timelapse(self):
+        with mock.patch.object(vp, "probe_duration", return_value=380.0), \
+                mock.patch.object(vp, "has_audio_stream", return_value=False):
+            result = vp.build_vertical_timelapse(
+                "input/clip.mp4", self.out,
+                target_duration=38.0, hook_duration=2.5,
+                keep_audio=False, runner=self._runner,
+            )
+        self.assertEqual(result, self.out)
+        self.assertTrue(any("setpts=" in vf for vf in self._video_filters()))
+
+    def test_realtime_body_is_cut_at_natural_speed(self):
+        result = self._run()
+        self.assertEqual(result, self.out)
+        self.assertFalse(any("setpts=" in vf for vf in self._video_filters()))
+        self.assertTrue(any("-ss" in cmd for cmd in self.commands))
+        self.assertTrue(any("_cut" in " ".join(cmd) for cmd in self.commands))
+
+    def test_realtime_body_with_no_active_moment_falls_back_to_timelapse(self):
+        self._run(active_timestamps=[])
+        self.assertTrue(any("setpts=" in vf for vf in self._video_filters()))
+
+    def test_realtime_body_keeps_the_flash_hook(self):
+        flash = os.path.join(self.tmp.name, "artwork.jpg")
+        with open(flash, "wb") as handle:
+            handle.write(b"jpeg")
+        self._run(hook_style="finish_flash_to_blank", flash_image=flash)
+        self.assertFalse(any("setpts=" in vf for vf in self._video_filters()))
+        self.assertTrue(any("_cut" in " ".join(cmd) for cmd in self.commands))

@@ -13,6 +13,14 @@ Two input shapes are supported:
   rendered straight into its own short 9:16 segment (``render_project_segment``)
   and only the tiny segments are concatenated, so an hour-long 6 GB recording
   never becomes a second multi-GB intermediate file on the runner's disk.
+
+Body pace (``video.pace_mode`` in config.yaml, default ``"timelapse"``):
+
+* ``timelapse`` - the whole recording is sped up to fit the body, as above;
+* ``realtime_cuts`` - motion-active moments (see ``extract_active_segments``)
+  are cut at natural speed and joined to fill the body instead. One cut is
+  about one narration phrase long, so the drawing moves with the voice; the
+  hook, the 28 s target and the posting flow are the same either way.
 """
 
 from __future__ import annotations
@@ -32,6 +40,20 @@ MAX_ATEMPO_FILTERS = 64
 CROP_FILTER = "crop=ih*9/16:ih,scale=1080:1920,setsar=1"
 HOOK_TAIL_SECONDS = 4.0
 MIN_MAIN_DURATION = 10.0
+
+# Body pace, chosen in config.yaml under ``video.pace_mode``.
+PACE_MODE_TIMELAPSE = "timelapse"
+PACE_MODE_REALTIME_CUTS = "realtime_cuts"
+PACE_MODES = (PACE_MODE_TIMELAPSE, PACE_MODE_REALTIME_CUTS)
+# A realtime cut is about one narration phrase long: long enough to see a
+# stroke land, short enough that the drawing keeps moving with the voice.
+REALTIME_CUT_SECONDS = 3.5
+REALTIME_CUT_MIN_SECONDS = 2.0
+REALTIME_CUT_MAX_SECONDS = 6.0
+# Active frames closer than this belong to the same visible moment.
+REALTIME_ACTIVE_GAP_SECONDS = 1.0
+# The shortest tail cut that still reads as a cut rather than a glitch.
+REALTIME_MIN_TAIL_SECONDS = 0.5
 
 # The opening of the Short, chosen per run (see improvement.py).
 #   finish_flash_to_blank - a flash of the finished artwork, then the last
@@ -356,6 +378,278 @@ def compute_timelapse_plan(
         # speed actually applied to the video (1 / pts_multiplier), not
         # speed_factor, or sound and picture drift apart.
         "audio_speed_factor": 1.0 / pts_multiplier if pts_multiplier > 0 else 1.0,
+    }
+
+
+def normalize_pace_mode(value: object) -> str:
+    """The body pace to render: ``"timelapse"`` unless asked otherwise.
+
+    Anything missing, blank or unknown falls back to ``"timelapse"``, so an
+    old config.yaml or a typo never changes what is rendered.
+    """
+    cleaned = str(value or "").strip().lower()
+    return cleaned if cleaned in PACE_MODES else PACE_MODE_TIMELAPSE
+
+
+def group_active_moments(
+    active_timestamps: Sequence[float],
+    gap_seconds: float = REALTIME_ACTIVE_GAP_SECONDS,
+) -> List[tuple]:
+    """Merge active-frame timestamps into (start, end) moments of movement.
+
+    Frames closer than ``gap_seconds`` belong to the same moment; a lone frame
+    is a moment of zero length, still usable as a cut start. Moments are in
+    recording order, so the longest ones are the moments where the drawing
+    visibly progressed the most.
+    """
+    try:
+        gap = max(float(gap_seconds), 0.0)
+    except (TypeError, ValueError):
+        gap = REALTIME_ACTIVE_GAP_SECONDS
+    stamps: List[float] = []
+    for stamp in active_timestamps or []:
+        try:
+            number = float(stamp)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(number) and number >= 0:
+            stamps.append(number)
+    stamps.sort()
+    moments: List[tuple] = []
+    for stamp in stamps:
+        if moments and stamp - moments[-1][1] <= gap:
+            moments[-1] = (moments[-1][0], stamp)
+        else:
+            moments.append((stamp, stamp))
+    return moments
+
+
+def phrase_durations_from_words(
+    words: Sequence[dict],
+    narration: str = "",
+) -> List[float]:
+    """One duration per narration phrase, from edge-tts word timings.
+
+    The words are grouped the way the telop closes its cards: a phrase ends
+    where a word ends a sentence, never on a single word, so the drawing cuts
+    land on the same beats the voice does. ``narration`` (when given) puts the
+    punctuation back onto the timings first, via telop's own helper.
+    """
+    import telop
+
+    timed = list(words or [])
+    if narration:
+        timed = telop.attach_punctuation(timed, narration)
+    ends_sentence = getattr(telop, "_ends_sentence", None)
+    if not callable(ends_sentence):
+        def ends_sentence(text: str) -> bool:
+            return bool(text) and text[-1] in ".!?\u2026"
+
+    phrases: List[float] = []
+    start: Optional[float] = None
+    end: Optional[float] = None
+    for word in timed:
+        try:
+            word_start = float(word["start"])
+            word_end = float(word["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(word_start) and math.isfinite(word_end)):
+            continue
+        if start is None:
+            start = word_start
+        end = word_end
+        if ends_sentence(str(word.get("text") or "")):
+            phrases.append(max(end - start, 0.05))
+            start = None
+            end = None
+    if start is not None and end is not None:
+        phrases.append(max(end - start, 0.05))
+    return phrases
+
+
+def align_cuts_to_phrases(
+    phrase_durations: Sequence[float],
+    target_seconds: float,
+    default_seconds: float = REALTIME_CUT_SECONDS,
+) -> List[float]:
+    """Cut lengths that fill ``target_seconds``, one cut per narration phrase.
+
+    The phrases are taken in order and cycled when there are fewer phrases
+    than cuts, each clamped to a length that still reads as a cut
+    (``REALTIME_CUT_MIN_SECONDS`` - ``REALTIME_CUT_MAX_SECONDS``). With no
+    phrases at all the cuts fall back to the default phrase-sized length.
+    The last cut is trimmed so the lengths add up to ``target_seconds``.
+    """
+    try:
+        target = max(float(target_seconds), 0.0)
+    except (TypeError, ValueError):
+        target = 0.0
+    phrases: List[float] = []
+    for value in phrase_durations or []:
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(seconds) and seconds > 0:
+            phrases.append(
+                min(max(seconds, REALTIME_CUT_MIN_SECONDS), REALTIME_CUT_MAX_SECONDS)
+            )
+    if not phrases:
+        try:
+            default = float(default_seconds)
+        except (TypeError, ValueError):
+            default = REALTIME_CUT_SECONDS
+        if not math.isfinite(default) or default <= 0:
+            default = REALTIME_CUT_SECONDS
+        phrases = [min(max(default, REALTIME_CUT_MIN_SECONDS), REALTIME_CUT_MAX_SECONDS)]
+
+    lengths: List[float] = []
+    total = 0.0
+    index = 0
+    while total < target:
+        length = phrases[index % len(phrases)]
+        lengths.append(length)
+        total += length
+        index += 1
+    if lengths:
+        overflow = total - target
+        if overflow > 0:
+            lengths[-1] -= overflow
+            if lengths[-1] < REALTIME_MIN_TAIL_SECONDS and len(lengths) > 1:
+                lengths[-2] += lengths[-1]
+                lengths.pop()
+    return lengths
+
+
+def select_realtime_cuts(
+    active_timestamps: Sequence[float],
+    total_duration: float,
+    main_duration: float,
+    phrase_durations: Optional[Sequence[float]] = None,
+    cut_seconds: float = REALTIME_CUT_SECONDS,
+    gap_seconds: float = REALTIME_ACTIVE_GAP_SECONDS,
+) -> Dict[str, object]:
+    """Pick the natural-speed cuts that fill the body of a Short.
+
+    The recording is split into one bin per cut and the longest active moment
+    in each bin is taken first, so the cuts are spread across the whole
+    drawing instead of bunching at the start, and longer moments (more visible
+    progress) win over brief ones. A bin with no unused moment takes the
+    longest moment still unused anywhere; once every moment has been used,
+    the longest moments are reused with a small offset, so the body still
+    fills.
+
+    Fallback, by design the simpler safe option: when the active moments are
+    too short to fill the body they are reused (``fallback == "reuse"``);
+    when there is no active moment at all no cuts are returned
+    (``fallback == "timelapse"``) and the caller renders the body as a
+    time-lapse instead, so a quiet recording still produces a Short.
+    """
+    total = max(float(total_duration or 0.0), 1.0)
+    main = max(float(main_duration or 0.0), 0.0)
+    moments = group_active_moments(active_timestamps, gap_seconds=gap_seconds)
+    active_seconds = sum(end - start for start, end in moments)
+    if not moments or main <= 0:
+        return {
+            "pace_mode": PACE_MODE_REALTIME_CUTS,
+            "cuts": [],
+            "total_seconds": 0.0,
+            "fallback": "timelapse" if main > 0 else "none",
+            "fallback_seconds": main,
+            "active_seconds": active_seconds,
+        }
+
+    lengths = align_cuts_to_phrases(
+        phrase_durations if phrase_durations is not None else [],
+        main,
+        default_seconds=cut_seconds,
+    )
+    # Longest moment first when choosing, so a cut prefers visible progress.
+    by_length = sorted(
+        range(len(moments)),
+        key=lambda i: (moments[i][1] - moments[i][0], moments[i][0]),
+        reverse=True,
+    )
+    used: set = set()
+    reuse_count: Dict[int, int] = {}
+    cuts: List[Dict[str, object]] = []
+    count = len(lengths)
+    for index, length in enumerate(lengths):
+        bin_start = index * total / count
+        bin_end = (index + 1) * total / count
+        pick = None
+        for candidate in by_length:
+            if candidate in used:
+                continue
+            start, end = moments[candidate]
+            if start < bin_end and end >= bin_start:
+                pick = candidate
+                break
+        if pick is None:
+            for candidate in by_length:
+                if candidate not in used:
+                    pick = candidate
+                    break
+        if pick is None:
+            pick = by_length[0]
+        reused = pick in used
+        used.add(pick)
+        start, end = moments[pick]
+        if reused:
+            reuse_count[pick] = reuse_count.get(pick, 0) + 1
+            shift = min(0.5 * reuse_count[pick], max((end - start) / 2.0, 0.0))
+            start = start + shift
+        start = min(max(start, 0.0), max(total - length, 0.0))
+        cuts.append({
+            "start": round(start, 3),
+            "length": round(float(length), 3),
+            "moment_start": round(moments[pick][0], 3),
+            "moment_end": round(moments[pick][1], 3),
+            "reused": reused,
+        })
+
+    return {
+        "pace_mode": PACE_MODE_REALTIME_CUTS,
+        "cuts": cuts,
+        "total_seconds": round(sum(cut["length"] for cut in cuts), 3),
+        "fallback": "reuse" if active_seconds < main else "none",
+        "fallback_seconds": round(max(main - active_seconds, 0.0), 3),
+        "active_seconds": round(active_seconds, 3),
+    }
+
+
+def compute_realtime_cuts_plan(
+    active_timestamps: Sequence[float],
+    total_duration: float,
+    target_duration: float = 38.0,
+    hook_duration: float = 2.5,
+    phrase_durations: Optional[Sequence[float]] = None,
+    cut_seconds: float = REALTIME_CUT_SECONDS,
+) -> Dict[str, object]:
+    """The realtime-cuts equivalent of :func:`compute_timelapse_plan`.
+
+    The hook and the body length come from the time-lapse plan (same target,
+    same hook), only the body is filled with natural-speed cuts instead of
+    one sped-up pass.
+    """
+    plan = compute_timelapse_plan(
+        total_duration, target_duration=target_duration, hook_duration=hook_duration
+    )
+    selection = select_realtime_cuts(
+        active_timestamps,
+        plan["orig_duration"],
+        plan["main_duration"],
+        phrase_durations=phrase_durations,
+        cut_seconds=cut_seconds,
+    )
+    return {
+        **plan,
+        "pace_mode": PACE_MODE_REALTIME_CUTS,
+        "cuts": selection["cuts"],
+        "fallback": selection["fallback"],
+        "fallback_seconds": selection["fallback_seconds"],
+        "active_seconds": selection["active_seconds"],
     }
 
 
@@ -862,6 +1156,68 @@ def render_project_segment(
     return output_path
 
 
+def _realtime_body_cuts(
+    input_path: str,
+    source_seconds: float,
+    main_duration: float,
+    active_timestamps: Optional[Sequence[float]],
+    motion_threshold: float,
+    phrase_durations: Optional[Sequence[float]],
+) -> Dict[str, object]:
+    """The realtime cuts for one body, detecting motion unless given stamps."""
+    stamps = (
+        active_timestamps
+        if active_timestamps is not None
+        else extract_active_segments(input_path, motion_threshold=motion_threshold)
+    )
+    return select_realtime_cuts(
+        stamps, source_seconds, main_duration, phrase_durations=phrase_durations
+    )
+
+
+def render_realtime_cuts(
+    input_path: str,
+    output_path: str,
+    cuts: Sequence[dict],
+    keep_audio: bool = False,
+    has_audio: bool = True,
+    runner: Runner = run_command,
+    volume_db: float = 0.0,
+) -> str:
+    """Render natural-speed cuts of one recording and join them into one body.
+
+    Every cut is an ordinary project segment at natural speed
+    (``pts_multiplier=None``), so it joins with the hook and finish pieces
+    exactly like the time-lapse body does. The per-cut files are removed
+    afterwards; only the joined body is kept.
+    """
+    if not cuts:
+        raise ValueError("realtime cuts need at least one cut")
+    stem = os.path.splitext(output_path)[0]
+    cut_paths: List[str] = []
+    try:
+        for index, cut in enumerate(cuts):
+            cut_path = f"{stem}_cut{index:02d}.mp4"
+            render_project_segment(
+                input_path, cut_path,
+                pts_multiplier=None,
+                keep_audio=keep_audio,
+                has_audio=has_audio,
+                runner=runner,
+                seek=float(cut["start"]),
+                length=float(cut["length"]),
+                duration=float(cut["length"]),
+                volume_db=volume_db,
+            )
+            cut_paths.append(cut_path)
+        concat_segments(cut_paths, output_path, runner=runner)
+    finally:
+        for path in cut_paths:
+            if os.path.exists(path):
+                os.remove(path)
+    return output_path
+
+
 def build_segments_concat_list_content(paths: Sequence[str]) -> str:
     return "".join(f"file '{os.path.abspath(path)}'\n" for path in paths)
 
@@ -1232,6 +1588,10 @@ def build_vertical_timelapse(
     flash_seconds: float = FLASH_SECONDS,
     volume_db: float = 0.0,
     body_volume_db: float = 0.0,
+    pace_mode: str = PACE_MODE_TIMELAPSE,
+    active_timestamps: Optional[Sequence[float]] = None,
+    motion_threshold: float = 1.8,
+    phrase_durations: Optional[Sequence[float]] = None,
 ) -> str:
     """Render the 9:16 time-lapse. Original audio is kept only on request.
 
@@ -1242,6 +1602,11 @@ def build_vertical_timelapse(
     the opening becomes a flash of the artwork followed by the tail of the
     drawing; those pieces are rendered on the shared segment canvas (the whole
     frame fitted, not cropped) so they join cleanly with any `-c copy` concat.
+
+    With `pace_mode="realtime_cuts"` the body is motion-active moments cut at
+    natural speed instead of one sped-up pass; the hook is unchanged. When no
+    active moment is found the body falls back to the time-lapse, so a quiet
+    recording still produces a Short.
     """
     hook = compute_hook_plan(hook_style, hook_duration, flash_seconds)
     if hook["style"] == HOOK_STYLE_FLASH and flash_image and os.path.exists(flash_image):
@@ -1253,6 +1618,10 @@ def build_vertical_timelapse(
             volume_db=volume_db,
             body_volume_db=body_volume_db,
             runner=runner,
+            pace_mode=pace_mode,
+            active_timestamps=active_timestamps,
+            motion_threshold=motion_threshold,
+            phrase_durations=phrase_durations,
         )
 
     plan = compute_timelapse_plan(
@@ -1260,7 +1629,8 @@ def build_vertical_timelapse(
         target_duration=target_duration,
         hook_duration=hook["total"],
     )
-    keep_audio = bool(keep_audio) and has_audio_stream(input_path)
+    has_audio = has_audio_stream(input_path)
+    keep_audio = bool(keep_audio) and has_audio
 
     temp_hook = f"{os.path.splitext(output_path)[0]}_hook.mp4"
     temp_main = f"{os.path.splitext(output_path)[0]}_main.mp4"
@@ -1275,6 +1645,20 @@ def build_vertical_timelapse(
                 )
             )
             pieces.append(temp_hook)
+        if normalize_pace_mode(pace_mode) == PACE_MODE_REALTIME_CUTS:
+            selection = _realtime_body_cuts(
+                input_path, plan["orig_duration"], plan["main_duration"],
+                active_timestamps, motion_threshold, phrase_durations,
+            )
+            if selection["cuts"]:
+                render_realtime_cuts(
+                    input_path, temp_main, selection["cuts"],
+                    keep_audio=keep_audio, has_audio=has_audio, runner=runner,
+                    volume_db=body_volume_db,
+                )
+                pieces.append(temp_main)
+                _concat_for_runner(pieces, output_path, runner)
+                return output_path
         runner(
             build_main_command(
                 input_path, temp_main,
@@ -1300,8 +1684,17 @@ def _build_styled_timelapse(
     volume_db: float,
     body_volume_db: float,
     runner: Runner,
+    pace_mode: str = PACE_MODE_TIMELAPSE,
+    active_timestamps: Optional[Sequence[float]] = None,
+    motion_threshold: float = 1.8,
+    phrase_durations: Optional[Sequence[float]] = None,
 ) -> str:
-    """Flash -> tail -> speeded body, all on the segment canvas."""
+    """Flash -> tail -> speeded body, all on the segment canvas.
+
+    With ``pace_mode="realtime_cuts"`` the body is natural-speed cuts of the
+    motion-active moments instead; the flash and tail are unchanged, and a
+    recording with no active moment falls back to the speeded body.
+    """
     source_seconds = probe_duration(input_path)
     has_audio = has_audio_stream(input_path)
     keep_audio = bool(keep_audio) and has_audio
@@ -1330,6 +1723,20 @@ def _build_styled_timelapse(
                 volume_db=volume_db,
             )
             pieces.append(hook_path)
+        if normalize_pace_mode(pace_mode) == PACE_MODE_REALTIME_CUTS:
+            selection = _realtime_body_cuts(
+                input_path, source_seconds, plan["main_duration"],
+                active_timestamps, motion_threshold, phrase_durations,
+            )
+            if selection["cuts"]:
+                render_realtime_cuts(
+                    input_path, main_path, selection["cuts"],
+                    keep_audio=keep_audio, has_audio=has_audio, runner=runner,
+                    volume_db=body_volume_db,
+                )
+                pieces.append(main_path)
+                _concat_for_runner(pieces, output_path, runner)
+                return output_path
         render_project_segment(
             input_path, main_path,
             pts_multiplier=plan["pts_multiplier"],

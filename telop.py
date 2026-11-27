@@ -6,7 +6,8 @@ asked for, using the caption techniques he picked out of the 100-technique
 sheet:
 
 * reading comfort - at most two lines per card, one message per card, breaks on
-  word boundaries, no trailing full stop or comma (1/4 of the sheet);
+  phrase boundaries (a card closes on a clause or a sentence, never on a word
+  that leans forward), no trailing full stop or comma (1/4 of the sheet);
 * placement - a band that stays clear of the Shorts UI (right-hand buttons,
   bottom title/description, top bar) and off the middle of the drawing, a heavy
   sans font with a black outline and a drop shadow, and gold on the words that
@@ -163,6 +164,22 @@ CARD_GAP_SECONDS = 0.35
 # Words whose last character ends a sentence: the card is closed there, which is
 # the "one message per card" rule (technique 12) without hard-cutting a phrase.
 SENTENCE_END = ".!?…"
+# A comma, semicolon or colon ends a clause: the voice pauses there, so the
+# card changes there too instead of running on into the next phrase.
+CLAUSE_END = ",;:"
+# Words that lean forward: they belong with the phrase that follows, so a card
+# or a line never ends on one - "the" or "out of" at the end of a card reads as
+# a phrase cut in half. Articles, prepositions, conjunctions, possessive
+# determiners and the comparatives "as"/"than". Verb particles ("out", "up")
+# are not here: they belong with the verb before them ("comes out").
+FORWARD_WORDS = frozenset({
+    "a", "an", "the",
+    "to", "of", "in", "on", "at", "for", "with", "from", "by", "into",
+    "over", "under", "through", "after", "before", "between", "about",
+    "against", "without", "within", "upon", "per", "via", "as", "than",
+    "and", "or", "but", "so", "nor", "yet",
+    "my", "your", "his", "her", "its", "our", "their",
+})
 # Punctuation that carries no meaning once spoken: dropped at the end of a card
 # (techniques 13 and 14). "!" and "?" stay - they carry the tone.
 SILENT_END_PUNCTUATION = ".,;:、。・"
@@ -244,6 +261,18 @@ def trim_card_end(text: str) -> str:
 def _ends_sentence(text: str) -> bool:
     stripped = text.rstrip().rstrip("\"'”’)]")
     return bool(stripped) and stripped[-1] in SENTENCE_END
+
+
+def _ends_clause(text: str) -> bool:
+    """True when a word ends a clause: a comma, semicolon or colon."""
+    stripped = text.rstrip().rstrip("\"'”’)]")
+    return bool(stripped) and stripped[-1] in CLAUSE_END
+
+
+def _leans_forward(text: str) -> bool:
+    """True when a word belongs with the phrase that follows it."""
+    stripped = clean_word(text).strip("\"'()[]!?.,;:").lower()
+    return stripped in FORWARD_WORDS
 
 
 # Typographic marks a Latin sans draws that are not letters, digits or ASCII.
@@ -402,6 +431,11 @@ def _tidy_timings(words: Sequence[dict]) -> List[dict]:
             start = tidied[-1]["start"]
         if tidied and end <= start:
             end = start + 0.05
+        if tidied and start < tidied[-1]["end"]:
+            # Boundaries that overlap would light two words at once; the
+            # earlier word ends where the next one begins, so the gold moves
+            # with the voice instead of doubling up.
+            tidied[-1]["end"] = start
         tidied.append({"text": clean_word(word["text"]), "start": start, "end": end})
     return [word for word in tidied if word["text"]]
 
@@ -873,16 +907,32 @@ def build_cards(
             text = clean_word(piece["text"])
             if not text:
                 continue
-            candidate = current + [{"text": text, "start": piece["start"], "end": piece["end"]}]
+            item = {"text": text, "start": piece["start"], "end": piece["end"]}
+            candidate = current + [item]
             if _card_fits([item["text"] for item in candidate], layout, max_lines):
                 current = candidate
-                if _ends_sentence(text) and len(current) >= 3:
+                # A card closes on a clause as well as a sentence: the voice
+                # pauses at a comma, so the card changes there instead of
+                # running on into the next phrase.
+                if (_ends_sentence(text) or _ends_clause(text)) and len(current) >= 3:
                     cards.append(current)
                     current = []
             else:
+                moved: List[dict] = []
                 if current:
-                    cards.append(current)
-                current = [{"text": text, "start": piece["start"], "end": piece["end"]}]
+                    # A card never ends on a word that leans forward: hand it
+                    # to the next card, where it stays with its own phrase.
+                    while current and _leans_forward(current[-1]["text"]):
+                        moved.append(current.pop())
+                    moved.reverse()
+                    if moved and not _card_fits(
+                        [entry["text"] for entry in moved + [item]], layout, max_lines
+                    ):
+                        current.extend(moved)
+                        moved = []
+                    if current:
+                        cards.append(current)
+                current = moved + [item]
                 if _ends_sentence(text) and len(current) >= 3:
                     cards.append(current)
                     current = []
@@ -957,6 +1007,25 @@ def _finish_card(
             current_text = candidate
     if current:
         lines.append(current)
+    # A line never ends on a word that leans forward either: hand the trailing
+    # run of such words to the next line, where they stay with their own
+    # phrase, when the next line still holds them. The whole run moves or
+    # nothing does - moving only part of it would leave the line ending on a
+    # forward word anyway. When the next line is already full the break stays.
+    for index in range(len(lines) - 1):
+        run = 0
+        while (
+            run < len(lines[index]) - 1
+            and _leans_forward(words[lines[index][-1 - run]]["text"])
+        ):
+            run += 1
+        if not run:
+            continue
+        following = lines[index][-run:] + lines[index + 1]
+        following_text = " ".join(words[i]["text"] for i in following)
+        if layout.fits(following_text):
+            lines[index] = lines[index][:-run]
+            lines[index + 1] = following
     while len(lines) > max_lines:
         # A measured line can still be too long for the cap; keep the card valid.
         last = lines.pop()

@@ -40,11 +40,21 @@ PERFORMANCE_PATH = "analytics/performance.csv"
 
 # The five styles the brief asks for, as data.
 HOOK_STYLES = ("finish_flash_to_blank", "finish_preview", "text_only")
+# All three modes still exist for an explicit choice in config.yaml; the
+# reflection is barred from switching between them in decide_params below,
+# so the loop cannot undo the overseas direction on its own.
 LANGUAGE_MODES = ("bilingual", "ja", "en")
 TTS_MODES = ("short", "full", "none")
+# The body pace: "timelapse" speeds the whole recording up to fit the Short,
+# "realtime_cuts" cuts motion-active moments at natural speed instead (see
+# video_processor.py). The reflection may switch it, but only after one mode
+# has run for MIN_PACE_RUN consecutive Shorts, so the comparison means
+# anything at one video a day.
+PACE_MODES = ("timelapse", "realtime_cuts")
+MIN_PACE_RUN = 2
 
 # The safe landing place: 20-30 s, the finished piece flashed at the start, the
-# drawing sound under the voice, Japanese and English on screen, and a closing
+# drawing sound under the voice, English on screen, and a closing
 # question that asks for the next motif.
 DEFAULT_PARAMS: Dict[str, object] = {
     "target_duration_sec": 28.0,
@@ -53,10 +63,11 @@ DEFAULT_PARAMS: Dict[str, object] = {
     "hook_flash_seconds": 0.4,
     "hook_audio_boost_db": 6.0,
     "finish_hold_seconds": 2.5,
-    "drawing_audio_volume": 0.35,
+    "drawing_audio_volume": 0.5,
     "narration_ratio": 0.62,
     "tempo": 1.0,
-    "language_mode": "bilingual",
+    "language_mode": "en",
+    "pace_mode": "timelapse",
     "tts_mode": "short",
     "cta_text": "Follow for more oil pastel art!",
     "cta_text_ja": "フォローしてね！",
@@ -78,6 +89,7 @@ NUMERIC_BOUNDS: Dict[str, Tuple[float, float]] = {
 CHOICES: Dict[str, Sequence[str]] = {
     "hook_style": HOOK_STYLES,
     "language_mode": LANGUAGE_MODES,
+    "pace_mode": PACE_MODES,
     "tts_mode": TTS_MODES,
 }
 TEXT_PARAMS = ("cta_text", "cta_question_en", "cta_question_ja")
@@ -152,7 +164,7 @@ def config_params(config: Optional[Mapping[str, object]] = None) -> Dict[str, ob
     # video.* stays the plain render config; it is the base when the improvement
     # block is absent, so an older config still renders what it says.
     video = dict((config or {}).get("video") or {})
-    for name in ("target_duration_sec", "hook_duration_sec"):
+    for name in ("target_duration_sec", "hook_duration_sec", "pace_mode"):
         if name not in defaults and name in video:
             defaults[name] = video[name]
     telop = dict((config or {}).get("telop") or {})
@@ -217,6 +229,7 @@ def describe_params(params: Mapping[str, object]) -> str:
         f"voice={params.get('tts_mode')} ({narration_word_budget(params)[0]}-"
         f"{narration_word_budget(params)[1]} words), "
         f"lang={params.get('language_mode')}, "
+        f"pace={params.get('pace_mode')}, "
         f"drawing sound={_float(params.get('drawing_audio_volume'), 0):.2f}, "
         f"tempo x{_float(params.get('tempo'), 1):g}"
     )
@@ -274,6 +287,7 @@ def summarise_performance(
             "comments": int(item.get("comments_count", 0) or 0),
             "hook_style": str(item.get("hook_type", "")),
             "language": str(item.get("language_mode", "")),
+            "pace": str(item.get("pace_mode", "")),
             "tts_mode": str(item.get("tts_mode", "")),
         }
 
@@ -281,9 +295,11 @@ def summarise_performance(
     retention = [record["retention_pct"] for record in records]
     by_hook: Dict[str, List[float]] = {}
     by_language: Dict[str, List[float]] = {}
+    by_pace: Dict[str, List[float]] = {}
     for record in records:
         by_hook.setdefault(str(record["hook_style"] or "unknown"), []).append(record["retention_pct"])
         by_language.setdefault(str(record["language"] or "unknown"), []).append(record["retention_pct"])
+        by_pace.setdefault(str(record["pace"] or "unknown"), []).append(record["retention_pct"])
 
     def _means(groups: Dict[str, List[float]]) -> Dict[str, float]:
         return {
@@ -308,6 +324,7 @@ def summarise_performance(
         "trend_pct": round(sum(newer) / len(newer) - sum(older) / len(older), 1),
         "by_hook_style": _means(by_hook),
         "by_language": _means(by_language),
+        "by_pace_mode": _means(by_pace),
         "best": best,
         "worst": worst,
         "recent": records,
@@ -347,8 +364,12 @@ Decide the parameters for the NEXT Short. Rules:
   problem, not only the duration.
 - Reward comments and loops: a question the viewer can answer in one word works
   better than a generic "follow me".
-- language_mode: "bilingual" (Japanese on screen with an English line under it),
-  "ja" (Japanese only), "en" (English only). Most viewers are in Japan.
+- language_mode: "en" (English only). The channel is made for viewers overseas,
+  so keep language_mode "en"; never switch it to "bilingual" or "ja".
+- pace_mode: "timelapse" (the whole recording sped up) or "realtime_cuts"
+  (motion-active moments at natural speed). Judge it by by_pace_mode, and hold
+  one pace for at least 2 consecutive Shorts before switching: only propose a
+  switch once each mode has 2 measured Shorts behind it.
 - tts_mode: "short" (a few sharp lines), "full" (the voice runs throughout),
   "none" (drawing sound only).
 - hook_style: "finish_flash_to_blank" (flash the finished artwork, then the
@@ -451,6 +472,38 @@ def decide_params(
         return base, {"status": "gemini-failed", "error": str(exc), "measured": measured}
 
     params = validate_params(review.get("next_params"), base=base)
+    # The channel is made for viewers overseas (2026-11-27): the reflection
+    # may tune the render, but it must not move the language. That stays
+    # whatever the config says - a human changes it in config.yaml, the loop
+    # cannot switch it back (or away) on its own.
+    if params.get("language_mode") != base.get("language_mode"):
+        log(
+            f"[pdca] keeping language_mode {base.get('language_mode')!r}: "
+            "the reflection may not switch it"
+        )
+        params["language_mode"] = base.get("language_mode", "en")
+    # The pace is a controlled experiment, held for MIN_PACE_RUN consecutive
+    # Shorts before it may switch. The recent rows are the memory here - the
+    # reflection's choice is not carried forward as the next run's base, so
+    # the hold is counted from what was actually rendered, most recent first.
+    # That covers the silent revert too: when the reflection says nothing
+    # about the pace, the config default would flip it back, and the hold
+    # keeps the running mode until it has had its 2 Shorts.
+    wanted_pace = str(params.get("pace_mode") or "")
+    recent = list(summary.get("recent") or [])
+    last_pace = str((recent[-1] or {}).get("pace") or "") if recent else ""
+    if wanted_pace and last_pace in PACE_MODES and wanted_pace != last_pace:
+        run = 0
+        for record in reversed(recent):
+            if str(record.get("pace") or "") != last_pace:
+                break
+            run += 1
+        if run < MIN_PACE_RUN:
+            log(
+                f"[pdca] keeping pace_mode {last_pace!r}: hold one pace for "
+                f"{MIN_PACE_RUN} Shorts before switching (only {run} so far)"
+            )
+            params["pace_mode"] = last_pace
     review.update({"status": "gemini", "measured": measured, "summary": summary})
     log(f"[pdca] {review.get('diagnosis', '')}")
     log(f"[pdca] experiment: {review.get('experiment', '')}")
@@ -571,6 +624,8 @@ __all__ = [
     "DEFAULT_PARAMS",
     "HOOK_STYLES",
     "LANGUAGE_MODES",
+    "MIN_PACE_RUN",
+    "PACE_MODES",
     "TTS_MODES",
     "STATE_PATH",
     "PERFORMANCE_PATH",
