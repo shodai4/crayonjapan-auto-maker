@@ -8,8 +8,8 @@ Analytics failure is logged and the existing CSV value is kept, so a bad request
 never wipes the learning history.
 
 The PDCA loop reads this table, so every row also records what the Short *was*
-made with (hook style, language, voice mode, target length and the whole
-parameter set) and when the numbers were last refreshed.
+made with (hook style, language, pace mode, voice mode, target length and the
+whole parameter set) and when the numbers were last refreshed.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ CSV_COLUMNS = [
     "likes",
     "comments_count",
     "language_mode",
+    "pace_mode",
     "tts_mode",
     "duration_sec",
     "target_duration_sec",
@@ -55,6 +56,7 @@ TEXT_COLUMNS = frozenset(
         "style_used",
         "hook_type",
         "language_mode",
+        "pace_mode",
         "tts_mode",
         "params_json",
         "top_feedback",

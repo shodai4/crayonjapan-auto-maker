@@ -13,7 +13,10 @@ actually watch.
    the hook is boosted (+6 dB) because that paper-and-pastel noise is the strongest reason to
    stay. `hook_style` switches it to the previous finish preview or to text only.
 2. **Vertical time-lapse, 20-32 s by default (28 s)** – the whole recording is sped up and
-   fitted to 1080x1920 (9:16). A project of several recordings is rendered clip by clip: each
+   fitted to 1080x1920 (9:16). `video.pace_mode: realtime_cuts` renders the body the other
+   way instead: motion-active moments cut together at natural speed, a few seconds each,
+   spread across the recording (one cut per narration phrase when phrase timings are known),
+   with a time-lapse fallback when a clip has no active moment. A project of several recordings is rendered clip by clip: each
    raw clip becomes its own short 9:16 segment proportional to its length, and only those
    small segments are joined. `tempo` plays the body faster than the target implies when the
    reflection asks for it.
@@ -98,7 +101,7 @@ the plain SRT cues. Every rule below is covered by `tests/test_telop.py`.
 
 | what | how |
 | --- | --- |
-| Reading comfort | at most **two lines** per card, **one message** per card, and cards close on a sentence end. Lines break on word boundaries only; a card's trailing `.` / `,` / `;` is dropped (`!` and `?` stay, they carry the tone). A card that would flash by in under 0.85 s is merged into a neighbour. |
+| Reading comfort | at most **two lines** per card, **one message** per card, and cards close on a sentence end **or a clause** (a comma, semicolon or colon), so a card ends where the voice pauses. A card never ends on a word that leans on the next phrase (an article, preposition or conjunction like `the`, `on`, `and`): the word moves to the next card, and the same rule splits lines. Lines break on word boundaries only; a card's trailing `.` / `,` / `;` is dropped (`!` and `?` stay, they carry the tone). Word timings are clamped to the next word's start, so two karaoke highlights never overlap. A card that would flash by in under 0.85 s is merged into a neighbour. |
 | Placement | the caption band sits `MarginV = 380` from the bottom with 170 px side margins, so it clears the Shorts title/description, the like-comment-share column (140 px) and the top bar. The hook lives in the upper band (300 px) and the fixed title at 180 px; the closing line takes the caption band once the captions have left, so the top edge of the drawing the zoom outro shows stays clear. |
 | Type | DejaVu Sans Bold (auto-detected; Liberation Sans as the fallback) with a black outline and a drop shadow, legible on white paper and on saturated colour. |
 | Emphasis | a keyword or a number is gold and 106 % (gold `&H14C8FF&`); the script can also mark its own words with `**word**`, which are removed before synthesis and highlighted on screen. |
@@ -418,8 +421,8 @@ restore (Drive) -> collect (YouTube) -> reflect (Gemini) -> render/publish -> sa
 | --- | --- | --- |
 | Restore | `performance.csv` and `improvement_state.json` are pulled from Drive over the local copy. The repository's CSV is only the starting point when Drive holds none. | `pdca_state.py` |
 | Collect | The Shorts at least 24 h old (plus any row never measured, at most 8, newest first) are refreshed: views, likes, comments and the uploaded length from the Data API, average view percentage **and average view duration** in one Analytics request. `updated_at` stops the same row being asked twice within 6 h. | `analytics_updater.py` |
-| Reflect | The recent rows (retention, seconds watched vs length, hook style, language, comments) and the current parameters go to Gemini, which answers with a diagnosis, the one thing the next Short tests, and the parameters to change. Out-of-range numbers are clamped, unknown keys dropped. | `improvement.py` |
-| Render | The chosen parameters drive the hook, the length, the tempo, the audio balance, the voice, the on-screen language and the closing question. | `main.py` |
+| Reflect | The recent rows (retention, seconds watched vs length, hook style, language, pace, comments) and the current parameters go to Gemini, which answers with a diagnosis, the one thing the next Short tests, and the parameters to change. Out-of-range numbers are clamped, unknown keys dropped. | `improvement.py` |
+| Render | The chosen parameters drive the hook, the length, the tempo, the audio balance, the voice, the on-screen language, the body pace and the closing question. | `main.py` |
 | Save | The parameters, the reflection and one history entry per run go into `improvement_state.json`, and both state files are written back to Drive (replacing the previous copy). | `pdca_state.py` |
 
 The parameters and their allowed ranges:
@@ -431,10 +434,11 @@ The parameters and their allowed ranges:
 | `hook_duration_sec` / `hook_flash_seconds` | 2.4 / 0.4 | 1.2-3.0 / 0-0.9 | flash + tail split |
 | `hook_audio_boost_db` | 6 | 0-12 | how loud the drawing sound is in the opening |
 | `finish_hold_seconds` | 2.5 | 1-5 | the slow look at the finished piece |
-| `drawing_audio_volume` | 0.35 | 0-1 | drawing sound under the voice (0 = voice only) |
+| `drawing_audio_volume` | 0.5 | 0-1 | drawing sound under the voice (0 = voice only); the drawing sound is the content, so it sits clearly audible |
 | `narration_ratio` | 0.62 | 0.3-0.95 | share of the Short the voice fills |
 | `tempo` | 1.0 | 0.8-2.0 | body speed beyond the target |
-| `language_mode` | `bilingual` | `ja`, `en` | on-screen language (and the voice) |
+| `language_mode` | `en` | `bilingual`, `ja`, `en` | on-screen language (and the voice); the reflection cannot switch it |
+| `pace_mode` | `timelapse` | `realtime_cuts` | body pace: whole recording sped up, or active moments at natural speed |
 | `tts_mode` | `short` | `full`, `none` | how much (or whether) a voice is used |
 | `cta_text` / `cta_text_ja` | Follow line | - | the closing line |
 | `cta_question_en` / `cta_question_ja` | What should I draw next? / 次は何を描いてほしい？ | - | the comment question |
@@ -443,6 +447,15 @@ Without enough data (fewer than `improvement.min_rows` measured Shorts), when Ge
 or when its answer cannot be parsed, the run ships the defaults in `config.yaml`
 (`improvement.defaults`) and logs why - the render never depends on the reflection.
 `--ignore-pdca` renders with those defaults and skips collection, for a comparable manual run.
+
+Two directions are not the reflection's to move. `language_mode` stays whatever
+`config.yaml` says: the channel is made for viewers overseas, so the loop can never switch it
+back to `bilingual` or `ja` on its own (a human still can, in `config.yaml`). `pace_mode` is
+a controlled experiment instead: the reflection compares retention by pace (`by_pace_mode`
+in the summary) and may switch it, but only after one pace has run for 2 consecutive Shorts,
+so a switch is never decided on a single video. At one video a day that is about four days
+to compare two paces; rendering both versions of one artwork with `--no-upload` and
+comparing them by eye is the fast alternative.
 
 The state files live in `DRIVE_STATE_FOLDER_ID` when it is set, otherwise in the archive folder
 (`03_ARCHIVE`), which nothing else reads; the workflow needs no change for it.

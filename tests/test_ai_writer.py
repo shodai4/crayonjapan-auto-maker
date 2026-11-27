@@ -136,7 +136,8 @@ class ParseScriptJsonTests(unittest.TestCase):
         import json
 
         data = ai_writer.parse_script_json(json.dumps(self.VALID))
-        self.assertEqual(data["title"], self.VALID["title"])
+        # "#Shorts" is stripped on the way in: the upload title never carries it.
+        self.assertEqual(data["title"], "Oil pastel postcard")
         self.assertEqual(len(data["tags"]), 10)
 
     def test_parses_fenced_json(self):
@@ -210,30 +211,38 @@ class PromptTests(unittest.TestCase):
                     self.assertIn(note, prompt)
                 self.assertIn("never invent a fact", prompt)
 
-    def test_every_style_asks_for_the_three_short_form_hooks(self):
-        """The buzz elements Gemini proposed: hook, sensory words, a loop."""
+    def test_every_style_asks_for_the_hook_sensory_words_and_the_loop(self):
+        """The hook names the motif and the payoff; the ending echoes the opening."""
         for style in CONFIG["evolution"]["styles"]:
             with self.subTest(style=style):
-                prompt = ai_writer.build_script_prompt(style, CONFIG)
+                # The prompt wraps sentences across lines; read it as one line.
+                prompt = " ".join(ai_writer.build_script_prompt(style, CONFIG).split())
                 self.assertIn("Hook (0-3s)", prompt)
-                self.assertIn("curiosity-gap sentence", prompt)
-                self.assertIn("The secret to realistic texture is", prompt)
-                self.assertIn("You won't believe how this layer transforms", prompt)
+                self.assertIn("names the motif and the payoff", prompt)
+                self.assertIn("same words as the on-screen hook text", prompt)
+                self.assertIn("first frame", prompt)
                 self.assertIn("Sensory Language", prompt)
                 for word in ("creamy", "buttery", "vibrant", "crisp"):
                     self.assertIn(word, prompt)
                 self.assertIn("Loop-friendly Ending", prompt)
-                self.assertIn("naturally lead back to the beginning", prompt)
+                self.assertIn("echoes the first line", prompt)
+                self.assertIn("naturally leads back to the beginning", prompt)
                 self.assertIn("satisfying punchline", prompt)
+                # Generic curiosity-gap lines name nothing: the first seconds
+                # must say what is being drawn.
+                self.assertNotIn("The secret to realistic texture is", prompt)
+                self.assertNotIn("You won't believe how this layer transforms", prompt)
 
     def test_the_narration_rule_keeps_the_hook_sensory_words_and_the_loop(self):
         prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
         narration_line = next(
             line for line in prompt.splitlines() if line.startswith('3. "narration"')
         )
-        self.assertIn("curiosity-gap hook", narration_line)
+        self.assertIn("name the motif and the payoff", narration_line)
         self.assertIn("sensory words", narration_line)
         self.assertIn("leads back to the opening", narration_line)
+        self.assertIn("one true detail", narration_line)
+        self.assertIn("Hold the reveal", narration_line)
 
 
 class JapaneseTranslationTests(unittest.TestCase):
@@ -440,13 +449,13 @@ class GenerateScriptFallbackTests(unittest.TestCase):
 
     def test_a_reply_without_japanese_still_returns_a_script(self):
         data, _, _ = self._run({ai_writer.MODEL_NAME: json.dumps(VALID_SCRIPT)})
-        self.assertEqual(data["title"], VALID_SCRIPT["title"])
+        self.assertEqual(data["title"], "Tiny pastel cat")
         for key in ai_writer.TRANSLATION_KEYS:
             self.assertEqual(data[key], "")
 
     def test_a_working_primary_model_is_used_once(self):
         data, calls, _ = self._run({ai_writer.MODEL_NAME: json.dumps(VALID_SCRIPT)})
-        self.assertEqual(data["title"], VALID_SCRIPT["title"])
+        self.assertEqual(data["title"], "Tiny pastel cat")
         self.assertEqual([name for name, _ in calls], [ai_writer.MODEL_NAME])
 
     def test_a_retired_model_falls_back_to_the_next_one(self):
@@ -456,7 +465,7 @@ class GenerateScriptFallbackTests(unittest.TestCase):
             fallback: json.dumps(VALID_SCRIPT),
         }
         data, calls, _ = self._run(replies)
-        self.assertEqual(data["title"], VALID_SCRIPT["title"])
+        self.assertEqual(data["title"], "Tiny pastel cat")
         self.assertEqual([name for name, _ in calls], [ai_writer.MODEL_NAME, fallback])
 
     def test_an_exhausted_quota_falls_back(self):
@@ -565,14 +574,233 @@ class ParameterisedPromptTests(unittest.TestCase):
         )
         self.assertIn("voice is off", prompt)
 
-    def test_japanese_tags_are_asked_for(self):
+    def test_tags_are_english_only(self):
         prompt = ai_writer.build_script_prompt(
             "style_B_story", CONFIG, params=self.params()
         )
-        self.assertIn("Japanese ones", prompt)
+        self.assertIn("English only, no Japanese tags", prompt)
+        self.assertNotIn("Japanese ones", prompt)
 
     def test_without_parameters_the_old_prompt_is_unchanged(self):
         prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
         self.assertIn("100-120 words", prompt)
         self.assertIn("3-35 s", prompt)
         self.assertNotIn("Japanese only", prompt)
+
+
+class TitleNormalisationTests(unittest.TestCase):
+    """A Gemini reply is cleaned on the way in: no #Shorts, under 70 chars."""
+
+    def reply(self, **overrides):
+        payload = {
+            "title": "Drawing Sushi in Oil Pastel #Shorts",
+            "hook_text": "Watch this sushi appear",
+            "narration": "A short narration.",
+            "description": "A story.",
+            "tags": ["oil pastel"],
+        }
+        payload.update(overrides)
+        return ai_writer.parse_script_json(json.dumps(payload))
+
+    def test_shorts_is_stripped_from_the_title(self):
+        self.assertEqual(self.reply()["title"], "Drawing Sushi in Oil Pastel")
+
+    def test_the_tag_is_stripped_wherever_it_sits(self):
+        data = self.reply(title="Drawing #Shorts Sushi in Oil Pastel")
+        self.assertEqual(data["title"], "Drawing Sushi in Oil Pastel")
+        self.assertNotIn("#", data["title"])
+
+    def test_a_long_title_is_cut_on_a_word_boundary(self):
+        long_title = (
+            "Drawing a very detailed sushi platter in oil pastel layer by layer "
+            "until it glows #Shorts"
+        )
+        title = self.reply(title=long_title)["title"]
+        self.assertLessEqual(len(title), ai_writer.TITLE_MAX_CHARS)
+        self.assertNotIn("#Shorts", title)
+        self.assertTrue(long_title.startswith(title))
+
+    def test_a_short_title_is_untouched(self):
+        self.assertEqual(
+            ai_writer.normalise_title("Drawing Sushi in Oil Pastel"),
+            "Drawing Sushi in Oil Pastel",
+        )
+
+    def test_a_long_hook_is_cut_to_seven_words(self):
+        data = self.reply(hook_text="Watch this little sushi roll appear right before your eyes today")
+        self.assertEqual(data["hook_text"], "Watch this little sushi roll appear right")
+        self.assertLessEqual(len(data["hook_text"].split()), 7)
+
+
+class MotifEnglishNameTests(unittest.TestCase):
+    """The motif in English: a pinned name wins, kana is romanised, kanji is not."""
+
+    def test_an_ascii_motif_is_returned_unchanged(self):
+        self.assertEqual(ai_writer.motif_english_name("sushi"), "sushi")
+
+    def test_a_pinned_name_beats_the_plain_romaji(self):
+        self.assertEqual(
+            ai_writer.motif_english_name("ポッキー", {"ポッキー": "Pocky"}), "Pocky"
+        )
+
+    def test_kana_is_romanised(self):
+        self.assertEqual(ai_writer.motif_english_name("ポッキー"), "pokkii")
+        self.assertEqual(ai_writer.motif_english_name("ねこ"), "neko")
+        self.assertEqual(ai_writer.motif_english_name("ラーメン"), "raamen")
+        self.assertEqual(ai_writer.motif_english_name("しゃしん"), "shashin")
+        self.assertEqual(ai_writer.motif_english_name("きゃらめる"), "kyarameru")
+        self.assertEqual(ai_writer.motif_english_name("ファミマ"), "famima")
+        self.assertEqual(ai_writer.motif_english_name("さんぽ"), "sampo")
+        self.assertEqual(ai_writer.motif_english_name("がっこう"), "gakkou")
+
+    def test_kanji_gives_no_english_name(self):
+        self.assertEqual(ai_writer.motif_english_name("桜"), "")
+        self.assertEqual(ai_writer.motif_english_name("桜もち"), "")
+
+    def test_an_empty_motif_gives_an_empty_name(self):
+        self.assertEqual(ai_writer.motif_english_name(""), "")
+
+    def test_motif_from_name_still_keeps_the_japanese(self):
+        # The raw name is the Japanese record; only the English display name
+        # is romanised, so the *_ja fields keep the original.
+        self.assertEqual(ai_writer.motif_from_name("GO_20261201_ねこ"), "ねこ")
+
+
+class PromptDepthTests(unittest.TestCase):
+    """Depth is one vivid, specific detail per Short - never a longer script."""
+
+    def test_the_prompt_asks_for_one_concrete_detail(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
+        self.assertIn("One true detail", prompt)
+        self.assertIn("why this motif was chosen", prompt)
+        self.assertIn("one memory attached to it", prompt)
+        self.assertIn("never invent a memory", prompt)
+        self.assertIn("never as a generic line", prompt)
+
+    def test_depth_does_not_grow_the_word_budget(self):
+        import improvement
+
+        params = improvement.validate_params()
+        prompt = " ".join(
+            ai_writer.build_script_prompt("style_B_story", CONFIG, params=params).split()
+        )
+        self.assertIn("Depth is one vivid detail, not a longer narration", prompt)
+        low, high = improvement.narration_word_budget(params)
+        self.assertIn(f"{low}-{high} words", prompt)
+
+    def test_the_prompt_says_one_idea_per_short(self):
+        prompt = ai_writer.build_script_prompt("style_A_material", CONFIG)
+        self.assertIn("One idea per Short", prompt)
+        self.assertIn("never a second subject", prompt)
+
+    def test_the_prompt_holds_the_reveal_until_the_end(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
+        self.assertIn("Hold the reveal", prompt)
+        self.assertIn("without giving away the finished look", prompt)
+
+
+class PromptMotifTests(unittest.TestCase):
+    """The English motif name reaches the prompt, so the first line can say it."""
+
+    def test_a_given_motif_is_named_in_the_prompt(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG, motif="Pocky")
+        self.assertIn("- Motif: Pocky", prompt)
+        self.assertIn("use exactly this name", prompt)
+
+    def test_without_a_motif_there_is_no_motif_line(self):
+        prompt = ai_writer.build_script_prompt("style_B_story", CONFIG)
+        self.assertNotIn("- Motif:", prompt)
+
+    def test_the_generator_passes_the_english_motif_to_the_prompt(self):
+        import copy
+
+        config = copy.deepcopy(CONFIG)
+        config["brand"]["motif_names"] = {"ポッキー": "Pocky"}
+        calls = []
+        replies = {ai_writer.MODEL_NAME: json.dumps(VALID_SCRIPT)}
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
+                mock.patch.object(ai_writer, "create_client",
+                                  return_value=_FakeClient(replies, calls)):
+            ai_writer.generate_making_script(
+                [], "style_B_story", config, motif="GO_ポッキー"
+            )
+        prompt = calls[0][1][0]
+        self.assertIn("- Motif: Pocky", prompt)
+        self.assertNotIn("ポッキー", prompt)
+
+
+class FallbackEnglishMotifTests(unittest.TestCase):
+    """The offline template speaks English: romanised motif, no #Shorts."""
+
+    PARAMS = {
+        "target_duration_sec": 28,
+        "narration_ratio": 0.62,
+        "language_mode": "en",
+        "tts_mode": "short",
+    }
+
+    def config(self, motif_names=None):
+        import copy
+
+        config = copy.deepcopy(CONFIG)
+        if motif_names is not None:
+            config["brand"]["motif_names"] = motif_names
+        return config
+
+    def script(self, motif, motif_names=None, style="style_A_material"):
+        return ai_writer.fallback_script(
+            style, self.config(motif_names), motif=motif, params=self.PARAMS
+        )
+
+    def test_a_pinned_name_is_used_everywhere_in_english(self):
+        script = self.script("GO_ポッキー", {"ポッキー": "Pocky"})
+        self.assertEqual(script["title"], "Drawing Pocky in Oil Pastel")
+        self.assertEqual(script["hook_text"], "Watch this Pocky appear")
+        self.assertIn("Pocky", script["narration"])
+        self.assertIn("ポッキー", script["title_ja"])
+        for field in ("title", "hook_text", "narration", "description", "overseas_caption"):
+            self.assertNotIn("#Shorts", script[field], field)
+            self.assertNotIn("ポッキー", script[field], field)
+        self.assertLessEqual(len(script["title"]), 65)
+
+    def test_an_unmapped_kana_name_is_romanised(self):
+        # ポッキー is pinned in config.yaml's brand.motif_names, so the
+        # unmapped case uses a different kana name here.
+        script = self.script("GO_ラーメン")
+        self.assertEqual(script["title"], "Drawing Raamen in Oil Pastel")
+        self.assertNotIn("ラーメン", script["narration"])
+
+    def test_a_hiragana_name_is_romanised(self):
+        script = self.script("GO_ねこ")
+        self.assertEqual(script["title"], "Drawing Neko in Oil Pastel")
+
+    def test_a_kanji_name_falls_back_to_generic_english(self):
+        script = self.script("GO_桜")
+        self.assertEqual(script["title"], "Drawing a tiny postcard in oil pastel")
+        for field in ("title", "hook_text", "narration", "description", "overseas_caption"):
+            self.assertNotIn("桜", script[field], field)
+        # The Japanese check copy still names the motif.
+        self.assertIn("桜", script["title_ja"])
+
+    def test_the_description_is_two_sentences_and_five_hashtags(self):
+        script = self.script("GO_ポッキー", {"ポッキー": "Pocky"})
+        body, hashtags = script["description"].rsplit("\n", 1)
+        self.assertEqual(len(hashtags.split()), 5)
+        self.assertNotIn("#Shorts", script["description"])
+        self.assertIn("#CrayonJapan", hashtags)
+        self.assertEqual(body.count("."), 2)
+
+    def test_the_tags_are_all_english(self):
+        script = self.script("GO_ポッキー", {"ポッキー": "Pocky"})
+        self.assertEqual(len(script["tags"]), 10)
+        for tag in script["tags"]:
+            self.assertTrue(all(ord(ch) < 128 for ch in tag), tag)
+
+    def test_the_ending_echoes_the_opening_strokes(self):
+        script = self.script("GO_ポッキー", {"ポッキー": "Pocky"})
+        self.assertTrue(
+            script["narration"].endswith(
+                "And it all starts again with a few oil pastel strokes."
+            )
+        )
+        self.assertIn("comes out of a few oil pastel strokes", script["narration"])

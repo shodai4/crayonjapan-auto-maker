@@ -14,7 +14,7 @@ CONFIG = {
         "enabled": True,
         "min_rows": 2,
         "audience_note": "89% of the viewers were in Japan.",
-        "defaults": {"target_duration_sec": 27, "language_mode": "bilingual"},
+        "defaults": {"target_duration_sec": 27, "language_mode": "en"},
     },
     "telop": {"cta_text": "Follow for more oil pastel art!"},
 }
@@ -46,6 +46,7 @@ def rows(*specs):
                 "likes": spec.get("likes", 3),
                 "comments_count": spec.get("comments", 0),
                 "language_mode": spec.get("language", "en"),
+                "pace_mode": spec.get("pace", "timelapse"),
                 "tts_mode": "full",
                 "duration_sec": spec.get("length", 46.0),
                 "target_duration_sec": 45,
@@ -84,7 +85,7 @@ class DefaultsTests(unittest.TestCase):
     def test_the_new_defaults_are_the_brief_s(self):
         params = improvement.validate_params()
         self.assertEqual(params["hook_style"], "finish_flash_to_blank")
-        self.assertEqual(params["language_mode"], "bilingual")
+        self.assertEqual(params["language_mode"], "en")
         self.assertEqual(params["tts_mode"], "short")
         self.assertTrue(20 <= float(params["target_duration_sec"]) <= 32)
         self.assertIn("次は何を描いてほしい", str(params["cta_question_ja"]))
@@ -99,7 +100,7 @@ class DefaultsTests(unittest.TestCase):
     def test_a_config_without_the_block_still_has_a_full_set(self):
         params = improvement.config_params({"video": {"target_duration_sec": 30}})
         self.assertEqual(params["target_duration_sec"], 30.0)
-        self.assertEqual(params["language_mode"], "bilingual")
+        self.assertEqual(params["language_mode"], "en")
 
     def test_numbers_are_clamped_not_rejected(self):
         params = improvement.validate_params(
@@ -110,19 +111,19 @@ class DefaultsTests(unittest.TestCase):
         self.assertEqual(params["tempo"], 2.0)
 
     def test_choices_fall_back_to_the_base_value(self):
-        base = improvement.validate_params({"hook_style": "text_only", "language_mode": "ja"})
+        base = improvement.validate_params({"hook_style": "text_only", "language_mode": "en"})
         params = improvement.validate_params(
             {"hook_style": "dance", "language_mode": "klingon"}, base=base
         )
         self.assertEqual(params["hook_style"], "text_only")
-        self.assertEqual(params["language_mode"], "ja")
+        self.assertEqual(params["language_mode"], "en")
 
     def test_broken_values_keep_the_default(self):
         params = improvement.validate_params(
             {"target_duration_sec": "long", "drawing_audio_volume": None, "cta_text": ""}
         )
         self.assertEqual(params["target_duration_sec"], 28.0)
-        self.assertEqual(params["drawing_audio_volume"], 0.35)
+        self.assertEqual(params["drawing_audio_volume"], 0.5)
         self.assertEqual(params["cta_text"], improvement.DEFAULT_PARAMS["cta_text"])
 
     def test_unknown_keys_are_dropped(self):
@@ -140,7 +141,7 @@ class DefaultsTests(unittest.TestCase):
 
     def test_describe_names_the_choices(self):
         line = improvement.describe_params(improvement.validate_params())
-        for needle in ("hook=finish_flash_to_blank", "lang=bilingual", "voice=short"):
+        for needle in ("hook=finish_flash_to_blank", "lang=en", "voice=short"):
             self.assertIn(needle, line)
 
 
@@ -222,7 +223,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(review["status"], "gemini")
         self.assertEqual(params["target_duration_sec"], 25.0)
         self.assertEqual(params["hook_style"], "finish_flash_to_blank")
-        self.assertEqual(params["language_mode"], "bilingual")  # untouched
+        self.assertEqual(params["language_mode"], "en")  # untouched
 
     def test_an_answer_outside_the_ranges_is_clamped(self):
         answer = json.dumps({"next_params": {"target_duration_sec": 70, "tempo": 0.1}})
@@ -308,6 +309,150 @@ class StateTests(unittest.TestCase):
         again = improvement.load_state(self.path)
         self.assertEqual(again["params"]["tempo"], 1.4)
         self.assertEqual(len(again["history"]), 1)
+
+
+class DirectionLockTests(unittest.TestCase):
+    """The overseas direction: the reflection cannot switch the language.
+
+    The channel is made for viewers overseas (2026-11-27), so the reflection
+    keeps language_mode "en". The lock lives in decide_params, not in the
+    allowed values: a human can still choose a language in config.yaml, but
+    the loop cannot move it on its own, in either direction.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.csv = os.path.join(self.tmp.name, "performance.csv")
+
+    def _decide(self, replies, config=CONFIG, client=None):
+        make_csv(self.csv, rows({"retention": 26.9, "length": 46}, {"retention": 50.0, "length": 83}))
+        fake = client if client is not None else FakeClient(replies)
+        with mock.patch.object(improvement, "_ask_gemini", side_effect=lambda prompt, cfg: fake.models.generate_content(contents=[prompt]).text):
+            return improvement.decide_params(self.csv, config, log=lambda *_: None)
+
+    def test_the_reflection_cannot_switch_the_language_to_bilingual(self):
+        answer = json.dumps({"next_params": {"language_mode": "bilingual"}})
+        params, review = self._decide([answer])
+        self.assertEqual(review["status"], "gemini")
+        self.assertEqual(params["language_mode"], "en")
+
+    def test_the_reflection_cannot_switch_the_language_to_japanese(self):
+        answer = json.dumps({"next_params": {"language_mode": "ja"}})
+        params, _ = self._decide([answer])
+        self.assertEqual(params["language_mode"], "en")
+
+    def test_the_reflection_cannot_move_a_language_a_human_chose_either(self):
+        config = {
+            "video": {"target_duration_sec": 28, "hook_duration_sec": 2.4},
+            "improvement": {"enabled": True, "min_rows": 2, "defaults": {"language_mode": "ja"}},
+        }
+        answer = json.dumps({"next_params": {"language_mode": "bilingual"}})
+        params, _ = self._decide([answer], config=config)
+        self.assertEqual(params["language_mode"], "ja")
+
+    def test_the_review_prompt_keeps_the_language_english(self):
+        summary = improvement.summarise_performance(rows({"retention": 40.0}))
+        prompt = improvement.review_prompt(summary, improvement.validate_params(), {})
+        self.assertIn('keep language_mode "en"', prompt)
+        self.assertIn("overseas", prompt)
+        self.assertIn('never switch it to "bilingual" or "ja"', prompt)
+        self.assertNotIn("Most viewers are in Japan", prompt)
+
+
+class PaceReflectionTests(unittest.TestCase):
+    """The pace is a controlled experiment, not a flip-flop.
+
+    performance.csv records which pace each Short used (same pattern as the
+    language column), summarise_performance compares retention by pace, and
+    decide_params holds one pace for 2 consecutive Shorts before it may
+    switch - at one video a day a shorter hold is no experiment. The hold is
+    counted from what was actually rendered, because the reflection's choice
+    is not carried forward as the next run's base.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.csv = os.path.join(self.tmp.name, "performance.csv")
+
+    def _decide(self, specs, replies, config=CONFIG):
+        make_csv(self.csv, rows(*specs))
+        fake = FakeClient(replies)
+        with mock.patch.object(improvement, "_ask_gemini", side_effect=lambda prompt, cfg: fake.models.generate_content(contents=[prompt]).text):
+            return improvement.decide_params(self.csv, config, log=lambda *_: None)
+
+    def test_config_picks_up_the_video_pace_mode(self):
+        config = {"video": {"pace_mode": "realtime_cuts"}}
+        self.assertEqual(improvement.config_params(config)["pace_mode"], "realtime_cuts")
+
+    def test_an_unknown_pace_falls_back_to_timelapse(self):
+        config = {"video": {"pace_mode": "fast"}}
+        self.assertEqual(improvement.config_params(config)["pace_mode"], "timelapse")
+
+    def test_the_summary_compares_retention_by_pace(self):
+        summary = improvement.summarise_performance(
+            rows(
+                {"retention": 30.0, "pace": "timelapse"},
+                {"retention": 50.0, "pace": "timelapse"},
+                {"retention": 60.0, "pace": "realtime_cuts"},
+            )
+        )
+        self.assertEqual(summary["by_pace_mode"]["timelapse"], 40.0)
+        self.assertEqual(summary["by_pace_mode"]["realtime_cuts"], 60.0)
+
+    def test_a_switch_is_blocked_after_only_one_short_on_the_running_pace(self):
+        answer = json.dumps({"next_params": {"pace_mode": "timelapse"}})
+        params, review = self._decide(
+            [{"retention": 40.0, "pace": "timelapse"}, {"retention": 55.0, "pace": "realtime_cuts"}],
+            [answer],
+        )
+        self.assertEqual(review["status"], "gemini")
+        self.assertEqual(params["pace_mode"], "realtime_cuts")
+
+    def test_a_switch_is_allowed_after_two_shorts_on_the_running_pace(self):
+        answer = json.dumps({"next_params": {"pace_mode": "timelapse"}})
+        params, _ = self._decide(
+            [{"retention": 55.0, "pace": "realtime_cuts"}, {"retention": 50.0, "pace": "realtime_cuts"}],
+            [answer],
+        )
+        self.assertEqual(params["pace_mode"], "timelapse")
+
+    def test_a_silent_reflection_does_not_revert_the_running_pace_early(self):
+        answer = json.dumps({"next_params": {"target_duration_sec": 25}})
+        params, _ = self._decide(
+            [{"retention": 40.0, "pace": "timelapse"}, {"retention": 55.0, "pace": "realtime_cuts"}],
+            [answer],
+        )
+        self.assertEqual(params["pace_mode"], "realtime_cuts")
+        self.assertEqual(params["target_duration_sec"], 25.0)
+
+    def test_old_rows_without_a_pace_column_do_not_block_a_switch(self):
+        specs = [
+            {"retention": 40.0, "date": "2026-11-10"},
+            {"retention": 55.0, "date": "2026-11-11"},
+        ]
+        made = rows(*specs)
+        for row in made:
+            del row["pace_mode"]
+        make_csv(self.csv, made)
+        answer = json.dumps({"next_params": {"pace_mode": "realtime_cuts"}})
+        fake = FakeClient([answer])
+        with mock.patch.object(improvement, "_ask_gemini", side_effect=lambda prompt, cfg: fake.models.generate_content(contents=[prompt]).text):
+            params, _ = improvement.decide_params(self.csv, CONFIG, log=lambda *_: None)
+        self.assertEqual(params["pace_mode"], "realtime_cuts")
+
+    def test_the_review_prompt_names_the_pace_and_the_hold(self):
+        summary = improvement.summarise_performance(rows({"retention": 40.0}))
+        prompt = improvement.review_prompt(summary, improvement.validate_params(), {})
+        self.assertIn("pace_mode", prompt)
+        self.assertIn("realtime_cuts", prompt)
+        self.assertIn("by_pace_mode", prompt)
+        self.assertIn("2 consecutive Shorts", prompt)
+
+    def test_describe_names_the_pace(self):
+        line = improvement.describe_params(improvement.validate_params({"pace_mode": "realtime_cuts"}))
+        self.assertIn("pace=realtime_cuts", line)
 
 
 if __name__ == "__main__":

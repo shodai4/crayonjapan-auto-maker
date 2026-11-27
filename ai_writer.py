@@ -172,8 +172,15 @@ def _narration_range(style_key: str, params=None) -> tuple:
     return low, high
 
 
-def build_script_prompt(style_key: str, config: dict, reference_scan: bool = False, params=None) -> str:
-    """The Gemini prompt for one Short; kept pure so it can be unit tested."""
+def build_script_prompt(style_key: str, config: dict, reference_scan: bool = False, params=None, motif: str = "") -> str:
+    """The Gemini prompt for one Short; kept pure so it can be unit tested.
+
+    ``motif`` is the English name of what is being drawn (see
+    :func:`motif_english_name`); when it is given, the prompt tells Gemini to
+    use exactly that name in the title, the first spoken line and the hook, so
+    the viewer hears the topic in the first seconds instead of guessing it
+    from the keyframes.
+    """
     styles_cfg = config["evolution"]["styles"]
     style_desc = styles_cfg[style_key]["description"]
     shop_url = config["brand"]["shop_url"]
@@ -224,6 +231,12 @@ def build_script_prompt(style_key: str, config: dict, reference_scan: bool = Fal
         )
 
     timeline, language_block = _run_shape(total_seconds, params)
+    motif_line = ""
+    if str(motif or "").strip():
+        motif_line = (
+            f"\n- Motif: {str(motif).strip()} (the English name of what is being drawn - "
+            f"use exactly this name in the title, the first spoken line and the hook text)."
+        )
     return f"""
 You are a creative director for the global art channel "CrayonJapan".
 Analyze the attached making-of keyframes of a hand-drawn postcard artwork.{scan_note}
@@ -232,25 +245,46 @@ Context:
 - Art Material: {material} (Japanese professional oil pastels)
 - Artwork Type: One-of-a-kind original postcard painting
 - Theme: {theme}
-- Shop URL: {shop_url}
+- Shop URL: {shop_url}{motif_line}
 - Selected Narrative Style ({style_key}): {style_desc}
 {artist_block}
 The finished Short is about {total_seconds} seconds long. Plan the narration on this
 timeline:
 {timeline}
 
-Three things every Short has to do, woven into the narration itself (never read
+One idea per Short: this motif and nothing else - never a second subject, never a
+digression.
+
+Four things every Short has to do, woven into the narration itself (never read
 out as a list, never a checklist):
-1. Hook (0-3s): Start with a curiosity-gap sentence. (e.g., "The secret to realistic texture is..." or "You won't believe how this layer transforms...")
+1. Hook (0-3s): The first spoken line names the motif and the payoff - what is being
+drawn and what the finished piece will look like - in the first seconds, in the same
+words as the on-screen hook text. The first frame, the first line and the hook text
+all point at the same payoff. No greeting, no warm-up, no logo.
 2. Sensory Language: Use words like 'creamy', 'buttery', 'vibrant', 'crisp' to emphasize the material's quality.
-3. Loop-friendly Ending: The last sentence should naturally lead back to the beginning or end with a strong, satisfying punchline.
+3. Loop-friendly Ending: The last sentence echoes the first line's words, so the ending
+naturally leads back to the beginning, or ends with a strong, satisfying punchline.
+4. One true detail: Exactly one concrete, specific detail from the artist context
+above - why this motif was chosen, or one memory attached to it (a place, a time, a
+person, a taste). Say it once, in concrete words, never as a generic line ('happy
+memories', 'a small everyday thing'). If no detail in the context fits this footage,
+say nothing personal at all - never invent a memory, a place or a person. Depth is
+one vivid detail, not a longer narration: the word budget below does not grow for it.
 {language_block}
 Generate a JSON response with the following keys:
-1. "title": Catchy YouTube Shorts title (under 65 chars, include #Shorts).
-2. "hook_text": Short punchy on-screen hook text for the first 2.5 seconds (max 7 words).
-3. "narration": Natural, engaging voiceover script of {word_min}-{word_max} words (this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Open on the curiosity-gap hook, keep the sensory words coming, mention {material} naturally, and close so the ending leads back to the opening or lands as a punchline. Do not leave a silent stretch longer than a breath anywhere the voice is used.
-4. "description": YouTube description with the artwork story, the material ({material}) and the hashtags (#SakuraCrayPas #CrayPasSpecialist #OilPastelArt #JapaneseArtSupplies #OriginalPostcard #CrayonJapan). The pipeline adds the shop call to action ({shop_url}) to this field itself, so write the story and the hashtags - do not write the shop link or a "shop this piece" line.
-5. "tags": List of 10 relevant tags (English names are fine; add 1-2 Japanese ones).
+1. "title": Search-phrase-first YouTube Shorts title: the motif and "oil pastel" up
+front, the point inside the first 40 characters, under 65 characters in total. No
+"#Shorts", no hashtags, no Japanese, no emoji.
+2. "hook_text": The same payoff as the first spoken line, as on-screen hook text for
+the first 2.5 seconds (max 7 words) - the first frame, the first line and this text
+all point at the same payoff.
+3. "narration": Natural, engaging voiceover script of {word_min}-{word_max} words (this Short is about {total_seconds} s), written to be spoken aloud: mostly sentences under 14 words. Open on the hook: name the motif and the payoff in the first sentence, so the first spoken words say the topic aloud. One idea only. Hold the reveal: describe the process without giving away the finished look until the end. Keep the sensory words coming, mention {material} naturally, say the one true detail (point 4) once in concrete words, and close so the ending leads back to the opening. Do not leave a silent stretch longer than a breath anywhere the voice is used.
+4. "description": 1-2 plain sentences about the artwork that restate the topic in
+different words from the title, then 3-5 hashtags (#SakuraCrayPas #OilPastelArt
+#CrayPasSpecialist #OriginalPostcard #CrayonJapan). No "#Shorts". The pipeline adds the shop call
+to action ({shop_url}) to this field itself, so write the story and the hashtags - do
+not write the shop link or a "shop this piece" line.
+5. "tags": List of 10 relevant tags, English only, no Japanese tags.
 6. "title_ja": The same title in natural Japanese, keeping "#Shorts" and any emoji.
 7. "hook_ja": The same on-screen hook in natural Japanese, short enough to read in 2.5 seconds.
 8. "narration_ja": The whole narration translated into natural, warm Japanese so the artist can check it before posting - the same meaning and order as "narration", one Japanese sentence per English sentence, no emoji and no stage directions. It is a translation only: never add or drop a fact, and never write a different script.
@@ -297,13 +331,16 @@ def _run_shape(total_seconds: int, params=None) -> tuple:
         "  written story of the artwork for the description, short and vivid.\n"
         if tts_mode == "none"
         else (
-            f"- 0-3 s: the hook (point 1 below). No greeting, no warm-up.\n"
+            f"- 0-3 s: the hook (point 1 below): name the motif and the payoff in the first\n"
+            f"sentence, so the topic is said aloud at once. No greeting, no warm-up.\n"
             f"- 3-{speech_end} s: the process, colour by colour, in words a viewer can almost\n"
             "feel. Nothing about the tools or the channel; only what is happening on the paper.\n"
+            "Hold the reveal: describe the work without giving away the finished look, and\n"
+            "say the one true detail (point 4) once, in concrete words, where it fits.\n"
             f"- {speech_end}-{punch_end} s: one satisfying punchline about the finished piece that\n"
-            "leads back to the opening, then the short call to action (1-of-1 original, link in\n"
-            "the description). After that the drawing sound and the closing question carry the\n"
-            "ending, so stop talking: no long trailing sentence.\n"
+            "echoes the opening line's words and leads back to it, then the short call to action\n"
+            "(1-of-1 original, link in the description). After that the drawing sound and the\n"
+            "closing question carry the ending, so stop talking: no long trailing sentence.\n"
         )
     )
     mode = str(params.get("language_mode", "bilingual"))
@@ -361,6 +398,35 @@ def overseas_text(data: dict, key: str) -> str:
     return ""
 
 
+TITLE_MAX_CHARS = 70
+HOOK_MAX_WORDS = 7
+_SHORTS_TOKEN = re.compile(r"#shorts\b", re.IGNORECASE)
+
+
+def normalise_title(title: object) -> str:
+    """The upload title: no ``#Shorts``, under 70 characters.
+
+    Gemini is told not to write ``#Shorts`` (it adds nothing to reach), but an
+    older or careless reply still gets cleaned here instead of on upload: the
+    tag is dropped and a title past the 60-70 character sweet spot is cut on a
+    word boundary, so the search phrase up front always survives.
+    """
+    text = _SHORTS_TOKEN.sub("", _text(title))
+    text = re.sub(r"\s+", " ", text).strip(" -–—|")
+    if len(text) > TITLE_MAX_CHARS:
+        cut = text[:TITLE_MAX_CHARS]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        text = cut.rstrip(" -–—|,;:")
+    return text
+
+
+def normalise_hook(hook_text: object) -> str:
+    """The on-screen hook: at most seven words, so it fits the first 2.5 s."""
+    words = _text(hook_text).split()
+    return " ".join(words[:HOOK_MAX_WORDS])
+
+
 def parse_script_json(raw_text: str) -> dict:
     """Parse Gemini's JSON reply even when it arrives inside markdown fences."""
     text = (raw_text or "").strip()
@@ -381,6 +447,10 @@ def parse_script_json(raw_text: str) -> dict:
     data["tags"] = [str(tag).strip() for tag in tags if str(tag).strip()][:10]
     for key in ("title", "hook_text", "narration", "description"):
         data[key] = str(data[key]).strip()
+    # A reply that still carries #Shorts, or a title past the sweet spot, is
+    # cleaned here: the pack and the upload only ever see the short form.
+    data["title"] = normalise_title(data["title"])
+    data["hook_text"] = normalise_hook(data["hook_text"])
     # A missing translation becomes an empty string rather than an error, so the
     # render and the English upload pack are never lost over it.
     for key in TRANSLATION_KEYS:
@@ -466,6 +536,132 @@ def _motif_title(motif: str) -> str:
     return motif
 
 
+# ---------------------------------------------------------------------------
+# The English name of the motif: the English voice and the English captions
+# must never carry untranslated Japanese (GO_ポッキー -> "ポッキー" in the
+# narration). The artist can pin an exact English name per motif in
+# config.yaml under ``brand.motif_names`` (``ポッキー`` -> ``Pocky``); anything
+# else in kana is romanised with this small table, and kanji - which no table
+# can read - falls back to no English name, so the generic English lines are
+# used and the Japanese name survives only in the *_ja check fields.
+# ---------------------------------------------------------------------------
+_KANA_ROMAJI: Dict[str, str] = {}
+for _hiragana, _katakana, _sounds in (
+    ("あいうえお", "アイウエオ", ("a", "i", "u", "e", "o")),
+    ("かきくけこ", "カキクケコ", ("ka", "ki", "ku", "ke", "ko")),
+    ("がぎぐげご", "ガギグゲゴ", ("ga", "gi", "gu", "ge", "go")),
+    ("さしすせそ", "サシスセソ", ("sa", "shi", "su", "se", "so")),
+    ("ざじずぜぞ", "ザジズゼゾ", ("za", "ji", "zu", "ze", "zo")),
+    ("たちつてと", "タチツテト", ("ta", "chi", "tsu", "te", "to")),
+    ("だぢづでど", "ダヂヅデド", ("da", "ji", "zu", "de", "do")),
+    ("なにぬねの", "ナニヌネノ", ("na", "ni", "nu", "ne", "no")),
+    ("はひふへほ", "ハヒフヘホ", ("ha", "hi", "fu", "he", "ho")),
+    ("ばびぶべぼ", "バビブベボ", ("ba", "bi", "bu", "be", "bo")),
+    ("ぱぴぷぺぽ", "パピプペポ", ("pa", "pi", "pu", "pe", "po")),
+    ("まみむめも", "マミムメモ", ("ma", "mi", "mu", "me", "mo")),
+    ("やゆよ", "ヤユヨ", ("ya", "yu", "yo")),
+    ("らりるれろ", "ラリルレロ", ("ra", "ri", "ru", "re", "ro")),
+    ("わを", "ワヲ", ("wa", "wo")),
+):
+    for _char, _sound in zip(_hiragana + _katakana, _sounds * 2):
+        _KANA_ROMAJI[_char] = _sound
+_KANA_ROMAJI["ん"] = "n"
+_KANA_ROMAJI["ン"] = "n"
+# Small vowels standing on their own (ファ -> "fa" comes through the yoon
+# path below only for ゃゅょ; a lone small vowel just says its vowel).
+for _char, _sound in zip("ぁぃぅぇぉァィゥェォ", ("a", "i", "u", "e", "o") * 2):
+    _KANA_ROMAJI[_char] = _sound
+_YOON_VOWEL = {"ゃ": "ya", "ゅ": "yu", "ょ": "yo", "ャ": "ya", "ュ": "yu", "ョ": "yo"}
+# Small vowels combine the same way (ファ -> "fa", シェ -> "she").
+_SMALL_COMBINE = dict(
+    _YOON_VOWEL,
+    **{c: v for c, v in zip("ぁぃぅぇぉァィゥェォ", ("a", "i", "u", "e", "o") * 2)},
+)
+_SOKUON = {"っ", "ッ"}
+_CHOONPU = "ー"
+_VOWELS = "aiueo"
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _romanise_kana(text: str) -> str:
+    """Hiragana/katakana as romaji; any other character is left as it is."""
+    out: List[str] = []
+    double_next = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in _SOKUON:
+            double_next = True
+            index += 1
+            continue
+        if char == _CHOONPU:
+            for piece in reversed(out):
+                for letter in reversed(piece):
+                    if letter in _VOWELS:
+                        out.append(letter)
+                        break
+                else:
+                    continue
+                break
+            index += 1
+            continue
+        sound = _KANA_ROMAJI.get(char)
+        if sound is None:
+            out.append(char)
+            double_next = False
+            index += 1
+            continue
+        # A small ゃ/ゅ/ょ (or ァ/ィ/ゥ/ェ/ォ) after a kana combines with it:
+        # きゃ -> "kya", しゃ -> "sha" (the "y" gives way after sh/ch/j),
+        # ファ -> "fa", シェ -> "she".
+        if index + 1 < len(text) and text[index + 1] in _SMALL_COMBINE:
+            base = sound.rstrip(_VOWELS)
+            tail = _SMALL_COMBINE[text[index + 1]]
+            if tail.startswith("y") and base in ("sh", "ch", "j"):
+                sound = base + tail[1:]
+            else:
+                sound = base + tail
+            index += 1
+        if double_next:
+            # Double the opening consonant: っき -> "kki", っち -> "cchi".
+            head = sound[:2] if sound[:2] in ("ch", "sh", "ts") else sound[:1]
+            if head not in _VOWELS:
+                sound = head + sound
+            double_next = False
+        elif char in ("ん", "ン"):
+            # ん before b/m/p is "m" (さんぽ -> "sampo"); otherwise "n".
+            following = _KANA_ROMAJI.get(text[index + 1]) if index + 1 < len(text) else None
+            sound = "m" if following and following[0] in "bmp" else "n"
+        out.append(sound)
+        index += 1
+    return "".join(out)
+
+
+def motif_english_name(motif: str, names: Optional[Mapping[str, str]] = None) -> str:
+    """The motif in English, for the voice, the hook and the metadata.
+
+    An exact entry in ``names`` (config ``brand.motif_names``) wins, so a brand
+    name stays its real English name (``ポッキー`` -> ``Pocky``, not the plain
+    romaji ``pokkii``). Otherwise kana is romanised; a name that still holds
+    CJK after that (kanji, which no table can read) gives "" - the caller then
+    uses the generic English lines, and the Japanese name is kept only in the
+    ``*_ja`` fields. An all-ASCII motif is returned unchanged.
+    """
+    raw = str(motif or "").strip()
+    if not raw:
+        return ""
+    if names:
+        for key, value in dict(names).items():
+            if str(key).strip() == raw and str(value or "").strip():
+                return str(value).strip()
+    if all(ord(ch) < 128 for ch in raw):
+        return raw
+    romanised = _romanise_kana(raw)
+    if _CJK.search(romanised):
+        return ""
+    return romanised
+
+
 # Sentence pairs for the offline narration: English and its Japanese
 # translation, so the pack the artist checks keeps the same order as the voice.
 # Every sentence is about the material or the process (or the motif the name
@@ -534,8 +730,8 @@ STYLE_SENTENCES = {
 }
 CLOSING_SENTENCES = (
     (
-        "One original postcard, drawn by hand and never repeated.",
-        "世界に1枚だけのポストカードを、手描きで。",
+        "And it all starts again with a few oil pastel strokes.",
+        "そして、また数本のオイルパステルの線から始まります。",
     ),
     (
         "And it begins again with a single quiet line.",
@@ -552,13 +748,15 @@ FALLBACK_TAGS = (
     "postcard art",
     "japanese art supplies",
     "satisfying art",
-    "手描き",
+    "hand drawn",
 )
+# The description carries 3-5 hashtags, no #Shorts: the same five the Gemini
+# prompt asks for, so the template and the model agree. #CrayonJapan is the
+# channel tag, and the pack's "CrayonJapan" needle comes from it.
 FALLBACK_HASHTAGS = (
     "#SakuraCrayPas",
-    "#CrayPasSpecialist",
     "#OilPastelArt",
-    "#JapaneseArtSupplies",
+    "#CrayPasSpecialist",
     "#OriginalPostcard",
     "#CrayonJapan",
 )
@@ -640,51 +838,64 @@ def fallback_script(
     material = str(brand.get("material_name") or "oil pastel").strip()
     series = str(brand.get("name") or "CrayonJapan").strip()
     motif = motif_from_name(motif)
-    shown = _motif_title(motif)
+    # The English voice, hook and metadata say the motif in English (a pinned
+    # name from brand.motif_names, else romaji); the Japanese name lives only
+    # in the *_ja fields. A name no table can read (kanji) gives no English
+    # name, so the generic English lines are used instead of untranslated
+    # Japanese in the voice.
+    motif_en = motif_english_name(motif, names=brand.get("motif_names"))
+    shown = _motif_title(motif_en)
+    shown_ja = _motif_title(motif)
     low, high = _narration_range(style_key, params)
 
     if shown:
-        title = f"{shown} in oil pastel #Shorts"
-        title_ja = f"{shown}をオイルパステルで描く #Shorts"
-        hook_text = f"Watch this {motif} appear"
-        hook_ja = f"{shown}が色になっていく"
+        # Search phrase first: the motif and "oil pastel" up front, no #Shorts.
+        title = f"Drawing {shown} in Oil Pastel"
+        title_ja = f"{shown_ja}をオイルパステルで描く #Shorts"
+        hook_text = f"Watch this {motif_en} appear"
+        hook_ja = f"{shown_ja}が色になっていく"
         opening = (
             f"This is how {shown} comes out of a few oil pastel strokes.",
-            f"{shown}が、いくつかの線から生まれます。",
+            f"{shown_ja}が、いくつかの線から生まれます。",
         )
         overseas = f"{shown} drawn in creamy oil pastel, layer by layer"
-        overseas_ja = f"クレヨンで描く{shown}。色を重ねて、少しずつ形になっていきます。"
+        overseas_ja = f"クレヨンで描く{shown_ja}。色を重ねて、少しずつ形になっていきます。"
     else:
-        title = "A tiny oil pastel drawing #Shorts"
-        title_ja = "小さなオイルパステル画 #Shorts"
+        title = "Drawing a tiny postcard in oil pastel"
+        # The Japanese check copy can still name the motif even when the
+        # English voice cannot say it (a kanji name has no romaji to use).
+        title_ja = f"{shown_ja}をオイルパステルで描く #Shorts" if shown_ja else "小さなオイルパステル画 #Shorts"
         hook_text = "Watch it appear stroke by stroke"
-        hook_ja = "一筆ずつ、色が生まれる"
+        hook_ja = f"{shown_ja}が色になっていく" if shown_ja else "一筆ずつ、色が生まれる"
         opening = (
             "This is how a small oil pastel drawing is built, stroke by stroke.",
             "小さなオイルパステル画が、一筆ずつ出来ていきます。",
         )
         overseas = "A small original postcard, drawn in creamy oil pastel"
-        overseas_ja = "小さなポストカードを、クレヨンで一筆ずつ描いています。"
+        overseas_ja = (
+            f"クレヨンで描く{shown_ja}。色を重ねて、少しずつ形になっていきます。"
+            if shown_ja
+            else "小さなポストカードを、クレヨンで一筆ずつ描いています。"
+        )
 
     # The opening, then the sentences of this run's style, then the material
     # ones: what the style is about has to survive the word budget.
     pool = (opening,) + STYLE_SENTENCES.get(style_key, ()) + MATERIAL_SENTENCES
     sentences = _compose_narration(
-        pool, CLOSING_SENTENCES, low, high, motif or shown, material
+        pool, CLOSING_SENTENCES, low, high, motif_en or shown, material
     )
     narration = " ".join(english for english, _ in sentences)
     narration_ja = "".join(japanese for _, japanese in sentences)
 
     description_lines = [
-        f"{shown or 'A small original'} - drawn by hand with {material}.",
-        "" if not shown else f"The {motif} is built up layer by layer: soft pigment first, then the details.",
+        f"{shown or 'A small original'} - drawn by hand with {material}, built up layer by layer.",
         "Every artwork is a one-of-a-kind original postcard, drawn once and never repeated.",
         "",
         " ".join(FALLBACK_HASHTAGS),
     ]
     tags = list(FALLBACK_TAGS)
-    if motif and motif.lower() not in {tag.lower() for tag in tags}:
-        tags = [motif] + tags
+    if motif_en and motif_en.lower() not in {tag.lower() for tag in tags}:
+        tags = [motif_en] + tags
 
     script = {
         "title": title[:100],
@@ -727,6 +938,7 @@ def write_script(
             config,
             reference_scan=reference_scan,
             params=params,
+            motif=motif,
         )
     except Exception as exc:  # noqa: BLE001 - a Short must still be made
         log(
@@ -747,8 +959,14 @@ def generate_making_script(
     model_name: str = MODEL_NAME,
     reference_scan: bool = False,
     params=None,
+    motif: str = "",
 ) -> dict:
-    """Send the keyframes to Gemini and return the parsed script dict."""
+    """Send the keyframes to Gemini and return the parsed script dict.
+
+    ``motif`` is the artwork/folder name (``GO_ポッキー``); its English name
+    goes into the prompt so Gemini can name the topic in the first line
+    instead of guessing it from the frames.
+    """
     from PIL import Image
 
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -756,7 +974,13 @@ def generate_making_script(
         raise RuntimeError("GEMINI_API_KEY is not set (add it to .env)")
 
     client = create_client(api_key)
-    prompt = build_script_prompt(style_key, config, reference_scan=reference_scan, params=params)
+    motif_en = motif_english_name(
+        motif_from_name(motif),
+        names=((config or {}).get("brand") or {}).get("motif_names"),
+    )
+    prompt = build_script_prompt(
+        style_key, config, reference_scan=reference_scan, params=params, motif=motif_en
+    )
 
     contents: List[object] = [prompt]
     for path in keyframe_paths:

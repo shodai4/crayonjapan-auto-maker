@@ -430,6 +430,43 @@ class ShopCallToActionTests(unittest.TestCase):
         self.assertIn(self.URL, body["snippet"]["description"])
         self.assertIn("Original artwork available at:", body["snippet"]["description"])
 
+    def test_shorts_is_stripped_from_the_description(self):
+        gemini = "A warm story.\n\n#SakuraCrayPas #Shorts #OilPastelArt"
+        text = mw.ensure_shop_cta(gemini, self.URL)
+        self.assertNotIn("#Shorts", text)
+        self.assertIn("#SakuraCrayPas", text)
+        self.assertIn("#OilPastelArt", text)
+
+    def test_more_than_five_hashtags_are_trimmed_to_five(self):
+        gemini = (
+            "A warm story.\n\n#SakuraCrayPas #OilPastelArt #CrayPasSpecialist "
+            "#OriginalPostcard #JapaneseArtSupplies #CrayonJapan"
+        )
+        text = mw.ensure_shop_cta(gemini, self.URL)
+        last_line = text.splitlines()[-1]
+        self.assertEqual(len(last_line.split()), 5)
+        self.assertIn("#SakuraCrayPas", last_line)
+        self.assertNotIn("#CrayonJapan", last_line)
+
+    def test_a_repeated_hashtag_is_kept_once(self):
+        gemini = "A warm story.\n\n#OilPastelArt #OilPastelArt #SakuraCrayPas"
+        text = mw.ensure_shop_cta(gemini, self.URL)
+        self.assertEqual(text.splitlines()[-1].count("#OilPastelArt"), 1)
+
+
+class TagLanguageTests(unittest.TestCase):
+    """Upload tags are English-only: a Japanese tag never reaches the pack."""
+
+    def test_a_japanese_tag_is_dropped(self):
+        script = dict(SCRIPT, tags=["oil pastel", "手描き", "postcard art"])
+        metadata = mw.build_art_metadata(script, base_name="clip", generated_at=GENERATED_AT)
+        self.assertEqual(metadata["tags"], ["oil pastel", "postcard art"])
+
+    def test_accented_latin_tags_survive(self):
+        script = dict(SCRIPT, tags=["oil pastel", "pâté"])
+        metadata = mw.build_art_metadata(script, base_name="clip", generated_at=GENERATED_AT)
+        self.assertIn("pâté", metadata["tags"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -152,6 +152,68 @@ class CardTests(unittest.TestCase):
         )
 
 
+class PhraseBreakTests(unittest.TestCase):
+    """Phrase breaks: a card changes where the voice pauses, never mid-phrase."""
+
+    LONG = (
+        "The secret to a glowing sakura petal is not more pink. It is one warm layer "
+        "underneath, pressed flat with my thumb. The grain grabs the wax, and the "
+        "colour already looks alive. Creamy, buttery pigment makes every stroke sing."
+    )
+
+    def test_a_card_closes_on_a_comma_where_the_voice_pauses(self):
+        cards = telop.plan_cards(timed("The paper grabs the wax, and the colour sings."))
+        self.assertNotIn("and", cards[0]["text"])
+        self.assertIn("wax", cards[0]["text"])
+        # The card ends exactly where the voice pauses at the comma.
+        self.assertAlmostEqual(cards[0]["spoken_end"], 2.04, places=2)
+        self.assertIn("and", cards[1]["text"])
+
+    def test_no_card_ends_on_a_word_that_leans_forward(self):
+        for narration in (self.LONG, CARD * 3):
+            cards = telop.plan_cards(timed(narration))
+            for card in cards:
+                last = card["text"].split()[-1].strip(".,;:")
+                self.assertFalse(
+                    telop._leans_forward(last),
+                    f"card ends on {last!r}: {card['text']!r}",
+                )
+
+    def test_a_line_hands_its_forward_word_to_the_next_line(self):
+        cards = telop.plan_cards(timed("soft wax on paper"))
+        lines = [
+            " ".join(card["words"][index]["text"] for index in line)
+            for card in cards
+            for line in card["lines"]
+        ]
+        self.assertEqual(lines, ["soft wax", "on paper"])
+
+    def test_a_line_only_ends_on_a_forward_word_when_the_next_line_is_full(self):
+        layout = telop.subtitle_layout()
+        cards = telop.plan_cards(timed(self.LONG))
+        for card in cards:
+            for index, line in enumerate(card["lines"][:-1]):
+                words = [card["words"][i]["text"] for i in line]
+                if not telop._leans_forward(words[-1]):
+                    continue
+                # The trailing run of forward words: the move was declined
+                # only because the run would not fit on the next line.
+                run = []
+                while words and telop._leans_forward(words[-1]) and len(words) > 1:
+                    run.insert(0, words.pop())
+                following = " ".join(
+                    run + [card["words"][i]["text"] for i in card["lines"][index + 1]]
+                )
+                self.assertFalse(layout.fits(following))
+
+    def test_overlapping_boundaries_never_light_two_words_at_once(self):
+        words = telop.word_timings_from_boundaries([
+            {"type": "WordBoundary", "offset": 0, "duration": 3000000, "text": "soft"},
+            {"type": "WordBoundary", "offset": 2000000, "duration": 3000000, "text": "wax"},
+        ])
+        self.assertEqual(words[0]["end"], words[1]["start"])
+
+
 class PlacementTests(unittest.TestCase):
     """2/4 of the sheet: where the text goes and how it is drawn."""
 

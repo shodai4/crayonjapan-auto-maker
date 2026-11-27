@@ -39,6 +39,12 @@ SHOP_CTA_JA = "1点ものの原画はこちらで販売中です：\n{url}"
 # A line holding the shop link is a shop line (and is replaced by the block
 # above) when what is left of it after the URL is this short.
 SHOP_LINE_MAX_REMAINDER = 45
+# The description carries 3-5 hashtags (the brief); a longer trailing block
+# is trimmed to this many.
+DESCRIPTION_MAX_HASHTAGS = 5
+# Tags are English-only metadata for an overseas Short: a tag carrying CJK
+# script (or an emoji) never reaches the upload.
+_NON_LATIN_TAG = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u2600-\u27bf]")
 _URL = re.compile(r"https?://\S+")
 
 
@@ -258,6 +264,22 @@ def _drop_shop_only_lines(text: str, url: str) -> str:
     return "\n".join(kept).strip()
 
 
+def _normalise_hashtags(hashtags: str) -> str:
+    """The trailing hashtag block: no ``#Shorts``, at most five, no repeats.
+
+    The description asks for 3-5 hashtags; a reply that still carries
+    ``#Shorts`` (it adds nothing to reach) or six tags gets trimmed here, so
+    the upload description always matches the brief.
+    """
+    kept: List[str] = []
+    for tag in (hashtags or "").split():
+        if tag.lower() == "#shorts":
+            continue
+        if tag.startswith("#") and tag not in kept:
+            kept.append(tag)
+    return " ".join(kept[:DESCRIPTION_MAX_HASHTAGS])
+
+
 def ensure_shop_cta(description: object, shop_url: object) -> str:
     """The description with the BASE shop link and the original-sale line.
 
@@ -267,6 +289,9 @@ def ensure_shop_cta(description: object, shop_url: object) -> str:
     """
     text = str(description or "").strip()
     url = str(shop_url or "").strip()
+    # #Shorts adds nothing to reach, wherever it sits in the description.
+    text = re.sub(r"#shorts\b", "", text, flags=re.IGNORECASE)
+    text = "\n".join(line.rstrip() for line in text.splitlines()).strip()
     if not url:
         return text
     english = SHOP_CTA_EN.format(url=url)
@@ -277,7 +302,9 @@ def ensure_shop_cta(description: object, shop_url: object) -> str:
     body, hashtags = _split_hashtags(text)
     body = _drop_shop_only_lines(body, url)
     block = f"{english}\n\n{japanese}"
-    return "\n\n".join(part for part in (body, block, hashtags) if part)
+    return "\n\n".join(
+        part for part in (body, block, _normalise_hashtags(hashtags)) if part
+    )
 
 
 def _clean(value: object) -> str:
@@ -290,7 +317,7 @@ def _clean_tags(tags: object) -> List[str]:
     cleaned: List[str] = []
     for tag in tags or []:
         text = _clean(tag)
-        if text:
+        if text and not _NON_LATIN_TAG.search(text):
             cleaned.append(text)
     return cleaned
 
