@@ -414,7 +414,12 @@ def word_timings_from_boundaries(entries: Iterable[dict]) -> List[dict]:
         cursor = start
         for piece, weight in zip(pieces, weights):
             span = duration * (weight / total)
-            words.append({"text": piece, "start": cursor, "end": cursor + span})
+            # Length-share is only a guess at when each word is spoken (in the
+            # Ichimi Short it put "Using" ~1.4 s before the voice said it), so
+            # these words are marked estimated: the card still shows for the
+            # sentence's true span, but no word is highlighted as if measured.
+            words.append({"text": piece, "start": cursor, "end": cursor + span,
+                          "estimated": True})
             cursor += span
 
     words.sort(key=lambda word: word["start"])
@@ -436,7 +441,8 @@ def _tidy_timings(words: Sequence[dict]) -> List[dict]:
             # earlier word ends where the next one begins, so the gold moves
             # with the voice instead of doubling up.
             tidied[-1]["end"] = start
-        tidied.append({"text": clean_word(word["text"]), "start": start, "end": end})
+        tidied.append({"text": clean_word(word["text"]), "start": start, "end": end,
+                       "estimated": bool(word.get("estimated"))})
     return [word for word in tidied if word["text"]]
 
 
@@ -878,6 +884,7 @@ def _split_oversized_word(word: dict, layout: LineLayout) -> List[dict]:
             "text": chunk,
             "start": round(start + index * span, 3),
             "end": round(start + (index + 1) * span, 3),
+            "estimated": bool(word.get("estimated")),
         }
         for index, chunk in enumerate(chunks)
     ]
@@ -907,7 +914,8 @@ def build_cards(
             text = clean_word(piece["text"])
             if not text:
                 continue
-            item = {"text": text, "start": piece["start"], "end": piece["end"]}
+            item = {"text": text, "start": piece["start"], "end": piece["end"],
+                    "estimated": bool(piece.get("estimated"))}
             candidate = current + [item]
             if _card_fits([item["text"] for item in candidate], layout, max_lines):
                 current = candidate
@@ -1419,6 +1427,8 @@ def build_telop_ass(
     # in gold and a touch larger, so the highlight follows the voice.
     for card in (cards if karaoke else []):
         for index, word in enumerate(card["words"]):
+            if word.get("estimated"):
+                continue
             start = word["start"]
             end = min(word["end"], card["end"])
             if end <= start:

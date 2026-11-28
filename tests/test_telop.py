@@ -473,6 +473,41 @@ class TimingTests(unittest.TestCase):
         self.assertAlmostEqual(words[-1]["end"], 2.0, places=3)
         self.assertLess(words[0]["end"], words[1]["end"])
 
+    def test_a_sentence_boundary_is_marked_estimated(self):
+        # Ichimi: the 2nd sentence came back as one SentenceBoundary and the
+        # length-share put "Using" ~1.4 s before the voice said it.
+        words = telop.word_timings_from_boundaries([
+            {"type": "SentenceBoundary", "offset": 30000000, "duration": 20000000,
+             "text": "Using Sakura Cray-Pas Specialist"},
+        ])
+        self.assertTrue(all(word.get("estimated") for word in words))
+        words = telop.word_timings_from_boundaries([
+            {"type": "WordBoundary", "offset": 0, "duration": 3000000, "text": "Hello"},
+        ])
+        self.assertFalse(words[0].get("estimated"))
+
+    def test_estimated_words_get_a_card_but_no_karaoke_highlight(self):
+        words = telop.word_timings_from_boundaries([
+            {"type": "SentenceBoundary", "offset": 30000000, "duration": 20000000,
+             "text": "Using Sakura Cray-Pas Specialist"},
+        ])
+        ass_text = telop.build_telop_ass(words, video_seconds=28.0)
+        rows = dialogues(ass_text)
+        cards = [row for row in rows if row["layer"] == 0 and row["style"] == "Telop"]
+        self.assertGreaterEqual(len(cards), 1)
+        self.assertAlmostEqual(cards[0]["start"], 3.0, places=2)
+        highlights = [row for row in rows if row["layer"] == 1]
+        self.assertEqual(highlights, [])
+        # A real WordBoundary still highlights word by word.
+        words = telop.word_timings_from_boundaries([
+            {"type": "WordBoundary", "offset": i * 3000000, "duration": 2500000,
+             "text": word}
+            for i, word in enumerate(["The", "paper", "grabs", "the", "wax"])
+        ])
+        ass_text = telop.build_telop_ass(words, video_seconds=28.0)
+        highlights = [row for row in dialogues(ass_text) if row["layer"] == 1]
+        self.assertEqual(len(highlights), 5)
+
     def test_audio_chunks_are_ignored(self):
         self.assertEqual(telop.word_timings_from_boundaries([{"type": "audio", "data": b"x"}]), [])
 
